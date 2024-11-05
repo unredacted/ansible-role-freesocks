@@ -1,0 +1,89 @@
+---
+# tasks/outline.yml - Outline server installation and configuration
+
+- name: Create expect script for Outline installation
+  copy:
+    content: |
+      #!/usr/bin/expect -f
+      set timeout -1
+      spawn bash -c "bash <(wget -qO- https://raw.githubusercontent.com/Jigsaw-Code/outline-server/master/src/server_manager/install_scripts/install_server.sh) --hostname={{ random_hostname }}.{{ base_domain }} --keys-port={{ outline_keys_port }} --api-port={{ outline_api_port }}"
+      expect {
+        "Would you like to install Docker?" {
+          send "y\r"
+          exp_continue
+        }
+        "CONGRATULATIONS! Your Outline server is up and running." {
+          puts "\nOutline installation completed successfully."
+          expect eof
+        }
+        eof {
+          puts "\nUnexpected EOF during Outline installation."
+          exit 1
+        }
+      }
+    dest: /tmp/install_outline.exp
+    mode: '0755'
+  become: yes
+
+- name: Install Outline server
+  command: /usr/bin/expect /tmp/install_outline.exp
+  register: outline_install
+  become: yes
+  failed_when: 
+    - outline_install.rc != 0
+    - "'CONGRATULATIONS! Your Outline server is up and running.' not in outline_install.stdout"
+
+- name: Debug Outline installation output
+  debug:
+    var: outline_install.stdout_lines
+
+- name: Display Outline installation error
+  debug:
+    msg: "Outline installation failed: {{ outline_install.stderr }}"
+  when: 
+    - outline_install.rc != 0
+    - "'CONGRATULATIONS! Your Outline server is up and running.' not in outline_install.stdout"
+
+- name: Remove expect script
+  file:
+    path: /tmp/install_outline.exp
+    state: absent
+  become: yes
+
+- name: Set fact for Outline installation success
+  set_fact:
+    outline_install_success: true
+  when: "'CONGRATULATIONS! Your Outline server is up and running.' in outline_install.stdout"
+
+- name: Set fact for Outline installation failure
+  set_fact:
+    outline_install_success: false
+  when: "'CONGRATULATIONS! Your Outline server is up and running.' not in outline_install.stdout"
+
+- name: Extract API URL and cert SHA256
+  set_fact:
+    outline_api_info: "{{ outline_install.stdout | regex_search('{.*}') | from_json }}"
+  when: outline_install_success
+
+- name: Display Outline server information
+  debug:
+    msg: |
+      CONGRATULATIONS! Your Outline server is up and running.
+
+      To manage your Outline server, please copy the following line (including curly
+      brackets) into Step 2 of the Outline Manager interface:
+
+      {{ outline_api_info | to_json }}
+
+      Make sure the following ports are open on your firewall, router or cloud provider:
+      - Management port {{ outline_api_port }}, for TCP
+      - Access key port {{ outline_keys_port }}, for TCP and UDP
+  when: outline_install_success
+
+- name: Save Outline API information
+  ansible.builtin.copy:
+    content: "{{ outline_api_info | to_json }}"
+    dest: "/root/outline_api_info.json"
+    mode: '0600'
+  become: yes
+  when: outline_install_success

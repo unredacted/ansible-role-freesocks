@@ -1,0 +1,101 @@
+# tasks/main.yml - Main task file that includes other task files
+
+- name: Fail if operation mode is not specified
+  fail:
+    msg: "Operation mode must be explicitly set to either 'deploy' or 'migrate'"
+  when: operation_mode is not defined or operation_mode == ""
+
+- name: Fail if operation mode is invalid
+  fail:
+    msg: "Operation mode must be either 'deploy' or 'migrate', got: {{ operation_mode }}"
+  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate']
+
+- name: Deploy new Outline server
+  block:
+    - name: Check if /opt/outline already exists
+      stat:
+        path: /opt/outline
+      register: outline_path
+
+    - name: Fail if /opt/outline already exists
+      fail:
+        msg: "Cannot deploy: /opt/outline already exists. Please remove it first or use migration mode."
+      when: outline_path.stat.exists
+
+    - name: Install wamerican package for word list
+      apt:
+        name: wamerican
+        state: present
+
+    - name: Get random words from system dictionary
+      shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n 3'
+      register: random_words
+
+    - name: Set random hostname
+      set_fact:
+        random_hostname: "{{ random_words.stdout_lines | join('-') }}"
+      when: random_hostname is not defined
+
+    - name: Set DNS hostname
+      set_fact:
+        dns_hostname: "{{ random_hostname }}.{{ base_domain }}"
+      when: dns_hostname is not defined
+
+    - name: Set KV store hostname
+      set_fact:
+        kv_hostname: "{{ random_hostname }}"
+      when: kv_hostname is not defined
+
+    - name: Debug hostname variables
+      debug:
+        msg:
+          - "Random Hostname: {{ random_hostname }}"
+          - "DNS Hostname: {{ dns_hostname }}"
+          - "KV Hostname: {{ kv_hostname }}"
+
+    - name: Include installation tasks
+      include_tasks: install.yml
+
+    - name: Include Outline server tasks
+      include_tasks: outline.yml
+
+    - name: Debug Outline installation success
+      debug:
+        msg: "Outline installation success: {{ outline_install_success }}"
+
+    - name: Include DNS tasks
+      include_tasks: dns.yml
+      when: outline_install_success | bool
+
+    - name: Include tunnel tasks
+      include_tasks: tunnel.yml
+      when: outline_install_success | bool
+
+    - name: Include KV store tasks
+      include_tasks: kv.yml
+      when: outline_install_success | bool
+  when: operation_mode == 'deploy'
+
+- name: Migrate existing Outline server
+  block:
+    - name: Verify required migration variables
+      fail:
+        msg: "Migration requires source_hostname and destination_hostname to be set"
+      when: source_hostname is not defined or destination_hostname is not defined
+
+    - name: Check if /opt/outline already exists
+      stat:
+        path: /opt/outline
+      register: outline_path
+
+    - name: Fail if /opt/outline already exists
+      fail:
+        msg: "Cannot migrate: /opt/outline already exists on the destination server. Please remove it first."
+      when: outline_path.stat.exists
+
+    - name: Include installation tasks
+      include_tasks: install.yml
+
+    - name: Include migration tasks
+      include_tasks: migrate.yml
+  when: operation_mode == 'migrate'

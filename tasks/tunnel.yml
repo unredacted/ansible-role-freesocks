@@ -1,0 +1,140 @@
+---
+# tasks/tunnel.yml - Cloudflare tunnel setup
+
+- name: Create Cloudflare Tunnel
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      name: "{{ kv_hostname }}{{ hostname_extension }}"
+      config_src: "cloudflare"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: cf_tunnel
+
+- name: Debug Cloudflare Tunnel creation result
+  debug:
+    var: cf_tunnel
+
+- name: Create DNS CNAME record for API domain
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ cloudflare_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: CNAME
+      name: "{{ kv_hostname }}-api"
+      content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
+      ttl: 1
+      proxied: true
+    status_code: [200, 201]
+  delegate_to: localhost
+
+- name: Create DNS CNAME record for Prometheus domain
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ cloudflare_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: CNAME
+      name: "{{ kv_hostname }}-prom"
+      content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
+      ttl: 1
+      proxied: true
+    status_code: [200, 201]
+  delegate_to: localhost
+
+- name: Create DNS CNAME records for additional domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item.zone_id | default(cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: CNAME
+      name: "{{ kv_hostname }}-api"
+      content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
+      ttl: 1
+      proxied: true
+    status_code: [200, 201]
+  delegate_to: localhost
+  loop: "{{ additional_domains }}"
+
+- name: Get Cloudflare Tunnel Token
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cf_tunnel.json.result.id }}/token"
+    method: GET
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    return_content: yes
+  delegate_to: localhost
+  register: cf_tunnel_token
+
+- name: Debug Cloudflare Tunnel Token
+  debug:
+    var: cf_tunnel_token
+
+- name: Install Cloudflared service
+  ansible.builtin.shell:
+    cmd: "cloudflared service install {{ cf_tunnel_token.json.result }}"
+  become: yes
+
+- name: Enable and start Cloudflared service
+  ansible.builtin.systemd:
+    name: cloudflared
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Set initial ingress configuration
+  set_fact:
+    ingress_config: []
+
+- name: Add API ingress configuration
+  set_fact:
+    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + '-api.' + api_domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
+
+- name: Add Prometheus ingress configuration
+  set_fact:
+    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + '-prom.' + prom_domain, 'service': 'http://127.0.0.1:9090', 'originRequest': {'access': {'required': true, 'teamName': cloudflare_access_team_name, 'audTag': [cloudflare_access_aud_tag]}}}] }}"
+
+- name: Add additional domain ingress configurations
+  set_fact:
+    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + '-api.' + item.domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
+  loop: "{{ additional_domains }}"
+
+- name: Add catch-all rule to ingress configuration
+  set_fact:
+    ingress_config: "{{ ingress_config + [{'service': 'http_status:404'}] }}"
+
+- name: Configure Cloudflare Tunnel ingress
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cf_tunnel.json.result.id }}/configurations"
+    method: PUT
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      config:
+        ingress: "{{ ingress_config }}"
+    status_code: 200
+  delegate_to: localhost

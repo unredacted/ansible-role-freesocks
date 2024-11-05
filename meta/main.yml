@@ -1,0 +1,16 @@
+galaxy_info:
+  author: lunarthegrey
+  description: An Ansible role to help with the deployment of new FreeSocks Outline VPN servers
+  company: Unredacted Inc
+  license: GPL-3.0-only
+  min_ansible_version: 2.1
+  platforms:
+    - name: Debian
+      versions:
+        - 12
+  galaxy_tags:
+    - networking
+    - security
+    - vpn
+    - cloudflare
+dependencies: []

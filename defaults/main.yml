@@ -1,0 +1,70 @@
+# defaults/main.yml - Default variables for the role
+
+# Operation mode: 'deploy' or 'migrate'
+# This must be explicitly set to either 'deploy' or 'migrate'
+# operation_mode: deploy
+
+# Migration settings
+# Whether to delete source server KV entries after successful migration
+migrate_delete_source: false
+
+# Common settings
+# OS version for cloudflared installation (e.g., "bookworm", "jammy")
+cloudflared_os_version: "{{ ansible_distribution_release }}"
+
+# Length of random hostname component
+random_hostname_length: 6
+
+# Outline server ports
+outline_api_port: 8443
+outline_keys_port: 443
+
+# Optional hostname extension appended to server names
+hostname_extension: ""
+
+# Additional domains configuration
+# List of additional domains to set up DNS records and tunnels for
+# Example:
+# additional_domains:
+#   - domain: "example.app"
+#     zone_id: "app-zone-id"  # Optional, defaults to base zone_id
+#   - domain: "example.xyz"
+#     zone_id: "xyz-zone-id"
+additional_domains: []
+
+# Envoy server mappings
+# Maps hostnames to their IPv4 and IPv6 addresses
+# Example structure:
+# envoy_mappings:
+#   outline1-jfk:  # Outline server hostname
+#     ipv4:
+#       - 1.2.3.4
+#       - 5.6.7.8
+#     ipv6:
+#       - 2001:db8::1
+#       - 2001:db8::2
+#   outline2-rmo:
+#     ipv4:
+#       - 9.10.11.12
+#     ipv6:
+#       - 2001:db8::3
+
+# Required variables that must be set by the user:
+# cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+# cloudflare_email: "your-email@example.com"
+# cloudflare_api_token: "your-api-token"
+# cloudflare_zone_id: "your-zone-id"
+# cloudflare_account_id: "your-account-id"
+# cloudflare_api_kv_namespace: "your-api-kv-namespace"
+# cloudflare_prom_kv_namespace: "your-prom-kv-namespace"
+# base_domain: "example.com"
+# api_domain: "api.example.com"
+# prom_domain: "prom.example.com"
+# cloudflare_access_team_name: "your-team-name"
+# cloudflare_access_aud_tag: "your-aud-tag"
+# kv_hostname_prefix: "outline"
+# envoy_mappings: {}  # Define your envoy mappings as shown in the example above
+
+# Additional required variables for migration mode:
+# source_hostname: "outline1-jfk"      # Hostname of the source server
+# destination_hostname: "outline2-rmo"  # Hostname of the destination server
