@@ -80,21 +80,29 @@
   block:
     - name: Verify required migration variables
       fail:
-        msg: "Migration requires source_hostname and destination_hostname to be set"
-      when: source_hostname is not defined or destination_hostname is not defined
+        msg: "Migration requires source_hostname, source_kv_hostname, destination_hostname, and destination_kv_hostname to be set"
+      when: >
+        source_hostname is not defined or 
+        source_kv_hostname is not defined or 
+        destination_hostname is not defined or 
+        destination_kv_hostname is not defined
 
     - name: Check if /opt/outline already exists
       stat:
         path: /opt/outline
       register: outline_path
+      when: inventory_hostname == destination_hostname
 
     - name: Fail if /opt/outline already exists
       fail:
         msg: "Cannot migrate: /opt/outline already exists on the destination server. Please remove it first."
-      when: outline_path.stat.exists
+      when: 
+        - inventory_hostname == destination_hostname
+        - outline_path.stat.exists | default(false)
 
     - name: Include installation tasks
       include_tasks: install.yml
+      when: inventory_hostname == destination_hostname
 
     - name: Include migration tasks
       include_tasks: migrate.yml
