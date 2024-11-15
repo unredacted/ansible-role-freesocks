@@ -27,6 +27,7 @@
       - "Account ID: {{ cloudflare_account_id }}"
       - "Envoy Mappings Available: {{ envoy_mappings[inventory_hostname] is defined }}"
 
+# Base domain DNS records
 - name: Add DNS A records for IPv4 addresses from envoy mappings
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
@@ -85,6 +86,61 @@
     var: dns_aaaa_records_result
   when: dns_aaaa_records_result is defined
 
+# Additional domain DNS records for direct connections
+- name: Add DNS A records for IPv4 addresses from envoy mappings for additional connect domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: A
+      name: "{{ random_hostname }}"
+      content: "{{ item[1] }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  with_nested:
+    - "{{ additional_connect_domains | default([]) }}"
+    - "{{ envoy_mappings[inventory_hostname].ipv4 | default([]) }}"
+  when: 
+    - additional_connect_domains is defined
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv4 is defined
+  register: additional_dns_a_records_result
+
+- name: Add DNS AAAA records for IPv6 addresses from envoy mappings for additional connect domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: AAAA
+      name: "{{ random_hostname }}"
+      content: "{{ item[1] }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  with_nested:
+    - "{{ additional_connect_domains | default([]) }}"
+    - "{{ envoy_mappings[inventory_hostname].ipv6 | default([]) }}"
+  when: 
+    - additional_connect_domains is defined
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv6 is defined
+  register: additional_dns_aaaa_records_result
+
 # Fallback to server's own IPs if no envoy mappings are found
 - name: Add DNS A record using server IP
   uri:
@@ -140,63 +196,8 @@
     var: fallback_dns_aaaa_record_result
   when: fallback_dns_aaaa_record_result is defined
 
-# Additional domain DNS records
-- name: Add DNS A records for IPv4 addresses from envoy mappings for additional domains
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
-    body_format: json
-    body:
-      type: A
-      name: "{{ random_hostname }}"
-      content: "{{ item[1] }}"
-      ttl: 1
-      proxied: false
-    status_code: [200, 201]
-  delegate_to: localhost
-  with_nested:
-    - "{{ additional_domains | default([]) }}"
-    - "{{ envoy_mappings[inventory_hostname].ipv4 | default([]) }}"
-  when: 
-    - additional_domains is defined
-    - envoy_mappings is defined
-    - envoy_mappings[inventory_hostname] is defined
-    - envoy_mappings[inventory_hostname].ipv4 is defined
-  register: additional_dns_a_records_result
-
-- name: Add DNS AAAA records for IPv6 addresses from envoy mappings for additional domains
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
-    body_format: json
-    body:
-      type: AAAA
-      name: "{{ random_hostname }}"
-      content: "{{ item[1] }}"
-      ttl: 1
-      proxied: false
-    status_code: [200, 201]
-  delegate_to: localhost
-  with_nested:
-    - "{{ additional_domains | default([]) }}"
-    - "{{ envoy_mappings[inventory_hostname].ipv6 | default([]) }}"
-  when: 
-    - additional_domains is defined
-    - envoy_mappings is defined
-    - envoy_mappings[inventory_hostname] is defined
-    - envoy_mappings[inventory_hostname].ipv6 is defined
-  register: additional_dns_aaaa_records_result
-
-# Fallback DNS records for additional domains
-- name: Add fallback DNS A records for additional domains
+# Fallback DNS records for additional connect domains
+- name: Add fallback DNS A records for additional connect domains
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ item.zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
     method: POST
@@ -213,14 +214,14 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  loop: "{{ additional_domains | default([]) }}"
+  loop: "{{ additional_connect_domains | default([]) }}"
   when: 
-    - additional_domains is defined
+    - additional_connect_domains is defined
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
     - ansible_default_ipv4.address is defined
   register: additional_fallback_dns_a_records_result
 
-- name: Add fallback DNS AAAA records for additional domains
+- name: Add fallback DNS AAAA records for additional connect domains
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ item.zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
     method: POST
@@ -237,9 +238,9 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  loop: "{{ additional_domains | default([]) }}"
+  loop: "{{ additional_connect_domains | default([]) }}"
   when: 
-    - additional_domains is defined
+    - additional_connect_domains is defined
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
     - ansible_default_ipv6.address is defined
   register: additional_fallback_dns_aaaa_records_result
@@ -251,4 +252,4 @@
       - "Additional AAAA Records Result: {{ additional_dns_aaaa_records_result | default('Not created') }}"
       - "Additional Fallback A Records Result: {{ additional_fallback_dns_a_records_result | default('Not created') }}"
       - "Additional Fallback AAAA Records Result: {{ additional_fallback_dns_aaaa_records_result | default('Not created') }}"
-  when: additional_domains is defined
+  when: additional_connect_domains is defined

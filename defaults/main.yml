@@ -32,6 +32,16 @@ hostname_extension: ""
 #     zone_id: "xyz-zone-id"
 additional_domains: []
 
+# Additional connect domains configuration
+# List of additional domains to set up DNS records for direct connections
+# Example:
+# additional_connect_domains:
+#   - domain: "example.app"
+#     zone_id: "app-zone-id"  # Optional, defaults to base zone_id
+#   - domain: "example.xyz"
+#     zone_id: "xyz-zone-id"
+additional_connect_domains: []
+
 # Envoy server mappings
 # Maps hostnames to their IPv4 and IPv6 addresses
 # Example structure:

@@ -1,6 +1,7 @@
 ---
 # tasks/migrate.yml - Migration tasks
 
+# Check source server status
 - name: Verify source server exists
   uri:
     url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
@@ -27,6 +28,7 @@
   failed_when: false
   run_once: true
 
+# Stop source server containers
 - name: Stop Outline containers on source server
   docker_container:
     name: "{{ item }}"
@@ -37,7 +39,7 @@
   become: yes
   when: inventory_hostname == source_hostname
 
-# Set required variables for outline.yml
+# Setup destination server
 - name: Set variables for Outline installation
   set_fact:
     random_hostname: "{{ destination_kv_hostname }}"
@@ -57,12 +59,6 @@
   include_tasks: outline.yml
   when: inventory_hostname == destination_hostname
 
-- name: Include tunnel tasks
-  include_tasks: tunnel.yml
-  when: 
-    - inventory_hostname == destination_hostname
-    - outline_install_success | default(false) | bool
-
 - name: Stop Outline containers on new server
   docker_container:
     name: "{{ item }}"
@@ -75,7 +71,7 @@
     - inventory_hostname == destination_hostname
     - outline_install_success | default(false) | bool
 
-# File transfer tasks
+# Transfer configuration
 - name: Create archive of Outline directory
   archive:
     path: /opt/outline
@@ -127,6 +123,7 @@
   become: yes
   when: inventory_hostname == destination_hostname
 
+# Update configuration files
 - name: Replace source hostnames with destination hostnames in files
   replace:
     path: "{{ item }}"
@@ -149,7 +146,34 @@
   become: yes
   when: inventory_hostname == destination_hostname
 
-# DNS and KV store tasks
+# Container management
+- name: Stop shadowbox container
+  docker_container:
+    name: shadowbox
+    state: stopped
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Remove shadowbox container
+  docker_container:
+    name: shadowbox
+    state: absent
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Start new shadowbox container using script
+  command: /opt/outline/persisted-state/start_container.sh
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+# Setup Cloudflare tunnel
+- name: Include tunnel tasks
+  include_tasks: tunnel.yml
+  when: 
+    - inventory_hostname == destination_hostname
+    - outline_install_success | default(false) | bool
+
+# DNS record management
 - name: Update DNS A records for IPv4 addresses from envoy mappings
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
@@ -179,6 +203,7 @@
     - inventory_hostname == destination_hostname
   run_once: true
 
+# Base domain DNS records
 - name: Add DNS A records for IPv4 addresses from envoy mappings
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
@@ -227,7 +252,62 @@
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv6 is defined
 
-# Fallback to server's own IPs if no envoy mappings are found
+# Additional domain DNS records for direct connections
+- name: Add DNS A records for IPv4 addresses from envoy mappings for additional connect domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: A
+      name: "{{ destination_kv_hostname }}"
+      content: "{{ item[1] }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  with_nested:
+    - "{{ additional_connect_domains | default([]) }}"
+    - "{{ envoy_mappings[inventory_hostname].ipv4 | default([]) }}"
+  when: 
+    - inventory_hostname == destination_hostname
+    - additional_connect_domains is defined
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv4 is defined
+
+- name: Add DNS AAAA records for IPv6 addresses from envoy mappings for additional connect domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: AAAA
+      name: "{{ destination_kv_hostname }}"
+      content: "{{ item[1] }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  with_nested:
+    - "{{ additional_connect_domains | default([]) }}"
+    - "{{ envoy_mappings[inventory_hostname].ipv6 | default([]) }}"
+  when: 
+    - inventory_hostname == destination_hostname
+    - additional_connect_domains is defined
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv6 is defined
+
+# Fallback DNS records
 - name: Add fallback DNS A record using server IP
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
@@ -272,16 +352,56 @@
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined
     - ansible_default_ipv6.address is defined
 
-- name: Start Outline containers on new server
-  docker_container:
-    name: "{{ item }}"
-    state: started
-  loop:
-    - shadowbox
-    - watchtower
-  become: yes
-  when: inventory_hostname == destination_hostname
+# Fallback DNS records for additional domains
+- name: Add fallback DNS A records for additional connect domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item.zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: A
+      name: "{{ destination_kv_hostname }}"
+      content: "{{ ansible_default_ipv4.address }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  loop: "{{ additional_connect_domains | default([]) }}"
+  when: 
+    - inventory_hostname == destination_hostname
+    - additional_connect_domains is defined
+    - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
+    - ansible_default_ipv4.address is defined
 
+- name: Add fallback DNS AAAA records for additional connect domains
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ item.zone_id | default(base_domain_cloudflare_zone_id) }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body_format: json
+    body:
+      type: AAAA
+      name: "{{ destination_kv_hostname }}"
+      content: "{{ ansible_default_ipv6.address }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  loop: "{{ additional_connect_domains | default([]) }}"
+  when: 
+    - inventory_hostname == destination_hostname
+    - additional_connect_domains is defined
+    - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
+    - ansible_default_ipv6.address is defined
+
+# KV store management
 - name: Check if KV entry already exists for new server
   uri:
     url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
@@ -338,6 +458,7 @@
     - inventory_hostname == destination_hostname
   run_once: true
 
+# Cleanup source server KV entries
 - name: Delete source server API KV entry
   uri:
     url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
