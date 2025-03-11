@@ -1,0 +1,71 @@
+# tasks/migrate/migrate.yml - Migration tasks orchestration
+
+# Verify source server and stop containers
+- name: Include source verification tasks
+  include_tasks: verify_source.yml
+
+# Setup destination server
+- name: Set variables for Outline installation
+  set_fact:
+    random_hostname: "{{ destination_kv_hostname }}"
+    dns_hostname: "{{ destination_kv_hostname }}.{{ base_domain }}"
+    kv_hostname: "{{ destination_kv_hostname }}"
+  when: inventory_hostname == destination_hostname
+
+- name: Debug hostname variables
+  debug:
+    msg:
+      - "Random Hostname: {{ random_hostname }}"
+      - "DNS Hostname: {{ dns_hostname }}"
+      - "KV Hostname: {{ kv_hostname }}"
+  when: inventory_hostname == destination_hostname
+
+- name: Install Outline on new server
+  include_tasks: ../setup/outline.yml
+  when: inventory_hostname == destination_hostname
+
+- name: Stop Outline containers on new server
+  docker_container:
+    name: "{{ item }}"
+    state: stopped
+  loop:
+    - watchtower
+    - shadowbox
+  become: yes
+  when: 
+    - inventory_hostname == destination_hostname
+    - outline_install_success | default(false) | bool
+
+# Transfer configuration and update files
+- name: Include configuration transfer tasks
+  include_tasks: transfer_config.yml
+
+# Clean up existing tunnel if needed
+- name: Include tunnel cleanup tasks
+  include_tasks: tunnel_cleanup.yml
+
+# Manage containers
+- name: Include container management tasks
+  include_tasks: containers.yml
+
+# Clean up any existing tunnel for destination hostname
+- name: Include destination tunnel cleanup tasks
+  include_tasks: destination_tunnel_cleanup.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - outline_install_success | default(false) | bool
+
+# Setup Cloudflare tunnel
+- name: Include tunnel tasks
+  include_tasks: ../setup/tunnel.yml
+  when: 
+    - inventory_hostname == destination_hostname
+    - outline_install_success | default(false) | bool
+
+# Setup DNS records
+- name: Include DNS record management tasks
+  include_tasks: dns_records.yml
+
+# Update KV store entries
+- name: Include KV store management tasks
+  include_tasks: kv_store.yml

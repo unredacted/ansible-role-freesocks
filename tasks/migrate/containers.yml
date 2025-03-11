@@ -1,0 +1,22 @@
+---
+# tasks/migrate/containers.yml - Container management tasks
+
+# Container management
+- name: Stop shadowbox container
+  docker_container:
+    name: shadowbox
+    state: stopped
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Remove shadowbox container
+  docker_container:
+    name: shadowbox
+    state: absent
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Start new shadowbox container using script
+  shell: /bin/bash /opt/outline/persisted-state/start_container.sh
+  become: yes
+  when: inventory_hostname == destination_hostname

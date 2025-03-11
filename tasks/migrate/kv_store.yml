@@ -1,0 +1,88 @@
+---
+# tasks/migrate/kv_store.yml - KV store management tasks
+
+# KV store management
+- name: Check if KV entry already exists for new server
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    method: GET
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  register: new_server_kv
+  run_once: true
+
+- name: Update API KV store with new hostname
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    method: PUT
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body: "{{ source_server.content | regex_replace(source_kv_hostname, destination_kv_hostname) }}"
+    status_code: 200
+  delegate_to: localhost
+  when: 
+    - source_server.status == 200
+    - new_server_kv.status == 404
+    - inventory_hostname == destination_hostname
+  run_once: true
+
+- name: Check if Prometheus KV entry already exists for new server
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    method: GET
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  register: new_server_prom_kv
+  run_once: true
+
+- name: Update Prometheus KV store with new hostname
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    method: PUT
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    body: "{{ source_prom.content | regex_replace(source_kv_hostname, destination_kv_hostname) }}"
+    status_code: 200
+  delegate_to: localhost
+  when: 
+    - source_prom.status == 200
+    - new_server_prom_kv.status == 404
+    - inventory_hostname == destination_hostname
+  run_once: true
+
+# Cleanup source server KV entries
+- name: Delete source server API KV entry
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
+    method: DELETE
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    status_code: 200
+  delegate_to: localhost
+  when: 
+    - migrate_delete_source | default(false) | bool
+    - inventory_hostname == destination_hostname
+  run_once: true
+
+- name: Delete source server Prometheus KV entry
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ source_kv_hostname }}"
+    method: DELETE
+    headers:
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    status_code: 200
+  delegate_to: localhost
+  when: 
+    - migrate_delete_source | default(false) | bool
+    - inventory_hostname == destination_hostname
+  run_once: true

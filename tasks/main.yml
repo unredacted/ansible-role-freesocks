@@ -54,25 +54,25 @@
           - "KV Hostname: {{ kv_hostname }}"
 
     - name: Include installation tasks
-      include_tasks: install.yml
+      include_tasks: setup/install.yml
 
     - name: Include Outline server tasks
-      include_tasks: outline.yml
+      include_tasks: setup/outline.yml
 
     - name: Debug Outline installation success
       debug:
         msg: "Outline installation success: {{ outline_install_success }}"
 
     - name: Include DNS tasks
-      include_tasks: dns.yml
+      include_tasks: setup/dns.yml
       when: outline_install_success | bool
 
     - name: Include tunnel tasks
-      include_tasks: tunnel.yml
+      include_tasks: setup/tunnel.yml
       when: outline_install_success | bool
 
     - name: Include KV store tasks
-      include_tasks: kv.yml
+      include_tasks: setup/kv.yml
       when: outline_install_success | bool
   when: operation_mode == 'deploy'
 
@@ -101,9 +101,9 @@
         - outline_path.stat.exists | default(false)
 
     - name: Include installation tasks
-      include_tasks: install.yml
+      include_tasks: setup/install.yml
       when: inventory_hostname == destination_hostname
 
     - name: Include migration tasks
-      include_tasks: migrate.yml
+      include_tasks: migrate/migrate.yml
   when: operation_mode == 'migrate'

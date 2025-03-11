@@ -1,0 +1,77 @@
+---
+# tasks/migrate/transfer_config.yml - Configuration transfer tasks
+
+# Transfer configuration
+- name: Create archive of Outline directory
+  archive:
+    path: /opt/outline
+    dest: /tmp/outline.tar.gz
+    format: gz
+  become: yes
+  when: inventory_hostname == source_hostname
+  register: archive_created
+
+- name: Fetch archive from source server
+  fetch:
+    src: /tmp/outline.tar.gz
+    dest: "/tmp/outline-migration-{{ source_kv_hostname }}.tar.gz"
+    flat: yes
+  become: yes
+  when: inventory_hostname == source_hostname
+  register: fetch_completed
+
+- name: Rename source Outline directory
+  command: mv /opt/outline /opt/outline.migrated
+  become: yes
+  when: inventory_hostname == source_hostname
+
+- name: Copy archive to destination server
+  copy:
+    src: "/tmp/outline-migration-{{ source_kv_hostname }}.tar.gz"
+    dest: /tmp/outline.tar.gz
+    mode: '0644'
+    remote_src: no
+  become: yes
+  when: inventory_hostname == destination_hostname
+  register: copy_completed
+
+- name: Extract archive on destination server
+  unarchive:
+    src: /tmp/outline.tar.gz
+    dest: /opt
+    remote_src: yes
+  become: yes
+  when: inventory_hostname == destination_hostname
+  register: extract_completed
+
+- name: Clean up archive files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/outline.tar.gz"
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+# Update configuration files
+- name: Replace source hostnames with destination hostnames in files
+  replace:
+    path: "{{ item }}"
+    regexp: "{{ source_hostname }}"
+    replace: "{{ destination_hostname }}"
+  with_items:
+    - "/opt/outline/access.txt"
+    - "/opt/outline/persisted-state/shadowbox_server_config.json"
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Replace source KV hostnames with destination KV hostnames in files
+  replace:
+    path: "{{ item }}"
+    regexp: "{{ source_kv_hostname }}"
+    replace: "{{ destination_kv_hostname }}"
+  with_items:
+    - "/opt/outline/access.txt"
+    - "/opt/outline/persisted-state/shadowbox_server_config.json"
+  become: yes
+  when: inventory_hostname == destination_hostname
