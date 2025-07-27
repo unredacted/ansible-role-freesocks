@@ -19,6 +19,11 @@ random_hostname_length: 6
 outline_api_port: 8443
 outline_keys_port: 443
 
+# Custom Docker image for Shadowbox (optional)
+# If set, this image will be used instead of the default
+# Example: custom_docker_image_shadowbox: "ghcr.io/unredacted/outline/shadowbox:latest"
+# custom_docker_image_shadowbox:
+
 # Optional hostname extension appended to server names
 hostname_extension: ""
 

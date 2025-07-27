@@ -6,7 +6,7 @@
     content: |
       #!/usr/bin/expect -f
       set timeout -1
-      spawn bash -c "bash <(wget -qO- https://raw.githubusercontent.com/Jigsaw-Code/outline-server/master/src/server_manager/install_scripts/install_server.sh) --hostname={{ random_hostname }}.{{ base_domain }} --keys-port={{ outline_keys_port }} --api-port={{ outline_api_port }}"
+      spawn bash -c "{% if custom_docker_image_shadowbox is defined %}export SB_IMAGE='{{ custom_docker_image_shadowbox }}' && {% endif %}bash <(wget -qO- https://raw.githubusercontent.com/Jigsaw-Code/outline-server/master/src/server_manager/install_scripts/install_server.sh) --hostname={{ random_hostname }}.{{ base_domain }} --keys-port={{ outline_keys_port }} --api-port={{ outline_api_port }}"
       expect {
         "Would you like to install Docker?" {
           send "y\r"
