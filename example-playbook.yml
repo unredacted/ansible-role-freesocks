@@ -14,8 +14,10 @@
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_zone_id: "your-zone-id"
-    cloudflare_api_kv_namespace: "your-api-kv-namespace"
-    cloudflare_prom_kv_namespace: "your-prom-kv-namespace"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
 
@@ -53,8 +55,10 @@
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_zone_id: "your-zone-id"
-    cloudflare_api_kv_namespace: "your-api-kv-namespace"
-    cloudflare_prom_kv_namespace: "your-prom-kv-namespace"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
 
@@ -74,6 +78,8 @@
 # [new_servers]
 # outline2-fra ansible_host=10.0.0.2
 
-# Usage:
-# Deploy:  ansible-playbook -i hosts example-playbook.yml --extra-vars "operation_mode=deploy kv_hostname_prefix=outline2-fra"
-# Migrate: ansible-playbook -i hosts example-playbook.yml --extra-vars "operation_mode=migrate source_hostname=outline1-ams destination_hostname=outline2-fra"
+# Usage (environment_mode is required for all operations):
+# Deploy (production):  ansible-playbook -i hosts example-playbook.yml --extra-vars "operation_mode=deploy environment_mode=prod kv_hostname_prefix=outline2-fra"
+# Deploy (dev mode):    ansible-playbook -i hosts example-playbook.yml --extra-vars "operation_mode=deploy environment_mode=dev kv_hostname_prefix=outline-test"
+# Migrate (production): ansible-playbook -i hosts example-playbook.yml --extra-vars "operation_mode=migrate environment_mode=prod source_hostname=outline1-ams destination_hostname=outline2-fra"
+# Migrate (dev mode):   ansible-playbook -i hosts example-playbook.yml --extra-vars "operation_mode=migrate environment_mode=dev source_hostname=outline1-ams destination_hostname=outline2-fra"

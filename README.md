@@ -32,10 +32,14 @@ cloudflare_email: "your-email@example.com"
 cloudflare_api_token: "your-api-token"
 cloudflare_account_id: "your-account-id"
 cloudflare_zone_id: "your-zone-id"
-cloudflare_api_kv_namespace: "your-api-kv-namespace"
-cloudflare_prom_kv_namespace: "your-prom-kv-namespace"
 cloudflare_access_team_name: "your-team-name"
 cloudflare_access_aud_tag: "your-aud-tag"
+
+# KV Namespace Configuration
+cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
 
 # Domain Configuration
 base_domain: "example.com"
@@ -57,6 +61,9 @@ envoy_mappings:
 ### Optional Variables
 
 ```yaml
+# Environment mode (required, set via --extra-vars)
+environment_mode: "prod"  # or "dev" for testing with development KV namespaces
+
 # Operation mode (required but typically set in playbook)
 operation_mode: "deploy"  # or "migrate"
 
@@ -79,6 +86,28 @@ migrate_delete_source: false  # Whether to delete source server KV entries after
 source_hostname: ""          # Required for migration
 destination_hostname: ""     # Required for migration
 ```
+
+## Environment Modes
+
+The role supports two environment modes for managing KV namespaces:
+
+### Production Mode
+
+Uses production KV namespaces for live deployments:
+```bash
+ansible-playbook -i inventory playbook.yml \
+  --extra-vars "operation_mode=deploy environment_mode=prod"
+```
+
+### Development Mode
+
+Uses development KV namespaces for testing without affecting production data:
+```bash
+ansible-playbook -i inventory playbook.yml \
+  --extra-vars "operation_mode=deploy environment_mode=dev"
+```
+
+Both modes create the same DNS records and tunnel configurations - only the KV namespace used for storing server endpoints differs.
 
 ## Operation Modes
 
