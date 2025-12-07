@@ -70,6 +70,21 @@ additional_connect_domains: []
 # This must be explicitly set via --extra-vars to prevent accidental deployments
 # environment_mode: prod
 
+# Provider Configuration
+# These must be explicitly set via --extra-vars
+
+# dns_provider: 'cloudflare'
+#   - cloudflare: Manage DNS via Cloudflare API
+#   Future: fastly, route53, etc.
+
+# tunnel_provider: 'cloudflare' or 'none'
+#   - cloudflare: Set up Cloudflare Tunnel for API/Prometheus access
+#   - none: Skip tunnel setup (direct access to API/Prometheus ports)
+
+# kv_provider: 'cloudflare'
+#   - cloudflare: Store server endpoints in Cloudflare KV
+#   Future: fastly, redis, etc.
+
 # Required variables that must be set by the user:
 # cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
 # cloudflare_email: "your-email@example.com"

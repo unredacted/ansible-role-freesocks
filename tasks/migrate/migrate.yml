@@ -1,8 +1,9 @@
 # tasks/migrate/migrate.yml - Migration tasks orchestration
 
-# Verify source server and stop containers
-- name: Include source verification tasks
-  include_tasks: verify_source.yml
+# Verify source server and stop containers (provider-specific)
+- name: Include source verification tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/migrate/verify_source.yml
+  when: kv_provider == 'cloudflare'
 
 # Setup destination server
 - name: Set variables for Outline installation
@@ -36,36 +37,41 @@
     - inventory_hostname == destination_hostname
     - outline_install_success | default(false) | bool
 
-# Transfer configuration and update files
+# Transfer configuration and update files (provider-agnostic)
 - name: Include configuration transfer tasks
   include_tasks: transfer_config.yml
 
-# Clean up existing tunnel if needed
-- name: Include tunnel cleanup tasks
-  include_tasks: tunnel_cleanup.yml
+# Clean up existing tunnel if needed (provider-specific)
+- name: Include tunnel cleanup tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/migrate/tunnel_cleanup.yml
+  when: tunnel_provider == 'cloudflare'
 
-# Manage containers
+# Manage containers (provider-agnostic)
 - name: Include container management tasks
   include_tasks: containers.yml
 
-# Clean up any existing tunnel for destination hostname
-- name: Include destination tunnel cleanup tasks
-  include_tasks: destination_tunnel_cleanup.yml
+# Clean up any existing tunnel for destination hostname (provider-specific)
+- name: Include destination tunnel cleanup tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/migrate/destination_tunnel_cleanup.yml
   when:
     - inventory_hostname == destination_hostname
     - outline_install_success | default(false) | bool
+    - tunnel_provider == 'cloudflare'
 
-# Setup Cloudflare tunnel
-- name: Include tunnel tasks
-  include_tasks: ../setup/tunnel.yml
+# Setup tunnel (provider-specific)
+- name: Include tunnel tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/tunnel.yml
   when: 
     - inventory_hostname == destination_hostname
     - outline_install_success | default(false) | bool
+    - tunnel_provider == 'cloudflare'
 
-# Setup DNS records
-- name: Include DNS record management tasks
-  include_tasks: dns_records.yml
+# Setup DNS records (provider-specific)
+- name: Include DNS record management tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/migrate/dns_records.yml
+  when: dns_provider == 'cloudflare'
 
-# Update KV store entries
-- name: Include KV store management tasks
-  include_tasks: kv_store.yml
+# Update KV store entries (provider-specific)
+- name: Include KV store management tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/migrate/kv_store.yml
+  when: kv_provider == 'cloudflare'

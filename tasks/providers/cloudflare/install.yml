@@ -1,0 +1,34 @@
+---
+# providers/cloudflare/install.yml - Cloudflare-specific package installation
+
+- name: Create directory for keyrings
+  file:
+    path: /usr/share/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Add Cloudflare GPG key
+  ansible.builtin.get_url:
+    url: https://pkg.cloudflare.com/cloudflare-main.gpg
+    dest: /usr/share/keyrings/cloudflare-main.gpg
+    mode: '0644'
+  become: yes
+
+- name: Add Cloudflare repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared {{ cloudflared_os_version }} main"
+    state: present
+    filename: cloudflared
+  become: yes
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install cloudflared
+  apt:
+    name: cloudflared
+    state: present
+  become: yes

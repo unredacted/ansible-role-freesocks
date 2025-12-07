@@ -3,9 +3,8 @@
 An Ansible role for deploying and managing Outline VPN servers for [FreeSocks](https://freesocks.org/). This role supports both new server deployments and migrations between servers, with features including:
 
 - Automated Outline server installation and configuration
-- Cloudflare DNS record management with IPv4 and IPv6 support
-- Cloudflare Tunnel setup for secure API access
-- KV store integration for server management
+- Pluggable provider architecture for DNS, tunnel, and KV store
+- Cloudflare integration (DNS, Tunnel, KV) with more providers coming soon
 - Multi-domain support
 - Server migration capabilities
 
@@ -14,19 +13,43 @@ An Ansible role for deploying and managing Outline VPN servers for [FreeSocks](h
 - Debian-based Linux system (tested on Debian only)
 - Python 3.x
 - Docker (will be installed by the role)
-- Cloudflare account with:
-  - API token with appropriate permissions
-  - Account ID
-  - Zone ID(s)
-  - KV namespaces for API and Prometheus endpoints
-  - Access Team configuration (for Prometheus access)
+- Provider-specific requirements (see Provider Configuration)
+
+## Provider Configuration
+
+The role uses a pluggable provider architecture. All providers must be explicitly set via `--extra-vars`.
+
+| Provider | Options | Purpose |
+|----------|---------|---------|
+| `dns_provider` | `cloudflare` | DNS record management |
+| `tunnel_provider` | `cloudflare`, `none` | Secure tunnel for API/Prometheus access |
+| `kv_provider` | `cloudflare` | Server endpoint storage |
+
+### Cloudflare Provider Requirements
+
+When using Cloudflare providers, you need:
+- API token with appropriate permissions
+- Account ID and Zone ID(s)
+- KV namespaces (for `kv_provider: cloudflare`)
+- Access Team configuration (for Prometheus access via tunnel)
 
 ## Role Variables
 
 ### Required Variables
 
 ```yaml
-# Cloudflare Configuration
+# Provider Configuration (required via --extra-vars)
+dns_provider: "cloudflare"
+tunnel_provider: "cloudflare"  # or "none" for direct port access
+kv_provider: "cloudflare"
+
+# Environment Mode (required via --extra-vars)  
+environment_mode: "prod"  # or "dev"
+
+# Operation Mode
+operation_mode: "deploy"  # or "migrate"
+
+# Cloudflare Configuration (when using Cloudflare providers)
 cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
 cloudflare_email: "your-email@example.com"
 cloudflare_api_token: "your-api-token"
@@ -50,75 +73,57 @@ kv_hostname_prefix: "outline"
 # Envoy Mappings (for DNS records)
 envoy_mappings:
   outline1-ams:
-    ipv4:
-      - "1.2.3.4"
-      - "5.6.7.8"
-    ipv6:
-      - "2001:db8::1"
-      - "2001:db8::2"
+    ipv4: ["1.2.3.4", "5.6.7.8"]
+    ipv6: ["2001:db8::1", "2001:db8::2"]
 ```
 
 ### Optional Variables
 
 ```yaml
-# Environment mode (required, set via --extra-vars)
-environment_mode: "prod"  # or "dev" for testing with development KV namespaces
-
-# Operation mode (required but typically set in playbook)
-operation_mode: "deploy"  # or "migrate"
-
 # Server Configuration
 outline_keys_port: 443
 outline_api_port: 8443
-cloudflared_os_version: "bookworm"  # OS codename for cloudflared package
+cloudflared_os_version: "bookworm"
 random_hostname_length: 6
-hostname_extension: ""  # Optional suffix for server names
+hostname_extension: ""
 
 # Additional Domains
-additional_domains: []  # List of additional domains with optional zone_ids
-# Example:
-# additional_domains:
-#   - domain: "example.app"
-#     zone_id: "app-zone-id"  # Optional, defaults to base cloudflare_zone_id
+additional_domains: []
 
 # Migration Settings
-migrate_delete_source: false  # Whether to delete source server KV entries after migration
-source_hostname: ""          # Required for migration
-destination_hostname: ""     # Required for migration
+migrate_delete_source: false
+source_hostname: ""
+destination_hostname: ""
 ```
 
-## Environment Modes
+## Usage
 
-The role supports two environment modes for managing KV namespaces:
+All operations require explicit provider and environment mode settings:
 
-### Production Mode
-
-Uses production KV namespaces for live deployments:
 ```bash
+# Deploy with Cloudflare (full stack)
 ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod"
-```
+  --extra-vars "operation_mode=deploy environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare"
 
-### Development Mode
-
-Uses development KV namespaces for testing without affecting production data:
-```bash
+# Deploy without tunnel (direct port access)
 ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=dev"
-```
+  --extra-vars "operation_mode=deploy environment_mode=prod dns_provider=cloudflare tunnel_provider=none kv_provider=cloudflare"
 
-Both modes create the same DNS records and tunnel configurations - only the KV namespace used for storing server endpoints differs.
+# Migrate server
+ansible-playbook -i inventory playbook.yml \
+  --extra-vars "operation_mode=migrate environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare source_hostname=outline1-ams destination_hostname=outline2-fra"
+```
 
 ## Operation Modes
 
 ### Deploy Mode
 
-Deploys a new Outline server with the following steps:
-1. Verifies /opt/outline doesn't exist
-2. Installs required packages and Docker
+Deploys a new Outline server:
+1. Validates provider and environment configuration
+2. Installs required packages (provider-specific)
 3. Installs and configures Outline server
-4. Sets up DNS records (A and AAAA)
-5. Configures Cloudflare Tunnel
+4. Sets up DNS records via configured provider
+5. Configures tunnel (if `tunnel_provider != none`)
 6. Updates KV store with server information
 
 ### Migrate Mode
@@ -131,46 +136,25 @@ Migrates an existing Outline server to a new location:
 5. Updates DNS and KV store entries
 6. Optionally deletes source server KV entries
 
-## Important Notes
+## Directory Structure
 
-- The role will fail early if /opt/outline already exists on the target system
-- All Cloudflare credentials and configuration must be provided
-- For migration, both source and destination hostnames are required
-- IPv4 and IPv6 addresses can be provided through envoy_mappings or will fall back to server's own IPs
-
-## Example Playbook
-
-```yaml
-# Deploy new server
-- hosts: new_servers
-  vars:
-    operation_mode: deploy
-    kv_hostname_prefix: "outline1-ams"
-    # ... (other required variables)
-  roles:
-    - ansible-role-freesocks
-
-# Migrate server
-- hosts: new_servers
-  vars:
-    operation_mode: migrate
-    source_hostname: "outline1-ams"
-    destination_hostname: "outline2-fra"
-    # ... (other required variables)
-  roles:
-    - ansible-role-freesocks
 ```
-
-## Usage
-
-```bash
-# Deploy new server
-ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=deploy kv_hostname_prefix=outline1-ams"
-
-# Migrate server
-ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=migrate source_hostname=outline1-ams destination_hostname=outline2-fra"
+tasks/
+├── main.yml                 # Orchestrator with provider routing
+├── setup/
+│   ├── install.yml          # Base package installation
+│   └── outline.yml          # Outline server setup
+├── migrate/
+│   ├── migrate.yml          # Migration orchestration
+│   ├── transfer_config.yml  # Config transfer (provider-agnostic)
+│   └── containers.yml       # Container management
+└── providers/
+    └── cloudflare/
+        ├── install.yml      # Cloudflared installation
+        ├── dns.yml          # DNS management
+        ├── tunnel.yml       # Tunnel setup
+        ├── kv.yml           # KV store operations
+        └── migrate/         # Migration-specific tasks
 ```
 
 ## License

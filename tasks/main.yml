@@ -1,5 +1,8 @@
 # tasks/main.yml - Main task file that includes other task files
 
+# ============================================================================
+# VALIDATION: Operation Mode
+# ============================================================================
 - name: Fail if operation mode is not specified
   fail:
     msg: "Operation mode must be explicitly set to either 'deploy' or 'migrate'"
@@ -10,6 +13,9 @@
     msg: "Operation mode must be either 'deploy' or 'migrate', got: {{ operation_mode }}"
   when: operation_mode is defined and operation_mode not in ['deploy', 'migrate']
 
+# ============================================================================
+# VALIDATION: Environment Mode
+# ============================================================================
 - name: Fail if environment mode is not specified
   fail:
     msg: "Environment mode must be explicitly set to either 'prod' or 'dev' via --extra-vars"
@@ -20,23 +26,69 @@
     msg: "Environment mode must be either 'prod' or 'dev', got: {{ environment_mode }}"
   when: environment_mode is defined and environment_mode not in ['prod', 'dev']
 
-- name: Set effective KV namespaces based on environment mode
+# ============================================================================
+# VALIDATION: Provider Configuration
+# ============================================================================
+- name: Fail if dns_provider is not specified
+  fail:
+    msg: "dns_provider must be explicitly set (e.g., 'cloudflare')"
+  when: dns_provider is not defined or dns_provider == ""
+
+- name: Fail if dns_provider is invalid
+  fail:
+    msg: "dns_provider must be 'cloudflare', got: {{ dns_provider }}"
+  when: dns_provider not in ['cloudflare']
+
+- name: Fail if tunnel_provider is not specified
+  fail:
+    msg: "tunnel_provider must be explicitly set (e.g., 'cloudflare' or 'none')"
+  when: tunnel_provider is not defined or tunnel_provider == ""
+
+- name: Fail if tunnel_provider is invalid
+  fail:
+    msg: "tunnel_provider must be 'cloudflare' or 'none', got: {{ tunnel_provider }}"
+  when: tunnel_provider not in ['cloudflare', 'none']
+
+- name: Fail if kv_provider is not specified
+  fail:
+    msg: "kv_provider must be explicitly set (e.g., 'cloudflare')"
+  when: kv_provider is not defined or kv_provider == ""
+
+- name: Fail if kv_provider is invalid
+  fail:
+    msg: "kv_provider must be 'cloudflare', got: {{ kv_provider }}"
+  when: kv_provider not in ['cloudflare']
+
+# ============================================================================
+# KV NAMESPACE SETUP (provider-specific)
+# ============================================================================
+- name: Set effective KV namespaces based on environment mode (Cloudflare)
   set_fact:
     cloudflare_api_kv_namespace: "{{ cloudflare_api_kv_namespace_dev if environment_mode == 'dev' else cloudflare_api_kv_namespace_prod }}"
     cloudflare_prom_kv_namespace: "{{ cloudflare_prom_kv_namespace_dev if environment_mode == 'dev' else cloudflare_prom_kv_namespace_prod }}"
+  when: kv_provider == 'cloudflare'
 
-- name: Fail if KV namespaces are not configured
+- name: Fail if Cloudflare KV namespaces are not configured
   fail:
     msg: "KV namespaces must be configured. Set cloudflare_api_kv_namespace_{{ environment_mode }} and cloudflare_prom_kv_namespace_{{ environment_mode }}"
-  when: cloudflare_api_kv_namespace is not defined or cloudflare_api_kv_namespace == "" or cloudflare_prom_kv_namespace is not defined or cloudflare_prom_kv_namespace == ""
+  when: 
+    - kv_provider == 'cloudflare'
+    - cloudflare_api_kv_namespace is not defined or cloudflare_api_kv_namespace == "" or cloudflare_prom_kv_namespace is not defined or cloudflare_prom_kv_namespace == ""
 
-- name: Debug environment mode and KV namespaces
+- name: Debug configuration
   debug:
     msg:
+      - "Operation Mode: {{ operation_mode }}"
       - "Environment Mode: {{ environment_mode }}"
-      - "API KV Namespace: {{ cloudflare_api_kv_namespace }}"
-      - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace }}"
+      - "DNS Provider: {{ dns_provider }}"
+      - "Tunnel Provider: {{ tunnel_provider }}"
+      - "KV Provider: {{ kv_provider }}"
+      - "API KV Namespace: {{ cloudflare_api_kv_namespace | default('N/A') }}"
+      - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace | default('N/A') }}"
 
+# ============================================================================
+# DEPLOY MODE
+# ============================================================================
 - name: Deploy new Outline server
   block:
     - name: Check if /opt/outline already exists
@@ -80,7 +132,12 @@
           - "DNS Hostname: {{ dns_hostname }}"
           - "KV Hostname: {{ kv_hostname }}"
 
-    - name: Include installation tasks
+    # Provider-specific installation
+    - name: Include Cloudflare installation tasks
+      include_tasks: providers/cloudflare/install.yml
+      when: tunnel_provider == 'cloudflare'
+
+    - name: Include base installation tasks
       include_tasks: setup/install.yml
 
     - name: Include Outline server tasks
@@ -90,19 +147,31 @@
       debug:
         msg: "Outline installation success: {{ outline_install_success }}"
 
-    - name: Include DNS tasks
-      include_tasks: setup/dns.yml
-      when: outline_install_success | bool
+    # Provider-specific DNS setup
+    - name: Include DNS tasks (Cloudflare)
+      include_tasks: providers/cloudflare/dns.yml
+      when: 
+        - outline_install_success | bool
+        - dns_provider == 'cloudflare'
 
-    - name: Include tunnel tasks
-      include_tasks: setup/tunnel.yml
-      when: outline_install_success | bool
+    # Provider-specific tunnel setup
+    - name: Include tunnel tasks (Cloudflare)
+      include_tasks: providers/cloudflare/tunnel.yml
+      when: 
+        - outline_install_success | bool
+        - tunnel_provider == 'cloudflare'
 
-    - name: Include KV store tasks
-      include_tasks: setup/kv.yml
-      when: outline_install_success | bool
+    # Provider-specific KV store setup
+    - name: Include KV store tasks (Cloudflare)
+      include_tasks: providers/cloudflare/kv.yml
+      when: 
+        - outline_install_success | bool
+        - kv_provider == 'cloudflare'
   when: operation_mode == 'deploy'
 
+# ============================================================================
+# MIGRATE MODE
+# ============================================================================
 - name: Migrate existing Outline server
   block:
     - name: Verify required migration variables
@@ -127,7 +196,14 @@
         - inventory_hostname == destination_hostname
         - outline_path.stat.exists | default(false)
 
-    - name: Include installation tasks
+    # Provider-specific installation
+    - name: Include Cloudflare installation tasks
+      include_tasks: providers/cloudflare/install.yml
+      when: 
+        - inventory_hostname == destination_hostname
+        - tunnel_provider == 'cloudflare'
+
+    - name: Include base installation tasks
       include_tasks: setup/install.yml
       when: inventory_hostname == destination_hostname
 
