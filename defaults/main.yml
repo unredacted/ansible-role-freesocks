@@ -19,6 +19,22 @@ random_hostname_length: 6
 outline_api_port: 8443
 outline_keys_port: 443
 
+# WebSocket (WSS) Support Configuration
+# Enable SS over WSS for improved censorship resistance
+# When enabled, Caddy will handle HTTPS on port 443 and proxy WebSocket traffic
+outline_wss_enabled: false
+
+# Caddy Web Server Configuration (used when outline_wss_enabled is true)
+# Auto HTTPS uses ACME to obtain certificates automatically
+outline_caddy_auto_https: true
+outline_caddy_email: ""        # Required for auto HTTPS (ACME registration)
+outline_caddy_domain: ""       # Defaults to dns_hostname if not set
+
+# WebSocket Listener Paths
+outline_wss_tcp_path: "/tcp"
+outline_wss_udp_path: "/udp"
+outline_wss_server_port: 8080  # Internal WebSocket server port (proxied by Caddy)
+
 # Custom Docker image for Shadowbox (optional)
 # If set, this image will be used instead of the default
 # Example: custom_docker_image_shadowbox: "ghcr.io/unredacted/outline/shadowbox:latest"

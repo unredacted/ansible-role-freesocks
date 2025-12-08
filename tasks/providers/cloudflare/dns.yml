@@ -154,14 +154,14 @@
     body:
       type: A
       name: "{{ random_hostname }}"
-      content: "{{ ansible_facts["default_ipv4"]["address"] }}"
+      content: '{{ ansible_facts["default_ipv4"]["address"] }}'
       ttl: 1
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
   when: 
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined
-    - ansible_facts["default_ipv4"]["address"] is defined
+    - ansible_facts['default_ipv4']['address'] is defined
   register: fallback_dns_a_record_result
 
 - name: Debug fallback DNS A record result
@@ -181,14 +181,14 @@
     body:
       type: AAAA
       name: "{{ random_hostname }}"
-      content: "{{ ansible_facts["default_ipv6"]["address"] }}"
+      content: '{{ ansible_facts["default_ipv6"]["address"] }}'
       ttl: 1
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
   when: 
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined
-    - ansible_facts["default_ipv6"]["address"] is defined
+    - ansible_facts['default_ipv6']['address'] is defined
   register: fallback_dns_aaaa_record_result
 
 - name: Debug fallback DNS AAAA record result
@@ -209,7 +209,7 @@
     body:
       type: A
       name: "{{ random_hostname }}"
-      content: "{{ ansible_facts["default_ipv4"]["address"] }}"
+      content: '{{ ansible_facts["default_ipv4"]["address"] }}'
       ttl: 1
       proxied: false
     status_code: [200, 201]
@@ -218,7 +218,7 @@
   when: 
     - additional_connect_domains is defined
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
-    - ansible_facts["default_ipv4"]["address"] is defined
+    - ansible_facts['default_ipv4']['address'] is defined
   register: additional_fallback_dns_a_records_result
 
 - name: Add fallback DNS AAAA records for additional connect domains
@@ -233,7 +233,7 @@
     body:
       type: AAAA
       name: "{{ random_hostname }}"
-      content: "{{ ansible_facts["default_ipv6"]["address"] }}"
+      content: '{{ ansible_facts["default_ipv6"]["address"] }}'
       ttl: 1
       proxied: false
     status_code: [200, 201]
@@ -242,7 +242,7 @@
   when: 
     - additional_connect_domains is defined
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
-    - ansible_facts["default_ipv6"]["address"] is defined
+    - ansible_facts['default_ipv6']['address'] is defined
   register: additional_fallback_dns_aaaa_records_result
 
 - name: Debug additional domains DNS records results

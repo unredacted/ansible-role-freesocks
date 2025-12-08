@@ -96,6 +96,28 @@ source_hostname: ""
 destination_hostname: ""
 ```
 
+### WebSocket (WSS) Support
+
+Enable Shadowsocks over WebSocket for improved censorship resistance. This tunnels Shadowsocks traffic over HTTPS, making it appear as regular web traffic.
+
+```yaml
+# Enable WSS support
+outline_wss_enabled: true
+
+# Caddy configuration for automatic HTTPS
+outline_caddy_auto_https: true
+outline_caddy_email: "admin@example.com"
+outline_caddy_domain: ""  # Defaults to server hostname
+
+# WebSocket paths (defaults shown)
+outline_wss_tcp_path: "/tcp"
+outline_wss_udp_path: "/udp"
+outline_wss_server_port: 8080
+```
+
+> **Important:** When using WSS, set `outline_keys_port` to a non-443 port (e.g., 853) 
+> so that Caddy can use port 443 for HTTPS/WebSocket traffic.
+
 ## Usage
 
 All operations require explicit provider and environment mode settings:

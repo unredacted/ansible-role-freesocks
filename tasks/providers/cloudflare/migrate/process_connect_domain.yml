@@ -128,7 +128,7 @@
     body:
       type: A
       name: "{{ destination_kv_hostname }}"
-      content: "{{ ansible_facts["default_ipv4"]["address"] }}"
+      content: '{{ ansible_facts["default_ipv4"]["address"] }}'
       ttl: 1
       proxied: false
     status_code: [200, 201]
@@ -136,7 +136,7 @@
   when:
     - domain_records.json.result | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
-    - ansible_facts["default_ipv4"]["address"] is defined
+    - ansible_facts['default_ipv4']['address'] is defined
 
 # Add fallback AAAA record if no existing records and no envoy mappings
 - name: Add fallback AAAA record for connect domain
@@ -151,7 +151,7 @@
     body:
       type: AAAA
       name: "{{ destination_kv_hostname }}"
-      content: "{{ ansible_facts["default_ipv6"]["address"] }}"
+      content: '{{ ansible_facts["default_ipv6"]["address"] }}'
       ttl: 1
       proxied: false
     status_code: [200, 201]
@@ -159,4 +159,4 @@
   when:
     - domain_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
-    - ansible_facts["default_ipv6"]["address"] is defined
+    - ansible_facts['default_ipv6']['address'] is defined

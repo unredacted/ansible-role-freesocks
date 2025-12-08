@@ -1,0 +1,81 @@
+---
+# tasks/setup/websocket.yml - Configure WebSocket (WSS) support
+# This configures the Outline server to use Shadowsocks over WebSocket (SS over WSS)
+# for improved censorship resistance.
+
+- name: Set effective Caddy domain
+  set_fact:
+    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname) }}"
+
+- name: Wait for Outline API to be available
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server"
+    method: GET
+    validate_certs: no
+  register: api_check
+  retries: 10
+  delay: 5
+  until: api_check.status == 200
+
+- name: Configure listeners for new access keys (WebSocket-only)
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/listeners-for-new-access-keys"
+    method: PUT
+    body_format: json
+    body:
+      websocketStream:
+        path: "{{ outline_wss_tcp_path }}"
+        webServerPort: "{{ outline_wss_server_port }}"
+      websocketPacket:
+        path: "{{ outline_wss_udp_path }}"
+        webServerPort: "{{ outline_wss_server_port }}"
+    validate_certs: no
+    status_code: 204
+  register: listeners_result
+
+- name: Debug listeners configuration
+  debug:
+    msg: "Listeners configured: TCP path={{ outline_wss_tcp_path }}, UDP path={{ outline_wss_udp_path }}"
+
+- name: Enable Caddy web server with auto HTTPS
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/web-server"
+    method: PUT
+    body_format: json
+    body:
+      enabled: true
+      autoHttps: "{{ outline_caddy_auto_https }}"
+      email: "{{ outline_caddy_email }}"
+      domain: "{{ effective_caddy_domain }}"
+    validate_certs: no
+    status_code: 204
+  register: caddy_result
+  when: outline_caddy_auto_https
+
+- name: Enable Caddy web server without auto HTTPS
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/web-server"
+    method: PUT
+    body_format: json
+    body:
+      enabled: true
+      autoHttps: false
+      domain: "{{ effective_caddy_domain }}"
+    validate_certs: no
+    status_code: 204
+  register: caddy_result_no_https
+  when: not outline_caddy_auto_https
+
+- name: Display WSS configuration success
+  debug:
+    msg: |
+      WebSocket (WSS) support configured successfully!
+      
+      Caddy Domain: {{ effective_caddy_domain }}
+      Auto HTTPS: {{ outline_caddy_auto_https }}
+      TCP Path: {{ outline_wss_tcp_path }}
+      UDP Path: {{ outline_wss_udp_path }}
+      Internal WS Port: {{ outline_wss_server_port }}
+      
+      New access keys will be WebSocket-only by default.
+      Caddy is listening on port 443 for HTTPS/WSS traffic.
