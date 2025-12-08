@@ -1,6 +1,19 @@
 # tasks/main.yml - Main task file that includes other task files
 
 # ============================================================================
+# VALIDATION: Vault Decryption Check
+# ============================================================================
+- name: Fail if vault-encrypted variables are not decrypted
+  fail:
+    msg: |
+      Vault-encrypted variables detected but not decrypted!
+      Please run the playbook with --ask-vault-pass or configure vault password file.
+      Example: ansible-playbook playbook.yml --ask-vault-pass --extra-vars "..."
+  when: >
+    (cloudflare_api_token is defined and cloudflare_api_token is string and 
+     '$ANSIBLE_VAULT;' in cloudflare_api_token)
+
+# ============================================================================
 # VALIDATION: Operation Mode
 # ============================================================================
 - name: Fail if operation mode is not specified
