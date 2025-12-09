@@ -32,7 +32,7 @@
     body_format: json
     body:
       type: CNAME
-      name: "{{ kv_hostname }}-api"
+      name: "{{ kv_hostname }}{{ api_hostname_suffix }}"
       content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
       ttl: 1
       proxied: true
@@ -50,7 +50,7 @@
     body_format: json
     body:
       type: CNAME
-      name: "{{ kv_hostname }}-prom"
+      name: "{{ kv_hostname }}{{ prom_hostname_suffix }}"
       content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
       ttl: 1
       proxied: true
@@ -68,7 +68,7 @@
     body_format: json
     body:
       type: CNAME
-      name: "{{ kv_hostname }}-api"
+      name: "{{ kv_hostname }}{{ api_hostname_suffix }}"
       content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
       ttl: 1
       proxied: true
@@ -109,15 +109,15 @@
 
 - name: Add API ingress configuration
   set_fact:
-    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + '-api.' + api_domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
+    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + api_hostname_suffix + '.' + api_domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
 
 - name: Add Prometheus ingress configuration
   set_fact:
-    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + '-prom.' + prom_domain, 'service': 'http://127.0.0.1:9090', 'originRequest': {'access': {'required': true, 'teamName': cloudflare_access_team_name, 'audTag': [cloudflare_access_aud_tag]}}}] }}"
+    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + prom_hostname_suffix + '.' + prom_domain, 'service': 'http://127.0.0.1:9090', 'originRequest': {'access': {'required': true, 'teamName': cloudflare_access_team_name, 'audTag': [cloudflare_access_aud_tag]}}}] }}"
 
 - name: Add additional domain ingress configurations
   set_fact:
-    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + '-api.' + item.domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
+    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + api_hostname_suffix + '.' + item.domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
   loop: "{{ additional_domains }}"
 
 - name: Add catch-all rule to ingress configuration

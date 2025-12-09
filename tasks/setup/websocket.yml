@@ -47,6 +47,7 @@
       autoHttps: "{{ outline_caddy_auto_https }}"
       email: "{{ outline_caddy_email }}"
       domain: "{{ effective_caddy_domain }}"
+      apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
     validate_certs: no
     status_code: 204
   register: caddy_result
@@ -61,6 +62,7 @@
       enabled: true
       autoHttps: false
       domain: "{{ effective_caddy_domain }}"
+      apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
     validate_certs: no
     status_code: 204
   register: caddy_result_no_https

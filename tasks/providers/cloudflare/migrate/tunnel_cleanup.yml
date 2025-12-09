@@ -60,7 +60,7 @@
     - source_kv_hostname == destination_kv_hostname
     - source_tunnel_id is defined
     - item.type == 'CNAME'
-    - (item.name == source_kv_hostname + '-api.' + api_domain or item.name == source_kv_hostname + '-prom.' + prom_domain)
+    - (item.name == source_kv_hostname + api_hostname_suffix + '.' + api_domain or item.name == source_kv_hostname + prom_hostname_suffix + '.' + prom_domain)
   run_once: true
 
 - name: Delete tunnel DNS CNAME records for additional domains
@@ -81,7 +81,7 @@
     - source_kv_hostname == destination_kv_hostname
     - source_tunnel_id is defined
     - item[1].type == 'CNAME'
-    - item[1].name == source_kv_hostname + '-api.' + item[0].domain
+    - item[1].name == source_kv_hostname + api_hostname_suffix + '.' + item[0].domain
   run_once: true
 
 - name: Delete existing tunnel

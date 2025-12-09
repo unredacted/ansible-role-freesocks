@@ -35,6 +35,17 @@ outline_wss_tcp_path: "/tcp"
 outline_wss_udp_path: "/udp"
 outline_wss_server_port: 8080  # Internal WebSocket server port (proxied by Caddy)
 
+# API Proxy Configuration
+# When set, Caddy will reverse proxy the management API with valid TLS certificates
+# This enables access from platforms that reject self-signed certs (e.g., Cloudflare Workers)
+outline_api_proxy_path: "/api"  # Path prefix for API (e.g., "/api" -> https://domain/api/...)
+
+# API and Prometheus Hostname Suffixes
+# When using Caddy proxy, these can be empty (everything goes through port 443)
+# Set to "-api" or "-prom" for separate subdomains (legacy behavior)
+api_hostname_suffix: ""   # e.g., "" for same domain, "-api" for api subdomain
+prom_hostname_suffix: ""  # e.g., "" for same domain, "-prom" for prom subdomain
+
 # Custom Docker image for Shadowbox (optional)
 # If set, this image will be used instead of the default
 # Example: custom_docker_image_shadowbox: "ghcr.io/unredacted/outline/shadowbox:latest"

@@ -162,7 +162,7 @@
     - inventory_hostname == destination_hostname
     - api_domain is defined
     - item.type == 'CNAME'
-    - (item.name == source_kv_hostname + '-api.' + api_domain or item.name == source_kv_hostname + '-prom.' + prom_domain)
+    - (item.name == source_kv_hostname + api_hostname_suffix + '.' + api_domain or item.name == source_kv_hostname + prom_hostname_suffix + '.' + prom_domain)
   run_once: true
 
 # Fallback DNS records if no existing records found and no envoy mappings

@@ -113,6 +113,15 @@ outline_caddy_domain: ""  # Defaults to server hostname
 outline_wss_tcp_path: "/tcp"
 outline_wss_udp_path: "/udp"
 outline_wss_server_port: 8080
+
+# API Proxy - enables valid TLS for API access (for control planes, etc.)
+outline_api_proxy_path: "/api"  # API available at https://domain/api/...
+
+# Hostname suffixes for API and Prometheus endpoints
+# Empty when using Caddy proxy (everything goes through port 443)
+# Set to "-api"/"-prom" for legacy separate subdomains
+api_hostname_suffix: ""   # e.g., "" -> abc123.domain.com, "-api" -> abc123-api.domain.com
+prom_hostname_suffix: ""
 ```
 
 > **Important:** When using WSS, set `outline_keys_port` to a non-443 port (e.g., 853) 
