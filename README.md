@@ -87,6 +87,10 @@ cloudflared_os_version: "bookworm"
 random_hostname_length: 6
 hostname_extension: ""
 
+# DNS Proxy (Cloudflare orange cloud, Fastly shield, etc.)
+# When true, traffic is proxied through the CDN
+dns_proxied: false  # Set to true for CDN proxy mode
+
 # Additional Domains
 additional_domains: []
 

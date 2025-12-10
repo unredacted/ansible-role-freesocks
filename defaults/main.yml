@@ -39,6 +39,11 @@ change_delete_old_dns: true
 # Whether to delete old KV entries after hostname change
 change_delete_old_kv: true
 
+# DNS Proxy Settings
+# Enable CDN proxy for DNS records (Cloudflare orange cloud, Fastly shield, etc.)
+# When true, traffic is proxied through the CDN; when false, DNS-only mode
+dns_proxied: false
+
 # Common settings
 # OS version for cloudflared installation (e.g., "bookworm", "jammy")
 cloudflared_os_version: "{{ ansible_distribution_release }}"

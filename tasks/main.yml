@@ -42,25 +42,36 @@
 # ============================================================================
 # VALIDATION: Provider Configuration
 # ============================================================================
+# Note: For change mode, dns_provider and tunnel_provider are derived from domain_providers
 - name: Fail if dns_provider is not specified
   fail:
     msg: "dns_provider must be explicitly set (e.g., 'cloudflare')"
-  when: dns_provider is not defined or dns_provider == ""
+  when:
+    - operation_mode != 'change'
+    - dns_provider is not defined or dns_provider == ""
 
 - name: Fail if dns_provider is invalid
   fail:
     msg: "dns_provider must be 'cloudflare', got: {{ dns_provider }}"
-  when: dns_provider not in ['cloudflare']
+  when:
+    - operation_mode != 'change'
+    - dns_provider is defined
+    - dns_provider not in ['cloudflare']
 
 - name: Fail if tunnel_provider is not specified
   fail:
     msg: "tunnel_provider must be explicitly set (e.g., 'cloudflare' or 'none')"
-  when: tunnel_provider is not defined or tunnel_provider == ""
+  when:
+    - operation_mode != 'change'
+    - tunnel_provider is not defined or tunnel_provider == ""
 
 - name: Fail if tunnel_provider is invalid
   fail:
     msg: "tunnel_provider must be 'cloudflare' or 'none', got: {{ tunnel_provider }}"
-  when: tunnel_provider not in ['cloudflare', 'none']
+  when:
+    - operation_mode != 'change'
+    - tunnel_provider is defined
+    - tunnel_provider not in ['cloudflare', 'none']
 
 - name: Fail if kv_provider is not specified
   fail:
@@ -93,8 +104,8 @@
     msg:
       - "Operation Mode: {{ operation_mode }}"
       - "Environment Mode: {{ environment_mode }}"
-      - "DNS Provider: {{ dns_provider }}"
-      - "Tunnel Provider: {{ tunnel_provider }}"
+      - "DNS Provider: {{ dns_provider | default('(from domain_providers)') }}"
+      - "Tunnel Provider: {{ tunnel_provider | default('(from domain_providers)') }}"
       - "KV Provider: {{ kv_provider }}"
       - "API KV Namespace: {{ cloudflare_api_kv_namespace | default('N/A') }}"
       - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace | default('N/A') }}"

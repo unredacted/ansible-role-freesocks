@@ -72,9 +72,33 @@
     src: /opt/outline/access.txt
   register: access_txt_raw
 
-- name: Parse API info from access.txt
+- name: Parse access.txt content
   set_fact:
-    outline_api_info: "{{ access_txt_raw.content | b64decode | regex_search('{.*}') | from_json }}"
+    access_txt_decoded: "{{ access_txt_raw.content | b64decode }}"
+
+- name: Debug access.txt content
+  debug:
+    msg: "access.txt content: {{ access_txt_decoded }}"
+
+# access.txt format is key:value pairs, one per line:
+# certSha256:XXXX
+# apiUrl:https://hostname:port/secret
+- name: Extract API URL from access.txt
+  set_fact:
+    api_url_line: "{{ access_txt_decoded | regex_search('apiUrl:(.+)', '\\1') | first }}"
+
+- name: Fail if API URL not found
+  fail:
+    msg: |
+      Could not find apiUrl in access.txt. File content:
+      {{ access_txt_decoded }}
+  when: api_url_line is not defined or api_url_line == ''
+
+- name: Build outline_api_info object
+  set_fact:
+    outline_api_info:
+      apiUrl: "{{ api_url_line }}"
+      certSha256: "{{ access_txt_decoded | regex_search('certSha256:(.+)', '\\1') | first | default('') }}"
 
 - name: Extract API random string
   set_fact:
@@ -86,14 +110,26 @@
       - "Current API URL: {{ outline_api_info.apiUrl }}"
       - "API Secret: {{ api_random_string }}"
 
+- name: Extract hostname from API URL
+  set_fact:
+    current_api_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^:/]+)', '\\1') | first }}"
+
+- name: Construct working API URL (forcing port 443)
+  set_fact:
+    current_working_api_url: "https://{{ current_api_hostname }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string }}"
+
+- name: Debug working API URL
+  debug:
+    msg: "Working API URL: {{ current_working_api_url }}"
+
 # ============================================================================
 # STEP 2: Get current hostname from server config
 # ============================================================================
 - name: Get current server config
   uri:
-    url: "{{ outline_api_info.apiUrl }}/server"
+    url: "{{ current_working_api_url }}/server"
     method: GET
-    validate_certs: no
+    validate_certs: yes
   register: current_server_config
 
 - name: Extract current hostname and domain
@@ -136,8 +172,12 @@
     kv_hostname: "{{ random_words.stdout_lines | join('-') }}"
     # Override base_domain for this operation to use the target domain
     base_domain: "{{ change_target_domain }}"
-    # Override zone ID for DNS operations
+    # Override api_domain and prom_domain for KV store operations
+    api_domain: "{{ change_target_domain }}"
+    prom_domain: "{{ change_target_domain }}"
+    # Override zone IDs for DNS and tunnel operations
     base_domain_cloudflare_zone_id: "{{ effective_zone_id }}"
+    cloudflare_zone_id: "{{ effective_zone_id }}"
 
 - name: Display new hostname configuration
   debug:
@@ -147,29 +187,65 @@
       - "New KV hostname: {{ kv_hostname }}"
 
 # ============================================================================
-# STEP 4: Create new DNS records (provider-specific)
+# STEP 4: Delete any existing DNS records for the new hostname (prevent conflicts)
+# ============================================================================
+- name: Get existing DNS records for new hostname (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ effective_zone_id }}/dns_records?name={{ dns_hostname }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    status_code: 200
+  delegate_to: localhost
+  register: existing_dns_records
+  when: effective_dns_provider == 'cloudflare'
+
+- name: Delete existing DNS records for new hostname (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ effective_zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      X-Auth-Email: "{{ cloudflare_email }}"
+      X-Auth-Key: "{{ cloudflare_api_token }}"
+    status_code: 200
+  delegate_to: localhost
+  loop: "{{ existing_dns_records.json.result | default([]) }}"
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - existing_dns_records.json.result | default([]) | length > 0
+
+- name: Display cleaned up existing records
+  debug:
+    msg: "Deleted {{ existing_dns_records.json.result | default([]) | length }} existing DNS records for {{ dns_hostname }}"
+  when: effective_dns_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 5: Create new DNS records (provider-specific)
 # ============================================================================
 - name: Include DNS tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/dns.yml
   when: effective_dns_provider == 'cloudflare'
 
 # ============================================================================
-# STEP 5: Create new tunnel records (provider-specific)
+# STEP 6: Create new tunnel records (provider-specific)
 # ============================================================================
 - name: Include tunnel tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/tunnel.yml
   when: effective_tunnel_provider == 'cloudflare'
 
 # ============================================================================
-# STEP 6: Update Caddy domain via Outline API
+# STEP 7: Update Caddy domain via Outline API
 # ============================================================================
 - name: Set effective Caddy domain
   set_fact:
-    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname) }}"
+    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname, true) }}"
 
 - name: Update Caddy web server domain
   uri:
-    url: "{{ outline_api_info.apiUrl }}/server/web-server"
+    url: "{{ current_working_api_url }}/server/web-server"
     method: PUT
     body_format: json
     body:
@@ -178,7 +254,7 @@
       email: "{{ outline_caddy_email }}"
       domain: "{{ effective_caddy_domain }}"
       apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
-    validate_certs: no
+    validate_certs: yes
     status_code: 204
   register: caddy_update_result
 
@@ -187,16 +263,16 @@
     msg: "Caddy domain updated to: {{ effective_caddy_domain }}"
 
 # ============================================================================
-# STEP 7: Update server hostname
+# STEP 8: Update server hostname
 # ============================================================================
 - name: Update server hostname
   uri:
-    url: "{{ outline_api_info.apiUrl }}/server/hostname-for-access-keys"
+    url: "{{ current_working_api_url }}/server/hostname-for-access-keys"
     method: PUT
     body_format: json
     body:
       hostname: "{{ dns_hostname }}"
-    validate_certs: no
+    validate_certs: yes
     status_code: 204
   register: hostname_update_result
 
@@ -205,7 +281,7 @@
     msg: "Server hostname updated to: {{ dns_hostname }}"
 
 # ============================================================================
-# STEP 8: Update local configuration files
+# STEP 9: Update local configuration files
 # ============================================================================
 - name: Update hostname in shadowbox_server_config.json
   ansible.builtin.shell: |
@@ -234,7 +310,7 @@
     msg: "Local config files updated with new hostname: {{ dns_hostname }}"
 
 # ============================================================================
-# STEP 9: Restart container to apply changes
+# STEP 10: Restart container to apply changes
 # ============================================================================
 - name: Stop shadowbox container
   docker_container:
@@ -248,13 +324,20 @@
 
 - name: Build new API URL for health check
   set_fact:
-    new_api_url: "{{ outline_api_info.apiUrl | regex_replace(old_hostname | regex_escape, dns_hostname) }}"
+    # Construct proper URL: https://hostname/api/secret (no port, uses Caddy proxy path)
+    new_api_url: "https://{{ dns_hostname }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string }}"
+
+- name: Debug new API URL
+  debug:
+    msg:
+      - "Old API URL: {{ outline_api_info.apiUrl }}"
+      - "New API URL: {{ new_api_url }}"
 
 - name: Wait for container to be healthy
   uri:
     url: "{{ new_api_url }}/server"
     method: GET
-    validate_certs: no
+    validate_certs: yes
     status_code: 200
   register: health_check
   retries: 10
@@ -266,14 +349,14 @@
     msg: "Container restarted and API accessible at: {{ new_api_url }}"
 
 # ============================================================================
-# STEP 10: Update KV store (Cloudflare)
+# STEP 11: Update KV store (Cloudflare)
 # ============================================================================
 - name: Include KV store tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/kv.yml
   when: kv_provider == 'cloudflare'
 
 # ============================================================================
-# STEP 11: Clean up old DNS records (optional)
+# STEP 12: Clean up old DNS records (optional)
 # ============================================================================
 - name: Delete old DNS A records (Cloudflare)
   block:
@@ -307,7 +390,7 @@
     - old_hostname != ''
 
 # ============================================================================
-# STEP 12: Delete old KV entries (optional)
+# STEP 13: Delete old KV entries (optional)
 # ============================================================================
 - name: Delete old KV entries (Cloudflare)
   block:

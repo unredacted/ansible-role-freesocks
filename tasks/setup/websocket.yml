@@ -5,7 +5,7 @@
 
 - name: Set effective Caddy domain
   set_fact:
-    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname) }}"
+    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname, true) }}"
 
 - name: Wait for Outline API to be available
   uri:

@@ -42,7 +42,7 @@
       name: "{{ random_hostname }}"
       content: "{{ item }}"
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ envoy_mappings[inventory_hostname].ipv4 }}"
@@ -71,7 +71,7 @@
       name: "{{ random_hostname }}"
       content: "{{ item }}"
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ envoy_mappings[inventory_hostname].ipv6 }}"
@@ -101,7 +101,7 @@
       name: "{{ random_hostname }}"
       content: "{{ item[1] }}"
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   with_nested:
@@ -128,7 +128,7 @@
       name: "{{ random_hostname }}"
       content: "{{ item[1] }}"
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   with_nested:
@@ -156,7 +156,7 @@
       name: "{{ random_hostname }}"
       content: '{{ ansible_facts["default_ipv4"]["address"] }}'
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   when: 
@@ -183,7 +183,7 @@
       name: "{{ random_hostname }}"
       content: '{{ ansible_facts["default_ipv6"]["address"] }}'
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   when: 
@@ -211,7 +211,7 @@
       name: "{{ random_hostname }}"
       content: '{{ ansible_facts["default_ipv4"]["address"] }}'
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ additional_connect_domains | default([]) }}"
@@ -235,7 +235,7 @@
       name: "{{ random_hostname }}"
       content: '{{ ansible_facts["default_ipv6"]["address"] }}'
       ttl: 1
-      proxied: false
+      proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ additional_connect_domains | default([]) }}"
