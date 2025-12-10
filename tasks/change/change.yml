@@ -1,7 +1,58 @@
 ---
 # tasks/change/change.yml - Change hostname for blocked servers
-# This operation generates a new hostname and updates DNS, Caddy, and KV store
-# without reinstalling Outline. Used when DNS filtering blocks the current hostname.
+# This operation updates DNS, Caddy, and KV store without reinstalling Outline.
+# Used when DNS filtering blocks the current hostname.
+#
+# REQUIRED VARIABLES (via --extra-vars):
+#   change_target_domain: The domain to generate a new hostname for (must exist in domain_providers)
+#
+# REQUIRED CONFIGURATION:
+#   domain_providers: A mapping of domains to their provider configuration
+#
+# Example:
+#   ansible-playbook playbook.yml \
+#     --extra-vars "operation_mode=change environment_mode=prod" \
+#     --extra-vars "change_target_domain=example.app"
+
+# ============================================================================
+# STEP 0: Validate required variables and domain configuration
+# ============================================================================
+- name: Fail if change_target_domain is not provided
+  fail:
+    msg: |
+      change_target_domain is required for change mode.
+      Please provide the target domain via --extra-vars.
+      Example: --extra-vars "change_target_domain=example.app"
+  when: change_target_domain is not defined or change_target_domain == ''
+
+- name: Fail if domain_providers is not configured
+  fail:
+    msg: |
+      domain_providers mapping is required for change mode.
+      Please configure domain_providers in your playbook with provider settings for each domain.
+  when: domain_providers is not defined or domain_providers | length == 0
+
+- name: Fail if target domain not found in domain_providers
+  fail:
+    msg: |
+      Domain '{{ change_target_domain }}' not found in domain_providers mapping.
+      Available domains: {{ domain_providers.keys() | list | join(', ') }}
+  when: change_target_domain not in domain_providers
+
+- name: Set provider configuration for target domain
+  set_fact:
+    target_domain_config: "{{ domain_providers[change_target_domain] }}"
+    effective_dns_provider: "{{ domain_providers[change_target_domain].dns_provider }}"
+    effective_tunnel_provider: "{{ domain_providers[change_target_domain].tunnel_provider | default('none') }}"
+    effective_zone_id: "{{ domain_providers[change_target_domain].zone_id }}"
+
+- name: Display change parameters
+  debug:
+    msg:
+      - "Target domain: {{ change_target_domain }}"
+      - "DNS Provider: {{ effective_dns_provider }}"
+      - "Tunnel Provider: {{ effective_tunnel_provider }}"
+      - "Zone ID: {{ effective_zone_id }}"
 
 # ============================================================================
 # STEP 1: Read existing Outline API info from access.txt
@@ -45,19 +96,28 @@
     validate_certs: no
   register: current_server_config
 
-- name: Extract current hostname
+- name: Extract current hostname and domain
   set_fact:
     old_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') }}"
-    old_kv_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('\\.' ~ base_domain ~ '$', '') }}"
+    # Extract just the random part (before the first dot)
+    old_random_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('\\..*$', '') }}"
+    # Extract the old domain (everything after the first dot)
+    old_domain: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('^[^.]+\\.', '') }}"
+
+- name: Set old KV hostname (for cleanup)
+  set_fact:
+    old_kv_hostname: "{{ old_random_hostname }}"
 
 - name: Display current hostname
   debug:
     msg:
-      - "Old Hostname: {{ old_hostname }}"
-      - "Old KV Hostname: {{ old_kv_hostname }}"
+      - "Current hostname: {{ old_hostname }}"
+      - "Current random part: {{ old_random_hostname }}"
+      - "Current domain: {{ old_domain }}"
+      - "Changing to new domain: {{ change_target_domain }}"
 
 # ============================================================================
-# STEP 3: Generate new hostname
+# STEP 3: Generate new random hostname for target domain
 # ============================================================================
 - name: Install wamerican package for word list
   apt:
@@ -69,35 +129,36 @@
   shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n 3'
   register: random_words
 
-- name: Set new random hostname
+- name: Set new hostnames for target domain
   set_fact:
     random_hostname: "{{ random_words.stdout_lines | join('-') }}"
+    dns_hostname: "{{ random_words.stdout_lines | join('-') }}.{{ change_target_domain }}"
+    kv_hostname: "{{ random_words.stdout_lines | join('-') }}"
+    # Override base_domain for this operation to use the target domain
+    base_domain: "{{ change_target_domain }}"
+    # Override zone ID for DNS operations
+    base_domain_cloudflare_zone_id: "{{ effective_zone_id }}"
 
-- name: Set new DNS hostname
-  set_fact:
-    dns_hostname: "{{ random_hostname }}.{{ base_domain }}"
-    kv_hostname: "{{ random_hostname }}"
-
-- name: Display new hostname
+- name: Display new hostname configuration
   debug:
     msg:
-      - "New Random Hostname: {{ random_hostname }}"
-      - "New DNS Hostname: {{ dns_hostname }}"
-      - "New KV Hostname: {{ kv_hostname }}"
+      - "New random hostname: {{ random_hostname }}"
+      - "New full DNS hostname: {{ dns_hostname }}"
+      - "New KV hostname: {{ kv_hostname }}"
 
 # ============================================================================
-# STEP 4: Create new DNS records (Cloudflare)
+# STEP 4: Create new DNS records (provider-specific)
 # ============================================================================
 - name: Include DNS tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/dns.yml
-  when: dns_provider == 'cloudflare'
+  when: effective_dns_provider == 'cloudflare'
 
 # ============================================================================
-# STEP 5: Create new tunnel records if using Cloudflare tunnel
+# STEP 5: Create new tunnel records (provider-specific)
 # ============================================================================
 - name: Include tunnel tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/tunnel.yml
-  when: tunnel_provider == 'cloudflare'
+  when: effective_tunnel_provider == 'cloudflare'
 
 # ============================================================================
 # STEP 6: Update Caddy domain via Outline API
@@ -148,7 +209,7 @@
 # ============================================================================
 - name: Update hostname in shadowbox_server_config.json
   ansible.builtin.shell: |
-    jq '.hostname = "{{ dns_hostname }}"' /opt/outline/persisted-state/shadowbox_server_config.json > /tmp/shadowbox_server_config.json.tmp && \
+    jq '.hostname = "{{ dns_hostname }}" | .caddyWebServer.domain = "{{ effective_caddy_domain }}"' /opt/outline/persisted-state/shadowbox_server_config.json > /tmp/shadowbox_server_config.json.tmp && \
     mv /tmp/shadowbox_server_config.json.tmp /opt/outline/persisted-state/shadowbox_server_config.json
   become: yes
 
@@ -160,19 +221,59 @@
   become: yes
   when: old_hostname != ''
 
+- name: Update hostname in Caddy config
+  ansible.builtin.replace:
+    path: /opt/outline/persisted-state/outline-caddy/config.yaml
+    regexp: '{{ old_hostname | regex_escape }}'
+    replace: '{{ dns_hostname }}'
+  become: yes
+  when: old_hostname != ''
+
 - name: Display local files updated
   debug:
     msg: "Local config files updated with new hostname: {{ dns_hostname }}"
 
 # ============================================================================
-# STEP 9: Update KV store (Cloudflare)
+# STEP 9: Restart container to apply changes
+# ============================================================================
+- name: Stop shadowbox container
+  docker_container:
+    name: shadowbox
+    state: stopped
+  become: yes
+
+- name: Start shadowbox container
+  ansible.builtin.shell: /bin/bash /opt/outline/persisted-state/start_container.sh
+  become: yes
+
+- name: Build new API URL for health check
+  set_fact:
+    new_api_url: "{{ outline_api_info.apiUrl | regex_replace(old_hostname | regex_escape, dns_hostname) }}"
+
+- name: Wait for container to be healthy
+  uri:
+    url: "{{ new_api_url }}/server"
+    method: GET
+    validate_certs: no
+    status_code: 200
+  register: health_check
+  retries: 10
+  delay: 5
+  until: health_check.status == 200
+
+- name: Display container restart complete
+  debug:
+    msg: "Container restarted and API accessible at: {{ new_api_url }}"
+
+# ============================================================================
+# STEP 10: Update KV store (Cloudflare)
 # ============================================================================
 - name: Include KV store tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/kv.yml
   when: kv_provider == 'cloudflare'
 
 # ============================================================================
-# STEP 10: Clean up old DNS records (optional)
+# STEP 11: Clean up old DNS records (optional)
 # ============================================================================
 - name: Delete old DNS A records (Cloudflare)
   block:
@@ -201,12 +302,12 @@
       loop: "{{ old_dns_records.json.result }}"
       when: old_dns_records.json.result | length > 0
   when:
-    - dns_provider == 'cloudflare'
+    - effective_dns_provider == 'cloudflare'
     - change_delete_old_dns | default(true) | bool
     - old_hostname != ''
 
 # ============================================================================
-# STEP 11: Delete old KV entries (optional)
+# STEP 12: Delete old KV entries (optional)
 # ============================================================================
 - name: Delete old KV entries (Cloudflare)
   block:
@@ -230,7 +331,7 @@
         status_code: [200, 404]
       delegate_to: localhost
   when:
-    - kv_provider == 'cloudflare'
+    - kv_provider == 'cloudflare'  # KV is global, not per-domain
     - change_delete_old_kv | default(true) | bool
     - old_kv_hostname != ''
 

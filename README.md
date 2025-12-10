@@ -146,7 +146,8 @@ ansible-playbook -i inventory playbook.yml \
 
 # Change hostname (when current hostname is blocked)
 ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=change environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare"
+  --extra-vars "operation_mode=change environment_mode=prod" \
+  --extra-vars "change_target_domain=example.app"
 ```
 
 ## Operation Modes
@@ -173,23 +174,61 @@ Migrates an existing Outline server to a new location:
 
 ### Change Mode
 
-Rotates the hostname on an existing server when the current hostname is blocked by DNS filtering:
+Rotates the hostname on an existing server when the current hostname is blocked by DNS filtering. This mode supports changing to a different domain entirely (e.g., from `example.com` to `example.app`).
 
-1. Reads existing API info from server
-2. Generates new random hostname
-3. Creates new DNS records
-4. Updates Caddy domain configuration (triggers new TLS certificate)
-5. Updates server hostname setting
-6. Updates KV store with new endpoint
-7. Optionally deletes old DNS and KV entries
+1. Validates `change_target_domain` is configured in `domain_providers`
+2. Reads existing API info from server
+3. Generates new random hostname for the target domain
+4. Creates new DNS records using the domain's configured provider
+5. Updates Caddy domain configuration (triggers new TLS certificate)
+6. Updates server hostname setting
+7. Updates local config files (shadowbox_server_config.json, access.txt, Caddy config)
+8. **Restarts container** to apply changes
+9. **Waits for health check** to confirm API accessibility
+10. Updates KV store with new endpoint
+11. Optionally deletes old DNS and KV entries
 
-**Settings:**
+**Required Configuration:**
+```yaml
+# In your playbook vars
+domain_providers:
+  example.com:
+    dns_provider: cloudflare
+    tunnel_provider: cloudflare
+    zone_id: "your-zone-id-for-com"
+  example.app:
+    dns_provider: cloudflare
+    tunnel_provider: cloudflare
+    zone_id: "your-zone-id-for-app"
+  # Future providers (framework ready)
+  # example.org:
+  #   dns_provider: fastly
+  #   tunnel_provider: none
+```
+
+**Required Variable:**
+```yaml
+# Must be passed via --extra-vars
+change_target_domain: "example.app"  # Domain to generate new hostname for
+```
+
+**Optional Settings:**
 ```yaml
 # Whether to delete old DNS records after hostname change
 change_delete_old_dns: true
 # Whether to delete old KV entries after hostname change
 change_delete_old_kv: true
 ```
+
+**Usage:**
+```bash
+# Change hostname to a new random hostname on example.app
+ansible-playbook -i inventory playbook.yml \
+  --extra-vars "operation_mode=change environment_mode=prod" \
+  --extra-vars "change_target_domain=example.app"
+```
+
+This generates something like `apple-banana-cherry.example.app` and uses the Cloudflare provider configured for that domain.
 
 ## Directory Structure
 

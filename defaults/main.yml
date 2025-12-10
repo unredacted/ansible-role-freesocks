@@ -11,6 +11,29 @@
 migrate_delete_source: false
 
 # Change mode settings
+# REQUIRED for change mode:
+#   change_target_domain: The domain to generate a new hostname for (must exist in domain_providers)
+#
+# Domain-to-Provider Mapping (required for change mode)
+# Maps each domain to its DNS and tunnel provider configuration
+# This enables hostname rotation across domains with different providers
+#
+# Example:
+# domain_providers:
+#   example.com:
+#     dns_provider: cloudflare
+#     tunnel_provider: cloudflare
+#     zone_id: "your-cloudflare-zone-id"
+#   example.app:
+#     dns_provider: cloudflare
+#     tunnel_provider: cloudflare
+#     zone_id: "another-zone-id"
+#   # Future: other providers
+#   # example.org:
+#   #   dns_provider: fastly
+#   #   tunnel_provider: none
+domain_providers: {}
+
 # Whether to delete old DNS records after hostname change
 change_delete_old_dns: true
 # Whether to delete old KV entries after hostname change

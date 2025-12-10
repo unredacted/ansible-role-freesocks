@@ -165,9 +165,54 @@
   roles:
     - ansible-role-freesocks
 
+- name: Change hostname (rotate to new domain)
+  hosts: existing_servers
+  remote_user: root
+  vars:
+    operation_mode: change
+    # Target domain for the new hostname (generates random hostname like apple-banana-cherry.example.app)
+    change_target_domain: "example.app"
+
+    # Provider configuration (global - also needed for KV operations)
+    kv_provider: cloudflare
+
+    # Domain-to-Provider Mapping (for change mode)
+    # Maps each domain to its DNS and tunnel provider configuration
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      example.app:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-app"
+      # Future: other providers
+      # example.org:
+      #   dns_provider: fastly
+      #   tunnel_provider: none
+
+    # Include same Cloudflare configuration as above
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_email: "your-email@example.com"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # Caddy configuration (for WSS servers)
+    outline_caddy_email: "admin@example.com"
+
+  roles:
+    - ansible-role-freesocks
+
 # Example inventory (hosts):
 # [new_servers]
 # outline2-fra ansible_host=10.0.0.2
+# [existing_servers]
+# outline1-ams ansible_host=10.0.0.1
 
 # Usage (all provider variables are required):
 # Deploy (Cloudflare, production):
@@ -181,3 +226,7 @@
 # Migrate (Cloudflare, production):
 #   ansible-playbook -i hosts example-playbook.yml \
 #     --extra-vars "operation_mode=migrate environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare source_hostname=outline1-ams destination_hostname=outline2-fra"
+#
+# Change hostname (rotate to new domain when blocked):
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "operation_mode=change environment_mode=prod change_target_domain=example.app"
