@@ -57,25 +57,7 @@
     - (item.name == destination_kv_hostname + api_hostname_suffix + '.' + api_domain or item.name == destination_kv_hostname + prom_hostname_suffix + '.' + prom_domain)
   run_once: true
 
-- name: Delete tunnel DNS CNAME records for additional domains
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ item[0].zone_id | default(cloudflare_zone_id) }}/dns_records/{{ item[1].id }}"
-    method: DELETE
-    headers:
-      Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
-    status_code: 200
-  delegate_to: localhost
-  with_nested:
-    - "{{ additional_domains | default([]) }}"
-    - "{{ tunnel_dns_records.json.result }}"
-  when: 
-    - inventory_hostname == destination_hostname
-    - destination_tunnel_id is defined
-    - item[1].type == 'CNAME'
-    - item[1].name == destination_kv_hostname + api_hostname_suffix + '.' + item[0].domain
-  run_once: true
+
 
 - name: Delete existing tunnel
   uri:

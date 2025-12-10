@@ -31,10 +31,7 @@
     api_domain: "api.example.com"
     prom_domain: "prom.example.com"
 
-    # Optional: Additional domains
-    additional_domains:
-      - domain: "example.app"
-        zone_id: "app-zone-id"
+
 
     # Server configuration
     envoy_mappings:

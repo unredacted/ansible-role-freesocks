@@ -95,14 +95,8 @@ prom_hostname_suffix: ""  # e.g., "" for same domain, "-prom" for prom subdomain
 hostname_extension: ""
 
 # Additional domains configuration
-# List of additional domains to set up DNS records and tunnels for
-# Example:
-# additional_domains:
-#   - domain: "example.app"
-#     zone_id: "app-zone-id"  # Optional, defaults to base zone_id
-#   - domain: "example.xyz"
-#     zone_id: "xyz-zone-id"
-additional_domains: []
+# DEPRECATED: usage removed.
+# additional_domains: []
 
 # Additional connect domains configuration
 # List of additional domains to set up DNS records for direct connections

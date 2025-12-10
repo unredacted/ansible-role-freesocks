@@ -91,8 +91,7 @@ hostname_extension: ""
 # When true, traffic is proxied through the CDN
 dns_proxied: false  # Set to true for CDN proxy mode
 
-# Additional Domains
-additional_domains: []
+
 
 # Migration Settings
 migrate_delete_source: false

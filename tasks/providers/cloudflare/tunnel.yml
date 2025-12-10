@@ -57,24 +57,6 @@
     status_code: [200, 201]
   delegate_to: localhost
 
-- name: Create DNS CNAME records for additional domains
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ item.zone_id | default(cloudflare_zone_id) }}/dns_records"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
-    body_format: json
-    body:
-      type: CNAME
-      name: "{{ kv_hostname }}{{ api_hostname_suffix }}"
-      content: "{{ cf_tunnel.json.result.id }}.cfargotunnel.com"
-      ttl: 1
-      proxied: true
-    status_code: [200, 201]
-  delegate_to: localhost
-  loop: "{{ additional_domains }}"
 
 - name: Get Cloudflare Tunnel Token
   uri:
@@ -114,11 +96,6 @@
 - name: Add Prometheus ingress configuration
   set_fact:
     ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + prom_hostname_suffix + '.' + prom_domain, 'service': 'http://127.0.0.1:9090', 'originRequest': {'access': {'required': true, 'teamName': cloudflare_access_team_name, 'audTag': [cloudflare_access_aud_tag]}}}] }}"
-
-- name: Add additional domain ingress configurations
-  set_fact:
-    ingress_config: "{{ ingress_config + [{'hostname': kv_hostname + api_hostname_suffix + '.' + item.domain, 'service': 'https://127.0.0.1:' + outline_api_port | string, 'originRequest': {'noTLSVerify': true}}] }}"
-  loop: "{{ additional_domains }}"
 
 - name: Add catch-all rule to ingress configuration
   set_fact:
