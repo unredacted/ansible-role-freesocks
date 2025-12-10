@@ -18,7 +18,7 @@
     headers:
       X-Auth-Email: "{{ cloudflare_email }}"
       X-Auth-Key: "{{ cloudflare_api_token }}"
-    body: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}/{{ api_random_string | default('') }}"
+    body: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string | default('') }}"
     status_code: 200
   delegate_to: localhost
   when: api_random_string is defined
