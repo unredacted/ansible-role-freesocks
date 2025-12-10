@@ -42,19 +42,19 @@
 # ============================================================================
 # VALIDATION: Provider Configuration
 # ============================================================================
-# Note: For change mode, dns_provider and tunnel_provider are derived from domain_providers
+# Note: For change and deploy modes, dns_provider and tunnel_provider are derived from domain_providers
 - name: Fail if dns_provider is not specified
   fail:
     msg: "dns_provider must be explicitly set (e.g., 'cloudflare')"
   when:
-    - operation_mode != 'change'
+    - operation_mode not in ['change', 'deploy']
     - dns_provider is not defined or dns_provider == ""
 
 - name: Fail if dns_provider is invalid
   fail:
     msg: "dns_provider must be 'cloudflare', got: {{ dns_provider }}"
   when:
-    - operation_mode != 'change'
+    - operation_mode not in ['change', 'deploy']
     - dns_provider is defined
     - dns_provider not in ['cloudflare']
 
@@ -62,14 +62,14 @@
   fail:
     msg: "tunnel_provider must be explicitly set (e.g., 'cloudflare' or 'none')"
   when:
-    - operation_mode != 'change'
+    - operation_mode not in ['change', 'deploy']
     - tunnel_provider is not defined or tunnel_provider == ""
 
 - name: Fail if tunnel_provider is invalid
   fail:
     msg: "tunnel_provider must be 'cloudflare' or 'none', got: {{ tunnel_provider }}"
   when:
-    - operation_mode != 'change'
+    - operation_mode not in ['change', 'deploy']
     - tunnel_provider is defined
     - tunnel_provider not in ['cloudflare', 'none']
 
@@ -82,6 +82,52 @@
   fail:
     msg: "kv_provider must be 'cloudflare', got: {{ kv_provider }}"
   when: kv_provider not in ['cloudflare']
+
+# ============================================================================
+# VALIDATION: Deploy Mode (New)
+# ============================================================================
+- name: Fail if deploy_target_domain is not provided (Deploy Mode)
+  fail:
+    msg: |
+      deploy_target_domain is required for deploy mode.
+      Please provide the target domain via --extra-vars.
+      Example: --extra-vars "deploy_target_domain=example.app"
+  when: 
+    - operation_mode == 'deploy'
+    - deploy_target_domain is not defined or deploy_target_domain == ''
+
+- name: Fail if domain_providers is not configured (Deploy Mode)
+  fail:
+    msg: "domain_providers mapping is required for deploy mode."
+  when: 
+    - operation_mode == 'deploy'
+    - (domain_providers is not defined or domain_providers | length == 0)
+
+- name: Fail if target domain not found in domain_providers (Deploy Mode)
+  fail:
+    msg: |
+      Domain '{{ deploy_target_domain }}' not found in domain_providers mapping.
+      Available domains: {{ domain_providers.keys() | list | join(', ') }}
+  when: 
+    - operation_mode == 'deploy'
+    - deploy_target_domain not in domain_providers
+
+# ============================================================================
+# SETUP: Deploy Mode Configuration
+# ============================================================================
+- name: Set provider configuration for deploy target domain
+  set_fact:
+    target_domain_config: "{{ domain_providers[deploy_target_domain] }}"
+    effective_dns_provider: "{{ domain_providers[deploy_target_domain].dns_provider }}"
+    effective_tunnel_provider: "{{ domain_providers[deploy_target_domain].tunnel_provider | default('none') }}"
+    effective_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
+    # Override global variables for this deployment
+    base_domain: "{{ deploy_target_domain }}"
+    api_domain: "{{ deploy_target_domain }}"
+    prom_domain: "{{ deploy_target_domain }}"
+    cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
+    base_domain_cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
+  when: operation_mode == 'deploy'
 
 # ============================================================================
 # KV NAMESPACE SETUP (provider-specific)
@@ -99,16 +145,56 @@
     - kv_provider == 'cloudflare'
     - cloudflare_api_kv_namespace is not defined or cloudflare_api_kv_namespace == "" or cloudflare_prom_kv_namespace is not defined or cloudflare_prom_kv_namespace == ""
 
+# ============================================================================
+# VALIDATION & SETUP: Change Mode
+# ============================================================================
+- name: Fail if change_target_domain is not provided (Change Mode)
+  fail:
+    msg: |
+      change_target_domain is required for change mode.
+      Please provide the target domain via --extra-vars.
+      Example: --extra-vars "change_target_domain=example.app"
+  when: 
+    - operation_mode == 'change'
+    - change_target_domain is not defined or change_target_domain == ''
+
+- name: Fail if domain_providers is not configured (Change Mode)
+  fail:
+    msg: |
+      domain_providers mapping is required for change mode.
+      Please configure domain_providers in your playbook with provider settings for each domain.
+  when: 
+    - operation_mode == 'change'
+    - (domain_providers is not defined or domain_providers | length == 0)
+
+- name: Fail if target domain not found in domain_providers (Change Mode)
+  fail:
+    msg: |
+      Domain '{{ change_target_domain }}' not found in domain_providers mapping.
+      Available domains: {{ domain_providers.keys() | list | join(', ') }}
+  when: 
+    - operation_mode == 'change'
+    - change_target_domain not in domain_providers
+
+- name: Set provider configuration for change target domain
+  set_fact:
+    target_domain_config: "{{ domain_providers[change_target_domain] }}"
+    effective_dns_provider: "{{ domain_providers[change_target_domain].dns_provider }}"
+    effective_tunnel_provider: "{{ domain_providers[change_target_domain].tunnel_provider | default('none') }}"
+    effective_zone_id: "{{ domain_providers[change_target_domain].zone_id }}"
+  when: operation_mode == 'change'
+
 - name: Debug configuration
   debug:
     msg:
       - "Operation Mode: {{ operation_mode }}"
       - "Environment Mode: {{ environment_mode }}"
-      - "DNS Provider: {{ dns_provider | default('(from domain_providers)') }}"
-      - "Tunnel Provider: {{ tunnel_provider | default('(from domain_providers)') }}"
+      - "DNS Provider: {{ effective_dns_provider | default(dns_provider) }}"
+      - "Tunnel Provider: {{ effective_tunnel_provider | default(tunnel_provider) }}"
       - "KV Provider: {{ kv_provider }}"
       - "API KV Namespace: {{ cloudflare_api_kv_namespace | default('N/A') }}"
       - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace | default('N/A') }}"
+      - "Deploy Target Domain: {{ deploy_target_domain | default('N/A') }}"
 
 # ============================================================================
 # DEPLOY MODE
@@ -159,7 +245,7 @@
     # Provider-specific installation
     - name: Include Cloudflare installation tasks
       include_tasks: providers/cloudflare/install.yml
-      when: tunnel_provider == 'cloudflare'
+      when: effective_tunnel_provider == 'cloudflare'
 
     - name: Include base installation tasks
       include_tasks: setup/install.yml
@@ -176,14 +262,14 @@
       include_tasks: providers/cloudflare/dns.yml
       when: 
         - outline_install_success | bool
-        - dns_provider == 'cloudflare'
+        - effective_dns_provider == 'cloudflare'
 
     # Provider-specific tunnel setup
     - name: Include tunnel tasks (Cloudflare)
       include_tasks: providers/cloudflare/tunnel.yml
       when: 
         - outline_install_success | bool
-        - tunnel_provider == 'cloudflare'
+        - effective_tunnel_provider == 'cloudflare'
 
     # WebSocket configuration (must run AFTER DNS and tunnel are set up)
     # Caddy needs DNS to be configured for ACME certificate provisioning

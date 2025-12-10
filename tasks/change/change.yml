@@ -15,44 +15,11 @@
 #     --extra-vars "change_target_domain=example.app"
 
 # ============================================================================
-# STEP 0: Validate required variables and domain configuration
+# STEP 0: Validation (moved to main.yml)
 # ============================================================================
-- name: Fail if change_target_domain is not provided
-  fail:
-    msg: |
-      change_target_domain is required for change mode.
-      Please provide the target domain via --extra-vars.
-      Example: --extra-vars "change_target_domain=example.app"
-  when: change_target_domain is not defined or change_target_domain == ''
+# Validation and provider setup is now performed in tasks/main.yml
+# before this file is included.
 
-- name: Fail if domain_providers is not configured
-  fail:
-    msg: |
-      domain_providers mapping is required for change mode.
-      Please configure domain_providers in your playbook with provider settings for each domain.
-  when: domain_providers is not defined or domain_providers | length == 0
-
-- name: Fail if target domain not found in domain_providers
-  fail:
-    msg: |
-      Domain '{{ change_target_domain }}' not found in domain_providers mapping.
-      Available domains: {{ domain_providers.keys() | list | join(', ') }}
-  when: change_target_domain not in domain_providers
-
-- name: Set provider configuration for target domain
-  set_fact:
-    target_domain_config: "{{ domain_providers[change_target_domain] }}"
-    effective_dns_provider: "{{ domain_providers[change_target_domain].dns_provider }}"
-    effective_tunnel_provider: "{{ domain_providers[change_target_domain].tunnel_provider | default('none') }}"
-    effective_zone_id: "{{ domain_providers[change_target_domain].zone_id }}"
-
-- name: Display change parameters
-  debug:
-    msg:
-      - "Target domain: {{ change_target_domain }}"
-      - "DNS Provider: {{ effective_dns_provider }}"
-      - "Tunnel Provider: {{ effective_tunnel_provider }}"
-      - "Zone ID: {{ effective_zone_id }}"
 
 # ============================================================================
 # STEP 1: Read existing Outline API info from access.txt
@@ -110,9 +77,31 @@
       - "Current API URL: {{ outline_api_info.apiUrl }}"
       - "API Secret: {{ api_random_string }}"
 
-- name: Extract hostname from API URL
+- name: Check if shadowbox_server_config.json exists
+  stat:
+    path: /opt/outline/persisted-state/shadowbox_server_config.json
+  register: shadowbox_config_file
+
+- name: Read shadowbox_server_config.json
+  slurp:
+    src: /opt/outline/persisted-state/shadowbox_server_config.json
+  register: shadowbox_config_raw
+  when: shadowbox_config_file.stat.exists
+
+- name: Parse shadowbox_server_config.json
   set_fact:
-    current_api_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^:/]+)', '\\1') | first }}"
+    shadowbox_config: "{{ shadowbox_config_raw.content | b64decode | from_json }}"
+  when: shadowbox_config_file.stat.exists
+
+- name: Extract hostname from API URL (access.txt)
+  set_fact:
+    access_txt_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^:/]+)', '\\1') | first }}"
+
+- name: Determine effective current hostname
+  set_fact:
+    # Prefer the Caddy domain if it exists in the config (handle partial failures)
+    # Otherwise fallback to the hostname in access.txt
+    current_api_hostname: "{{ shadowbox_config.caddyWebServer.domain | default(access_txt_hostname) }}"
 
 - name: Construct working API URL (forcing port 443)
   set_fact:
@@ -237,7 +226,27 @@
   when: effective_tunnel_provider == 'cloudflare'
 
 # ============================================================================
-# STEP 7: Update Caddy domain via Outline API
+# STEP 7: Update server hostname (internal)
+# ============================================================================
+# We update the internal hostname FIRST so that if the subsequent Caddy update
+# fails or disrupts connectivity, the server internally knows its new identity.
+- name: Update server hostname
+  uri:
+    url: "{{ current_working_api_url }}/server/hostname-for-access-keys"
+    method: PUT
+    body_format: json
+    body:
+      hostname: "{{ dns_hostname }}"
+    validate_certs: yes
+    status_code: 204
+  register: hostname_update_result
+
+- name: Display hostname update result
+  debug:
+    msg: "Server hostname updated to: {{ dns_hostname }}"
+
+# ============================================================================
+# STEP 8: Update Caddy domain via Outline API
 # ============================================================================
 - name: Set effective Caddy domain
   set_fact:
@@ -261,24 +270,6 @@
 - name: Display Caddy update result
   debug:
     msg: "Caddy domain updated to: {{ effective_caddy_domain }}"
-
-# ============================================================================
-# STEP 8: Update server hostname
-# ============================================================================
-- name: Update server hostname
-  uri:
-    url: "{{ current_working_api_url }}/server/hostname-for-access-keys"
-    method: PUT
-    body_format: json
-    body:
-      hostname: "{{ dns_hostname }}"
-    validate_certs: yes
-    status_code: 204
-  register: hostname_update_result
-
-- name: Display hostname update result
-  debug:
-    msg: "Server hostname updated to: {{ dns_hostname }}"
 
 # ============================================================================
 # STEP 9: Update local configuration files
@@ -423,18 +414,18 @@
 # ============================================================================
 - name: Display change completion summary
   debug:
-    msg: |
-      ============================================
-      HOSTNAME CHANGE COMPLETE
-      ============================================
-      
-      Old Hostname: {{ old_hostname }}
-      New Hostname: {{ dns_hostname }}
-      
-      New Caddy Domain: {{ effective_caddy_domain }}
-      New KV Hostname: {{ kv_hostname }}
-      
-      The server is now accessible at the new hostname.
-      Old DNS and KV entries have been {{ 'deleted' if (change_delete_old_dns | default(true)) else 'preserved' }}.
-      
-      ============================================
+    msg:
+      - "✨ Hostname Change Complete ✨"
+      - ""
+      - "🔄 Migration Summary"
+      - "--------------------"
+      - "❌ Old Hostname: {{ old_hostname }}"
+      - "✅ New Hostname: {{ dns_hostname }}"
+      - ""
+      - "📝 Configuration"
+      - "------------------"
+      - "🌐 Caddy Domain: {{ effective_caddy_domain }}"
+      - "🔑 KV Key:       {{ kv_hostname }}"
+      - ""
+      - "🚀 Status: Server is accessible at the new hostname."
+      - "🗑️  Cleanup: Old DNS and KV entries have been {{ 'deleted' if (change_delete_old_dns | default(true)) else 'preserved' }}."

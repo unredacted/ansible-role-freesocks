@@ -14,6 +14,10 @@ migrate_delete_source: false
 # REQUIRED for change mode:
 #   change_target_domain: The domain to generate a new hostname for (must exist in domain_providers)
 #
+# Deploy mode settings
+# REQUIRED for deploy mode:
+#   deploy_target_domain: The domain to deploy the new server to (must exist in domain_providers)
+#
 # Domain-to-Provider Mapping (required for change mode)
 # Maps each domain to its DNS and tunnel provider configuration
 # This enables hostname rotation across domains with different providers
@@ -160,7 +164,10 @@ additional_connect_domains: []
 # cloudflare_access_team_name: "your-team-name"
 # cloudflare_access_aud_tag: "your-aud-tag"
 # kv_hostname_prefix: "outline"
-# envoy_mappings: {}  # Define your envoy mappings as shown in the example above
+# # Default zone ID for base domain operations (defaults to main zone ID)
+base_domain_cloudflare_zone_id: "{{ cloudflare_zone_id }}"
+
+envoy_mappings: {}  # Define your envoy mappings as shown in the example above
 
 # KV Namespace Configuration
 # Production KV namespaces (used when environment_mode is 'prod')
