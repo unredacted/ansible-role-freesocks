@@ -1,0 +1,256 @@
+---
+# tasks/change/change.yml - Change hostname for blocked servers
+# This operation generates a new hostname and updates DNS, Caddy, and KV store
+# without reinstalling Outline. Used when DNS filtering blocks the current hostname.
+
+# ============================================================================
+# STEP 1: Read existing Outline API info from access.txt
+# ============================================================================
+- name: Check if access.txt exists
+  stat:
+    path: /opt/outline/access.txt
+  register: access_txt_file
+
+- name: Fail if access.txt not found
+  fail:
+    msg: "Cannot find /opt/outline/access.txt - this server may not have Outline installed"
+  when: not access_txt_file.stat.exists
+
+- name: Read access.txt
+  slurp:
+    src: /opt/outline/access.txt
+  register: access_txt_raw
+
+- name: Parse API info from access.txt
+  set_fact:
+    outline_api_info: "{{ access_txt_raw.content | b64decode | regex_search('{.*}') | from_json }}"
+
+- name: Extract API random string
+  set_fact:
+    api_random_string: "{{ outline_api_info.apiUrl | regex_search('/([^/]+)$') | regex_replace('/', '') }}"
+
+- name: Display current configuration
+  debug:
+    msg:
+      - "Current API URL: {{ outline_api_info.apiUrl }}"
+      - "API Secret: {{ api_random_string }}"
+
+# ============================================================================
+# STEP 2: Get current hostname from server config
+# ============================================================================
+- name: Get current server config
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server"
+    method: GET
+    validate_certs: no
+  register: current_server_config
+
+- name: Extract current hostname
+  set_fact:
+    old_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') }}"
+    old_kv_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('\\.' ~ base_domain ~ '$', '') }}"
+
+- name: Display current hostname
+  debug:
+    msg:
+      - "Old Hostname: {{ old_hostname }}"
+      - "Old KV Hostname: {{ old_kv_hostname }}"
+
+# ============================================================================
+# STEP 3: Generate new hostname
+# ============================================================================
+- name: Install wamerican package for word list
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+
+- name: Get random words from system dictionary
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n 3'
+  register: random_words
+
+- name: Set new random hostname
+  set_fact:
+    random_hostname: "{{ random_words.stdout_lines | join('-') }}"
+
+- name: Set new DNS hostname
+  set_fact:
+    dns_hostname: "{{ random_hostname }}.{{ base_domain }}"
+    kv_hostname: "{{ random_hostname }}"
+
+- name: Display new hostname
+  debug:
+    msg:
+      - "New Random Hostname: {{ random_hostname }}"
+      - "New DNS Hostname: {{ dns_hostname }}"
+      - "New KV Hostname: {{ kv_hostname }}"
+
+# ============================================================================
+# STEP 4: Create new DNS records (Cloudflare)
+# ============================================================================
+- name: Include DNS tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/dns.yml
+  when: dns_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 5: Create new tunnel records if using Cloudflare tunnel
+# ============================================================================
+- name: Include tunnel tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/tunnel.yml
+  when: tunnel_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 6: Update Caddy domain via Outline API
+# ============================================================================
+- name: Set effective Caddy domain
+  set_fact:
+    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname) }}"
+
+- name: Update Caddy web server domain
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/web-server"
+    method: PUT
+    body_format: json
+    body:
+      enabled: true
+      autoHttps: "{{ outline_caddy_auto_https }}"
+      email: "{{ outline_caddy_email }}"
+      domain: "{{ effective_caddy_domain }}"
+      apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
+    validate_certs: no
+    status_code: 204
+  register: caddy_update_result
+
+- name: Display Caddy update result
+  debug:
+    msg: "Caddy domain updated to: {{ effective_caddy_domain }}"
+
+# ============================================================================
+# STEP 7: Update server hostname
+# ============================================================================
+- name: Update server hostname
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/hostname-for-access-keys"
+    method: PUT
+    body_format: json
+    body:
+      hostname: "{{ dns_hostname }}"
+    validate_certs: no
+    status_code: 204
+  register: hostname_update_result
+
+- name: Display hostname update result
+  debug:
+    msg: "Server hostname updated to: {{ dns_hostname }}"
+
+# ============================================================================
+# STEP 8: Update local configuration files
+# ============================================================================
+- name: Update hostname in shadowbox_server_config.json
+  ansible.builtin.shell: |
+    jq '.hostname = "{{ dns_hostname }}"' /opt/outline/persisted-state/shadowbox_server_config.json > /tmp/shadowbox_server_config.json.tmp && \
+    mv /tmp/shadowbox_server_config.json.tmp /opt/outline/persisted-state/shadowbox_server_config.json
+  become: yes
+
+- name: Update hostname in access.txt
+  ansible.builtin.replace:
+    path: /opt/outline/access.txt
+    regexp: '{{ old_hostname | regex_escape }}'
+    replace: '{{ dns_hostname }}'
+  become: yes
+  when: old_hostname != ''
+
+- name: Display local files updated
+  debug:
+    msg: "Local config files updated with new hostname: {{ dns_hostname }}"
+
+# ============================================================================
+# STEP 9: Update KV store (Cloudflare)
+# ============================================================================
+- name: Include KV store tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/kv.yml
+  when: kv_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 10: Clean up old DNS records (optional)
+# ============================================================================
+- name: Delete old DNS A records (Cloudflare)
+  block:
+    - name: Get existing DNS records
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records?name={{ old_hostname }}"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          X-Auth-Email: "{{ cloudflare_email }}"
+          X-Auth-Key: "{{ cloudflare_api_token }}"
+        status_code: 200
+      delegate_to: localhost
+      register: old_dns_records
+
+    - name: Delete old DNS records
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Content-Type: "application/json"
+          X-Auth-Email: "{{ cloudflare_email }}"
+          X-Auth-Key: "{{ cloudflare_api_token }}"
+        status_code: 200
+      delegate_to: localhost
+      loop: "{{ old_dns_records.json.result }}"
+      when: old_dns_records.json.result | length > 0
+  when:
+    - dns_provider == 'cloudflare'
+    - change_delete_old_dns | default(true) | bool
+    - old_hostname != ''
+
+# ============================================================================
+# STEP 11: Delete old KV entries (optional)
+# ============================================================================
+- name: Delete old KV entries (Cloudflare)
+  block:
+    - name: Delete old API KV entry
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ old_kv_hostname }}"
+        method: DELETE
+        headers:
+          X-Auth-Email: "{{ cloudflare_email }}"
+          X-Auth-Key: "{{ cloudflare_api_token }}"
+        status_code: [200, 404]
+      delegate_to: localhost
+
+    - name: Delete old Prometheus KV entry
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ old_kv_hostname }}"
+        method: DELETE
+        headers:
+          X-Auth-Email: "{{ cloudflare_email }}"
+          X-Auth-Key: "{{ cloudflare_api_token }}"
+        status_code: [200, 404]
+      delegate_to: localhost
+  when:
+    - kv_provider == 'cloudflare'
+    - change_delete_old_kv | default(true) | bool
+    - old_kv_hostname != ''
+
+# ============================================================================
+# COMPLETE
+# ============================================================================
+- name: Display change completion summary
+  debug:
+    msg: |
+      ============================================
+      HOSTNAME CHANGE COMPLETE
+      ============================================
+      
+      Old Hostname: {{ old_hostname }}
+      New Hostname: {{ dns_hostname }}
+      
+      New Caddy Domain: {{ effective_caddy_domain }}
+      New KV Hostname: {{ kv_hostname }}
+      
+      The server is now accessible at the new hostname.
+      Old DNS and KV entries have been {{ 'deleted' if (change_delete_old_dns | default(true)) else 'preserved' }}.
+      
+      ============================================

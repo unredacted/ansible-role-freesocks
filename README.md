@@ -143,6 +143,10 @@ ansible-playbook -i inventory playbook.yml \
 # Migrate server
 ansible-playbook -i inventory playbook.yml \
   --extra-vars "operation_mode=migrate environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare source_hostname=outline1-ams destination_hostname=outline2-fra"
+
+# Change hostname (when current hostname is blocked)
+ansible-playbook -i inventory playbook.yml \
+  --extra-vars "operation_mode=change environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare"
 ```
 
 ## Operation Modes
@@ -166,6 +170,26 @@ Migrates an existing Outline server to a new location:
 4. Copies configuration from source to destination
 5. Updates DNS and KV store entries
 6. Optionally deletes source server KV entries
+
+### Change Mode
+
+Rotates the hostname on an existing server when the current hostname is blocked by DNS filtering:
+
+1. Reads existing API info from server
+2. Generates new random hostname
+3. Creates new DNS records
+4. Updates Caddy domain configuration (triggers new TLS certificate)
+5. Updates server hostname setting
+6. Updates KV store with new endpoint
+7. Optionally deletes old DNS and KV entries
+
+**Settings:**
+```yaml
+# Whether to delete old DNS records after hostname change
+change_delete_old_dns: true
+# Whether to delete old KV entries after hostname change
+change_delete_old_kv: true
+```
 
 ## Directory Structure
 

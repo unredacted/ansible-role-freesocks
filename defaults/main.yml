@@ -1,12 +1,20 @@
 # defaults/main.yml - Default variables for the role
 
-# Operation mode: 'deploy' or 'migrate'
-# This must be explicitly set to either 'deploy' or 'migrate'
+# Operation mode: 'deploy', 'migrate', or 'change'
+# - deploy: Install new Outline server with fresh hostname
+# - migrate: Migrate server from source to destination host
+# - change: Rotate hostname on existing server (for DNS blocking bypass)
 # operation_mode: deploy
 
 # Migration settings
 # Whether to delete source server KV entries after successful migration
 migrate_delete_source: false
+
+# Change mode settings
+# Whether to delete old DNS records after hostname change
+change_delete_old_dns: true
+# Whether to delete old KV entries after hostname change
+change_delete_old_kv: true
 
 # Common settings
 # OS version for cloudflared installation (e.g., "bookworm", "jammy")

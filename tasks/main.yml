@@ -18,13 +18,13 @@
 # ============================================================================
 - name: Fail if operation mode is not specified
   fail:
-    msg: "Operation mode must be explicitly set to either 'deploy' or 'migrate'"
+    msg: "Operation mode must be explicitly set to 'deploy', 'migrate', or 'change'"
   when: operation_mode is not defined or operation_mode == ""
 
 - name: Fail if operation mode is invalid
   fail:
-    msg: "Operation mode must be either 'deploy' or 'migrate', got: {{ operation_mode }}"
-  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate']
+    msg: "Operation mode must be 'deploy', 'migrate', or 'change', got: {{ operation_mode }}"
+  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate', 'change']
 
 # ============================================================================
 # VALIDATION: Environment Mode
@@ -231,3 +231,22 @@
     - name: Include migration tasks
       include_tasks: migrate/migrate.yml
   when: operation_mode == 'migrate'
+
+# ============================================================================
+# CHANGE MODE
+# ============================================================================
+- name: Change hostname for blocked server
+  block:
+    - name: Check if /opt/outline exists
+      stat:
+        path: /opt/outline
+      register: outline_path
+
+    - name: Fail if /opt/outline does not exist
+      fail:
+        msg: "Cannot change hostname: /opt/outline does not exist. This server may not have Outline installed."
+      when: not outline_path.stat.exists
+
+    - name: Include change tasks
+      include_tasks: change/change.yml
+  when: operation_mode == 'change'
