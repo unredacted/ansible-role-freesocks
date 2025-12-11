@@ -106,7 +106,7 @@
   delegate_to: localhost
   with_nested:
     - "{{ additional_connect_domains | default([]) }}"
-    - "{{ envoy_mappings[inventory_hostname].ipv4 | default([]) }}"
+    - "{{ (envoy_mappings[inventory_hostname] | default({})).ipv4 | default([]) }}"
   when: 
     - additional_connect_domains is defined
     - envoy_mappings is defined
@@ -133,7 +133,7 @@
   delegate_to: localhost
   with_nested:
     - "{{ additional_connect_domains | default([]) }}"
-    - "{{ envoy_mappings[inventory_hostname].ipv6 | default([]) }}"
+    - "{{ (envoy_mappings[inventory_hostname] | default({})).ipv6 | default([]) }}"
   when: 
     - additional_connect_domains is defined
     - envoy_mappings is defined
