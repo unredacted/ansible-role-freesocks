@@ -6,11 +6,21 @@
   remote_user: root
   vars:
     operation_mode: deploy
+    deploy_target_domain: "example.com"  # Deploy to this domain
     kv_hostname_prefix: "outline1-ams"
 
-    # Provider configuration
-    dns_provider: cloudflare
-    tunnel_provider: cloudflare
+    # Domain-to-Provider Mapping
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      example.app:
+        dns_provider: cloudflare
+        tunnel_provider: none
+        zone_id: "your-zone-id-for-app"
+
+    # KV provider (global)
     kv_provider: cloudflare
 
     # Cloudflare configuration
@@ -18,20 +28,12 @@
     cloudflare_email: "your-email@example.com"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_zone_id: "your-zone-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
     cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
     cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
     cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
-
-    # Domain configuration
-    base_domain: "example.com"
-    api_domain: "api.example.com"
-    prom_domain: "prom.example.com"
-
-
 
     # Server configuration
     envoy_mappings:
@@ -47,11 +49,21 @@
   remote_user: root
   vars:
     operation_mode: deploy
+    deploy_target_domain: "example.app"  # Deploy to different domain
     kv_hostname_prefix: "outline2-ams"
 
-    # Provider configuration - no tunnel, direct port access
-    dns_provider: cloudflare
-    tunnel_provider: none
+    # Domain-to-Provider Mapping (tunnel_provider: none for this domain)
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      example.app:
+        dns_provider: cloudflare
+        tunnel_provider: none  # Direct port access
+        zone_id: "your-zone-id-for-app"
+
+    # KV provider (global)
     kv_provider: cloudflare
 
     # Same Cloudflare configuration as above...
@@ -59,17 +71,12 @@
     cloudflare_email: "your-email@example.com"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_zone_id: "your-zone-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
     cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
     cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
     cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
-
-    base_domain: "example.com"
-    api_domain: "api.example.com"
-    prom_domain: "prom.example.com"
 
     envoy_mappings:
       outline2-ams:
@@ -84,6 +91,7 @@
   remote_user: root
   vars:
     operation_mode: deploy
+    deploy_target_domain: "example.com"
     kv_hostname_prefix: "outline3-ams"
 
     # WSS Configuration - enables Shadowsocks over WebSocket
@@ -93,9 +101,14 @@
     outline_caddy_email: "admin@example.com"
     # outline_caddy_domain: ""  # Defaults to dns_hostname
 
-    # Provider configuration
-    dns_provider: cloudflare
-    tunnel_provider: cloudflare
+    # Domain-to-Provider Mapping
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+
+    # KV provider (global)
     kv_provider: cloudflare
 
     # Same Cloudflare configuration as above...
@@ -103,17 +116,12 @@
     cloudflare_email: "your-email@example.com"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_zone_id: "your-zone-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
     cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
     cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
     cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
-
-    base_domain: "example.com"
-    api_domain: "api.example.com"
-    prom_domain: "prom.example.com"
 
     envoy_mappings:
       outline3-ams:
@@ -129,30 +137,37 @@
   vars:
     operation_mode: migrate
     source_hostname: "outline1-ams"
+    source_kv_hostname: "apple-banana-cherry"  # KV key from old deployment
     destination_hostname: "outline2-fra"
+    destination_kv_hostname: "dog-elephant-fox"  # New KV key for destination
     migrate_delete_source: false
 
-    # Provider configuration
-    dns_provider: cloudflare
-    tunnel_provider: cloudflare
+    # Domain-to-Provider Mapping (base_domain used for migration)
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+
+    # Active domain for migration
+    base_domain: "example.com"
+    api_domain: "example.com"
+    prom_domain: "example.com"
+
+    # KV provider (global)
     kv_provider: cloudflare
 
-    # Include same Cloudflare and domain configuration as above
+    # Include same Cloudflare configuration as above
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_email: "your-email@example.com"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_zone_id: "your-zone-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
     cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
     cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
     cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
-
-    base_domain: "example.com"
-    api_domain: "api.example.com"
-    prom_domain: "prom.example.com"
 
     envoy_mappings:
       outline2-fra:
@@ -211,19 +226,18 @@
 # [existing_servers]
 # outline1-ams ansible_host=10.0.0.1
 
-# Usage (all provider variables are required):
-# Deploy (Cloudflare, production):
+# Usage:
+# Deploy to example.com (production):
 #   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "operation_mode=deploy environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare"
+#     --extra-vars "environment_mode=prod deploy_target_domain=example.com"
 #
-# Deploy (Cloudflare, no tunnel, dev mode):
+# Deploy to example.app without tunnel (dev mode):
 #   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "operation_mode=deploy environment_mode=dev dns_provider=cloudflare tunnel_provider=none kv_provider=cloudflare"
+#     --extra-vars "environment_mode=dev deploy_target_domain=example.app"
 #
-# Migrate (Cloudflare, production):
+# Migrate (production):
 #   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "operation_mode=migrate environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare source_hostname=outline1-ams destination_hostname=outline2-fra"
-#
+#     --extra-vars "environment_mode=prod source_hostname=outline1-ams source_kv_hostname=apple-banana-cherry destination_hostname=outline2-fra destination_kv_hostname=dog-elephant-fox"
 # Change hostname (rotate to new domain when blocked):
 #   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "operation_mode=change environment_mode=prod change_target_domain=example.app"
+#     --extra-vars "environment_mode=prod change_target_domain=example.app"

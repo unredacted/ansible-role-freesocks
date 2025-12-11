@@ -52,8 +52,15 @@ dns_proxied: false
 # OS version for cloudflared installation (e.g., "bookworm", "jammy")
 cloudflared_os_version: "{{ ansible_distribution_release }}"
 
-# Length of random hostname component
-random_hostname_length: 6
+# Custom hostname override (optional)
+# If set, this hostname will be used instead of generating a random 3-word hostname
+# Can be used in deploy mode and change mode
+# Example: custom_hostname: "my-custom-server"
+# custom_hostname:
+
+# Number of words in randomly generated hostnames (default: 3)
+# Examples: 2 = "apple-banana", 3 = "apple-banana-cherry", 4 = "apple-banana-cherry-dog"
+hostname_word_count: 3
 
 # Outline server ports
 outline_api_port: 8443
@@ -93,20 +100,6 @@ prom_hostname_suffix: ""  # e.g., "" for same domain, "-prom" for prom subdomain
 
 # Optional hostname extension appended to server names
 hostname_extension: ""
-
-# Additional domains configuration
-# DEPRECATED: usage removed.
-# additional_domains: []
-
-# Additional connect domains configuration
-# List of additional domains to set up DNS records for direct connections
-# Example:
-# additional_connect_domains:
-#   - domain: "example.app"
-#     zone_id: "app-zone-id"  # Optional, defaults to base zone_id
-#   - domain: "example.xyz"
-#     zone_id: "xyz-zone-id"
-additional_connect_domains: []
 
 # Envoy server mappings
 # Maps hostnames to their IPv4 and IPv6 addresses
@@ -158,8 +151,9 @@ additional_connect_domains: []
 # cloudflare_access_team_name: "your-team-name"
 # cloudflare_access_aud_tag: "your-aud-tag"
 # kv_hostname_prefix: "outline"
-# # Default zone ID for base domain operations (defaults to main zone ID)
-base_domain_cloudflare_zone_id: "{{ cloudflare_zone_id }}"
+
+# Zone IDs are looked up from domain_providers based on base_domain, api_domain, and prom_domain
+# No need to set zone_id separately - it's derived from domain_providers[domain].zone_id
 
 envoy_mappings: {}  # Define your envoy mappings as shown in the example above
 

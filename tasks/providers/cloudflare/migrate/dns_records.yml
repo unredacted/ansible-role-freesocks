@@ -3,7 +3,7 @@
 # Get existing DNS records for base domain
 - name: Get existing DNS records for base domain
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: GET
     headers:
       Content-Type: "application/json"
@@ -17,7 +17,7 @@
 # Update base domain DNS A records if they exist
 - name: Update existing DNS A records for IPv4 addresses
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records/{{ item[0].id }}"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item[0].id }}"
     method: PUT
     headers:
       Content-Type: "application/json"
@@ -44,7 +44,7 @@
 # Create new A records if they don't exist
 - name: Create new DNS A records for IPv4 addresses
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
     headers:
       Content-Type: "application/json"
@@ -70,7 +70,7 @@
 # Update base domain DNS AAAA records if they exist
 - name: Update existing DNS AAAA records for IPv6 addresses
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records/{{ item[0].id }}"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item[0].id }}"
     method: PUT
     headers:
       Content-Type: "application/json"
@@ -97,7 +97,7 @@
 # Create new AAAA records if they don't exist
 - name: Create new DNS AAAA records for IPv6 addresses
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
     headers:
       Content-Type: "application/json"
@@ -120,15 +120,6 @@
     - envoy_mappings[inventory_hostname].ipv6 is defined
     - existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0
 
-# Handle additional connect domains
-- name: Process additional connect domains
-  include_tasks: process_connect_domain.yml
-  loop: "{{ additional_connect_domains | default([]) }}"
-  loop_control:
-    loop_var: connect_domain
-  when:
-    - inventory_hostname == destination_hostname
-    - additional_connect_domains is defined
 
 # Cleanup API and Prometheus domain records
 - name: Get existing DNS records for API domain cleanup
@@ -168,7 +159,7 @@
 # Fallback DNS records if no existing records found and no envoy mappings
 - name: Add fallback DNS A record using server IP
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
     headers:
       Content-Type: "application/json"
@@ -191,7 +182,7 @@
 
 - name: Add fallback DNS AAAA record using server IP
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
     headers:
       Content-Type: "application/json"

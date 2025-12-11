@@ -149,12 +149,14 @@
     name: wamerican
     state: present
   become: yes
+  when: custom_hostname is not defined
 
 - name: Get random words from system dictionary
-  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n 3'
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n {{ hostname_word_count }}'
   register: random_words
+  when: custom_hostname is not defined
 
-- name: Set new hostnames for target domain
+- name: Set new hostnames for target domain (generated)
   set_fact:
     random_hostname: "{{ random_words.stdout_lines | join('-') }}"
     dns_hostname: "{{ random_words.stdout_lines | join('-') }}.{{ change_target_domain }}"
@@ -164,9 +166,23 @@
     # Override api_domain and prom_domain for KV store operations
     api_domain: "{{ change_target_domain }}"
     prom_domain: "{{ change_target_domain }}"
-    # Override zone IDs for DNS and tunnel operations
-    base_domain_cloudflare_zone_id: "{{ effective_zone_id }}"
+    # Override zone ID for DNS and tunnel operations
     cloudflare_zone_id: "{{ effective_zone_id }}"
+  when: custom_hostname is not defined
+
+- name: Set new hostnames for target domain (custom)
+  set_fact:
+    random_hostname: "{{ custom_hostname }}"
+    dns_hostname: "{{ custom_hostname }}.{{ change_target_domain }}"
+    kv_hostname: "{{ custom_hostname }}"
+    # Override base_domain for this operation to use the target domain
+    base_domain: "{{ change_target_domain }}"
+    # Override api_domain and prom_domain for KV store operations
+    api_domain: "{{ change_target_domain }}"
+    prom_domain: "{{ change_target_domain }}"
+    # Override zone ID for DNS and tunnel operations
+    cloudflare_zone_id: "{{ effective_zone_id }}"
+  when: custom_hostname is defined
 
 - name: Display new hostname configuration
   debug:
@@ -353,7 +369,7 @@
   block:
     - name: Get existing DNS records
       uri:
-        url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records?name={{ old_hostname }}"
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records?name={{ old_hostname }}"
         method: GET
         headers:
           Content-Type: "application/json"
@@ -365,7 +381,7 @@
 
     - name: Delete old DNS records
       uri:
-        url: "{{ cloudflare_api_endpoint }}/zones/{{ base_domain_cloudflare_zone_id }}/dns_records/{{ item.id }}"
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records/{{ item.id }}"
         method: DELETE
         headers:
           Content-Type: "application/json"

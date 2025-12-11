@@ -5,7 +5,7 @@ An Ansible role for deploying and managing Outline VPN servers for [FreeSocks](h
 - Automated Outline server installation and configuration
 - Pluggable provider architecture for DNS, tunnel, and KV store
 - Cloudflare integration (DNS, Tunnel, KV) with more providers coming soon
-- Multi-domain support
+- Hostname rotation for DNS blocking bypass
 - Server migration capabilities
 
 ## Requirements
@@ -65,12 +65,24 @@ cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
 cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
 
 # Domain Configuration
+# Zone IDs are looked up from domain_providers based on the domain
+domain_providers:
+  example.com:
+    dns_provider: cloudflare
+    tunnel_provider: none
+    zone_id: "your-zone-id-for-com"
+  example.app:
+    dns_provider: cloudflare
+    tunnel_provider: none
+    zone_id: "your-zone-id-for-app"
+
+# Active domain for operations (typically set via deploy_target_domain or change_target_domain)
 base_domain: "example.com"
-api_domain: "api.example.com"
-prom_domain: "prom.example.com"
+api_domain: "example.com"
+prom_domain: "example.com"
 kv_hostname_prefix: "outline"
 
-# Envoy Mappings (for DNS records)
+# Envoy Mappings (for multi-IP DNS records)
 envoy_mappings:
   outline1-ams:
     ipv4: ["1.2.3.4", "5.6.7.8"]
@@ -84,14 +96,18 @@ envoy_mappings:
 outline_keys_port: 443
 outline_api_port: 8443
 cloudflared_os_version: "bookworm"
-random_hostname_length: 6
 hostname_extension: ""
+
+# Custom hostname override (optional)
+# If set, uses this instead of auto-generating random hostname
+custom_hostname: "my-server"  # Example: results in my-server.example.com
+
+# Number of words in randomly generated hostnames
+hostname_word_count: 3  # Default: 3 (e.g., apple-banana-cherry)
 
 # DNS Proxy (Cloudflare orange cloud, Fastly shield, etc.)
 # When true, traffic is proxied through the CDN
 dns_proxied: false  # Set to true for CDN proxy mode
-
-
 
 # Migration Settings
 migrate_delete_source: false
@@ -137,11 +153,11 @@ All operations require explicit provider and environment mode settings:
 ```bash
 # Deploy with Cloudflare (full stack)
 ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod dns_provider=cloudflare tunnel_provider=cloudflare kv_provider=cloudflare"
+  --extra-vars "target=server-name operation_mode=deploy environment_mode=prod deploy_target_domain=example.com"
 
 # Deploy without tunnel (direct port access)
 ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod dns_provider=cloudflare tunnel_provider=none kv_provider=cloudflare"
+  --extra-vars "target=server-name operation_mode=deploy environment_mode=prod deploy_target_domain=example.com tunnel_provider=none"
 
 # Migrate server
 ansible-playbook -i inventory playbook.yml \

@@ -126,7 +126,6 @@
     api_domain: "{{ deploy_target_domain }}"
     prom_domain: "{{ deploy_target_domain }}"
     cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
-    base_domain_cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
   when: operation_mode == 'deploy'
 
 # ============================================================================
@@ -215,15 +214,26 @@
       apt:
         name: wamerican
         state: present
+      when: custom_hostname is not defined
 
     - name: Get random words from system dictionary
-      shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n 3'
+      shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n {{ hostname_word_count }}'
       register: random_words
+      when: custom_hostname is not defined
 
-    - name: Set random hostname
+    - name: Set random hostname from dictionary words
       set_fact:
         random_hostname: "{{ random_words.stdout_lines | join('-') }}"
-      when: random_hostname is not defined
+      when: 
+        - random_hostname is not defined
+        - custom_hostname is not defined
+
+    - name: Set random hostname from custom override
+      set_fact:
+        random_hostname: "{{ custom_hostname }}"
+      when: 
+        - random_hostname is not defined
+        - custom_hostname is defined
 
     - name: Set DNS hostname
       set_fact:
