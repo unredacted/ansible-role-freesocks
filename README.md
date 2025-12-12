@@ -128,9 +128,17 @@ outline_caddy_auto_https: true
 outline_caddy_email: "admin@example.com"
 outline_caddy_domain: ""  # Defaults to server hostname
 
-# WebSocket paths (defaults shown)
+# WebSocket path configuration
+# Random paths use dictionary words (like hostnames) for natural-looking URLs
+outline_wss_random_paths: true  # Set to false to use custom paths
+outline_wss_random_path_min_words: 3  # Minimum words (e.g., /apple-banana-cherry)
+outline_wss_random_path_max_words: 5  # Maximum words (random in range)
+
+# Custom paths (used when outline_wss_random_paths is false)
 outline_wss_tcp_path: "/tcp"
 outline_wss_udp_path: "/udp"
+
+# Internal WebSocket server port (not externally exposed)
 outline_wss_server_port: 8080
 
 # API Proxy - enables valid TLS for API access (for control planes, etc.)

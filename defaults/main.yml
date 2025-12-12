@@ -78,6 +78,13 @@ outline_caddy_email: ""        # Required for auto HTTPS (ACME registration)
 outline_caddy_domain: ""       # Defaults to dns_hostname if not set
 
 # WebSocket Listener Paths
+# Random paths are enabled by default for improved censorship resistance
+# Uses dictionary words (like hostnames) for natural-looking URLs
+outline_wss_random_paths: true
+outline_wss_random_path_min_words: 3  # Minimum number of words in path
+outline_wss_random_path_max_words: 5  # Maximum number of words (random in range)
+
+# Custom paths (used when outline_wss_random_paths is false)
 outline_wss_tcp_path: "/tcp"
 outline_wss_udp_path: "/udp"
 outline_wss_server_port: 8080  # Internal WebSocket server port (proxied by Caddy)

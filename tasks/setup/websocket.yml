@@ -7,6 +7,45 @@
   set_fact:
     effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname, true) }}"
 
+- name: Install wamerican package for word list (WSS paths)
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random word count for TCP path
+  set_fact:
+    _wss_tcp_path_word_count: "{{ range(outline_wss_random_path_min_words, outline_wss_random_path_max_words + 1) | random }}"
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random word count for UDP path
+  set_fact:
+    _wss_udp_path_word_count: "{{ range(outline_wss_random_path_min_words, outline_wss_random_path_max_words + 1) | random }}"
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random words for TCP path
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ _wss_tcp_path_word_count }}'
+  register: _wss_tcp_path_words
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random words for UDP path
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ _wss_udp_path_word_count }}'
+  register: _wss_udp_path_words
+  when: outline_wss_random_paths | default(true)
+
+- name: Set random WebSocket paths from dictionary words
+  set_fact:
+    effective_wss_tcp_path: "/{{ _wss_tcp_path_words.stdout_lines | join('-') }}"
+    effective_wss_udp_path: "/{{ _wss_udp_path_words.stdout_lines | join('-') }}"
+  when: outline_wss_random_paths | default(true)
+
+- name: Use configured WebSocket paths
+  set_fact:
+    effective_wss_tcp_path: "{{ outline_wss_tcp_path }}"
+    effective_wss_udp_path: "{{ outline_wss_udp_path }}"
+  when: not (outline_wss_random_paths | default(true))
+
 - name: Wait for Outline API to be available
   uri:
     url: "{{ outline_api_info.apiUrl }}/server"
@@ -24,10 +63,10 @@
     body_format: json
     body:
       websocketStream:
-        path: "{{ outline_wss_tcp_path }}"
+        path: "{{ effective_wss_tcp_path }}"
         webServerPort: "{{ outline_wss_server_port }}"
       websocketPacket:
-        path: "{{ outline_wss_udp_path }}"
+        path: "{{ effective_wss_udp_path }}"
         webServerPort: "{{ outline_wss_server_port }}"
     validate_certs: no
     status_code: 204
@@ -35,7 +74,7 @@
 
 - name: Debug listeners configuration
   debug:
-    msg: "Listeners configured: TCP path={{ outline_wss_tcp_path }}, UDP path={{ outline_wss_udp_path }}"
+    msg: "Listeners configured: TCP path={{ effective_wss_tcp_path }}, UDP path={{ effective_wss_udp_path }}{{ ' (randomized)' if outline_wss_random_paths else '' }}"
 
 - name: Enable Caddy web server with auto HTTPS
   uri:
@@ -75,8 +114,8 @@
       
       Caddy Domain: {{ effective_caddy_domain }}
       Auto HTTPS: {{ outline_caddy_auto_https }}
-      TCP Path: {{ outline_wss_tcp_path }}
-      UDP Path: {{ outline_wss_udp_path }}
+      TCP Path: {{ effective_wss_tcp_path }}{{ ' (randomized)' if outline_wss_random_paths else '' }}
+      UDP Path: {{ effective_wss_udp_path }}{{ ' (randomized)' if outline_wss_random_paths else '' }}
       Internal WS Port: {{ outline_wss_server_port }}
       
       New access keys will be WebSocket-only by default.

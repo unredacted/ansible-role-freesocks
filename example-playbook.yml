@@ -101,6 +101,15 @@
     outline_caddy_email: "admin@example.com"
     # outline_caddy_domain: ""  # Defaults to dns_hostname
 
+    # WSS Path Configuration (random dictionary word paths are default)
+    # outline_wss_random_paths: true              # Default: true
+    # outline_wss_random_path_min_words: 3        # Default: 3 (e.g., /apple-banana-cherry)
+    # outline_wss_random_path_max_words: 5        # Default: 5 (random word count in range)
+    # Or use custom static paths:
+    # outline_wss_random_paths: false
+    # outline_wss_tcp_path: "/stream"
+    # outline_wss_udp_path: "/packet"
+
     # Domain-to-Provider Mapping
     domain_providers:
       example.com:
