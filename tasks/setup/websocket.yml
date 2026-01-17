@@ -56,9 +56,9 @@
   delay: 5
   until: api_check.status == 200
 
-- name: Configure listeners for new access keys (WebSocket-only)
+- name: Configure listeners for access keys (WebSocket-only)
   uri:
-    url: "{{ outline_api_info.apiUrl }}/server/listeners-for-new-access-keys"
+    url: "{{ outline_api_info.apiUrl }}/server/listeners"
     method: PUT
     body_format: json
     body:
