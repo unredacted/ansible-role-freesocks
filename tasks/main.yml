@@ -18,13 +18,13 @@
 # ============================================================================
 - name: Fail if operation mode is not specified
   fail:
-    msg: "Operation mode must be explicitly set to 'deploy', 'migrate', or 'change'"
+    msg: "Operation mode must be explicitly set to 'deploy', 'migrate', 'change', or 'update'"
   when: operation_mode is not defined or operation_mode == ""
 
 - name: Fail if operation mode is invalid
   fail:
-    msg: "Operation mode must be 'deploy', 'migrate', or 'change', got: {{ operation_mode }}"
-  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate', 'change']
+    msg: "Operation mode must be 'deploy', 'migrate', 'change', or 'update', got: {{ operation_mode }}"
+  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate', 'change', 'update']
 
 # ============================================================================
 # VALIDATION: Environment Mode
@@ -42,19 +42,19 @@
 # ============================================================================
 # VALIDATION: Provider Configuration
 # ============================================================================
-# Note: For change and deploy modes, dns_provider and tunnel_provider are derived from domain_providers
+# Note: For change, deploy, and update modes, dns_provider and tunnel_provider are derived from domain_providers
 - name: Fail if dns_provider is not specified
   fail:
     msg: "dns_provider must be explicitly set (e.g., 'cloudflare')"
   when:
-    - operation_mode not in ['change', 'deploy']
+    - operation_mode not in ['change', 'deploy', 'update']
     - dns_provider is not defined or dns_provider == ""
 
 - name: Fail if dns_provider is invalid
   fail:
     msg: "dns_provider must be 'cloudflare', got: {{ dns_provider }}"
   when:
-    - operation_mode not in ['change', 'deploy']
+    - operation_mode not in ['change', 'deploy', 'update']
     - dns_provider is defined
     - dns_provider not in ['cloudflare']
 
@@ -62,14 +62,14 @@
   fail:
     msg: "tunnel_provider must be explicitly set (e.g., 'cloudflare' or 'none')"
   when:
-    - operation_mode not in ['change', 'deploy']
+    - operation_mode not in ['change', 'deploy', 'update']
     - tunnel_provider is not defined or tunnel_provider == ""
 
 - name: Fail if tunnel_provider is invalid
   fail:
     msg: "tunnel_provider must be 'cloudflare' or 'none', got: {{ tunnel_provider }}"
   when:
-    - operation_mode not in ['change', 'deploy']
+    - operation_mode not in ['change', 'deploy', 'update']
     - tunnel_provider is defined
     - tunnel_provider not in ['cloudflare', 'none']
 
@@ -188,28 +188,54 @@
     msg:
       - "Operation Mode: {{ operation_mode }}"
       - "Environment Mode: {{ environment_mode }}"
-      - "DNS Provider: {{ effective_dns_provider | default(dns_provider) }}"
-      - "Tunnel Provider: {{ effective_tunnel_provider | default(tunnel_provider) }}"
+      - "DNS Provider: {{ effective_dns_provider | default(dns_provider) | default('pending') }}"
+      - "Tunnel Provider: {{ effective_tunnel_provider | default(tunnel_provider) | default('pending') }}"
       - "KV Provider: {{ kv_provider }}"
       - "API KV Namespace: {{ cloudflare_api_kv_namespace | default('N/A') }}"
       - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace | default('N/A') }}"
       - "Deploy Target Domain: {{ deploy_target_domain | default('N/A') }}"
+  when: operation_mode != 'update'  # Update mode sets these later
 
 # ============================================================================
 # DEPLOY MODE
 # ============================================================================
-- name: Deploy new Outline server
+# Component-based deployment: can deploy Outline, slipstream, or both
+- name: Deploy server with selected components
   block:
+    # Validate component selection
+    - name: Fail if no components selected
+      fail:
+        msg: |
+          No components selected for deployment!
+          Set at least one of: outline_enabled=true, slipstream_enabled=true
+      when:
+        - not (outline_enabled | default(true) | bool)
+        - not (slipstream_enabled | default(false) | bool)
+
+    - name: Validate slipstream configuration
+      fail:
+        msg: |
+          Invalid slipstream configuration: slipstream_mode=shadowsocks requires outline_enabled=true.
+          Either set outline_enabled=true or use slipstream_mode=raw.
+      when:
+        - slipstream_enabled | default(false) | bool
+        - slipstream_mode | default('shadowsocks') == 'shadowsocks'
+        - not (outline_enabled | default(true) | bool)
+
+    # Check for existing installation
     - name: Check if /opt/outline already exists
       stat:
         path: /opt/outline
       register: outline_path
 
-    - name: Fail if /opt/outline already exists
+    - name: Fail if /opt/outline already exists when deploying Outline
       fail:
-        msg: "Cannot deploy: /opt/outline already exists. Please remove it first or use migration mode."
-      when: outline_path.stat.exists
+        msg: "Cannot deploy Outline: /opt/outline already exists. Please remove it first or use migration mode."
+      when:
+        - outline_enabled | default(true) | bool
+        - outline_path.stat.exists
 
+    # Generate hostname
     - name: Install wamerican package for word list
       apt:
         name: wamerican
@@ -245,27 +271,43 @@
         kv_hostname: "{{ random_hostname }}"
       when: kv_hostname is not defined
 
-    - name: Debug hostname variables
+    - name: Debug deployment configuration
       debug:
         msg:
           - "Random Hostname: {{ random_hostname }}"
           - "DNS Hostname: {{ dns_hostname }}"
           - "KV Hostname: {{ kv_hostname }}"
+          - "Components:"
+          - "  - Outline: {{ outline_enabled | default(true) | bool }}"
+          - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
+          - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
 
-    # Provider-specific installation
+    # Provider-specific installation (tunnel setup)
     - name: Include Cloudflare installation tasks
       include_tasks: providers/cloudflare/install.yml
       when: effective_tunnel_provider == 'cloudflare'
 
+    # Base installation (common packages)
     - name: Include base installation tasks
       include_tasks: setup/install.yml
 
-    - name: Include Outline server tasks
-      include_tasks: setup/outline.yml
+    # =========================================================================
+    # COMPONENT: Outline Shadowsocks Server
+    # =========================================================================
+    - name: Install Outline server component
+      block:
+        - name: Include Outline server tasks
+          include_tasks: setup/outline.yml
 
-    - name: Debug Outline installation success
-      debug:
-        msg: "Outline installation success: {{ outline_install_success }}"
+        - name: Debug Outline installation success
+          debug:
+            msg: "Outline installation success: {{ outline_install_success }}"
+      when: outline_enabled | default(true) | bool
+
+    - name: Set outline_install_success for non-Outline deployments
+      set_fact:
+        outline_install_success: true
+      when: not (outline_enabled | default(true) | bool)
 
     # Provider-specific DNS setup
     - name: Include DNS tasks (Cloudflare)
@@ -281,13 +323,24 @@
         - outline_install_success | bool
         - effective_tunnel_provider == 'cloudflare'
 
-    # WebSocket configuration (must run AFTER DNS and tunnel are set up)
-    # Caddy needs DNS to be configured for ACME certificate provisioning
+    # =========================================================================
+    # COMPONENT: WebSocket (requires Outline)
+    # =========================================================================
     - name: Include WebSocket configuration tasks
       include_tasks: setup/websocket.yml
       when:
         - outline_install_success | bool
+        - outline_enabled | default(true) | bool
         - outline_wss_enabled | default(false) | bool
+
+    # =========================================================================
+    # COMPONENT: slipstream DNS Tunnel
+    # =========================================================================
+    - name: Install slipstream DNS tunnel component
+      include_tasks: setup/slipstream.yml
+      when:
+        - outline_install_success | bool
+        - slipstream_enabled | default(false) | bool
 
     # Provider-specific KV store setup
     - name: Include KV store tasks (Cloudflare)
@@ -295,6 +348,24 @@
       when: 
         - outline_install_success | bool
         - kv_provider == 'cloudflare'
+
+    - name: Display deployment summary
+      debug:
+        msg: |
+          Deployment complete!
+          
+          Hostname: {{ dns_hostname }}
+          
+          Components deployed:
+          {% if outline_enabled | default(true) | bool %}
+            ✓ Outline Shadowsocks server
+          {% endif %}
+          {% if outline_wss_enabled | default(false) | bool %}
+            ✓ WebSocket transport (WSS)
+          {% endif %}
+          {% if slipstream_enabled | default(false) | bool %}
+            ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
+          {% endif %}
   when: operation_mode == 'deploy'
 
 # ============================================================================
@@ -357,3 +428,334 @@
     - name: Include change tasks
       include_tasks: change/change.yml
   when: operation_mode == 'change'
+
+# ============================================================================
+# UPDATE MODE
+# ============================================================================
+# Add components (slipstream, WSS) to an existing server
+# Does NOT reinstall Outline, only adds new components and updates KV
+
+# Set providers from domain_providers for update mode
+# Use slipstream_base_domain if slipstream is enabled, otherwise use base_domain
+- name: Set update mode base domain
+  set_fact:
+    update_base_domain: "{{ slipstream_base_domain if (slipstream_enabled | default(false) | bool) else base_domain }}"
+  when: operation_mode == 'update'
+
+- name: Set providers from domain_providers (update mode)
+  set_fact:
+    dns_provider: "{{ domain_providers[update_base_domain].dns_provider | default('cloudflare') }}"
+    tunnel_provider: "{{ domain_providers[update_base_domain].tunnel_provider | default('none') }}"
+    base_domain: "{{ update_base_domain }}"
+  when:
+    - operation_mode == 'update'
+    - update_base_domain is defined
+    - update_base_domain in domain_providers
+
+- name: Update existing server with new components
+  block:
+    - name: Check if /opt/outline exists
+      stat:
+        path: /opt/outline
+      register: outline_path
+
+    - name: Set outline_install_success based on existing installation
+      set_fact:
+        outline_install_success: "{{ outline_path.stat.exists }}"
+
+    - name: Fail if Outline not found for update mode
+      fail:
+        msg: |
+          Update mode requires an existing Outline installation!
+          
+          Update mode is for adding components to existing servers.
+          If you want to deploy slipstream raw mode without Outline, 
+          use deploy mode instead:
+          
+            operation_mode=deploy outline_enabled=false slipstream_enabled=true slipstream_mode=raw
+      when: not outline_path.stat.exists
+
+    - name: Fail if Outline not found but slipstream shadowsocks mode requested
+      fail:
+        msg: |
+          Cannot add slipstream in shadowsocks mode: Outline is not installed.
+          Either install Outline first or use slipstream_mode=raw.
+      when:
+        - slipstream_enabled | default(false) | bool
+        - slipstream_mode | default('shadowsocks') == 'shadowsocks'
+        - not outline_path.stat.exists
+
+    - name: Read existing Outline API info
+      slurp:
+        src: /opt/outline/access.txt
+      register: outline_access_raw
+      when: outline_path.stat.exists
+
+    - name: Parse existing API info (key:value format)
+      set_fact:
+        outline_access_decoded: "{{ outline_access_raw.content | b64decode }}"
+      when: outline_path.stat.exists
+
+    - name: Extract API URL from access.txt
+      set_fact:
+        outline_api_url: "{{ outline_access_decoded | regex_search('apiUrl:(.+)', '\\1') | first }}"
+      when: outline_path.stat.exists
+
+    - name: Build outline_api_info object
+      set_fact:
+        outline_api_info:
+          apiUrl: "{{ outline_api_url }}"
+          certSha256: "{{ outline_access_decoded | regex_search('certSha256:(.+)', '\\1') | first | default('') }}"
+      when: outline_path.stat.exists
+
+    - name: Extract hostname from existing API URL
+      set_fact:
+        random_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^.]+)', '\\1') | first }}"
+        dns_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^/]+)', '\\1') | first | regex_replace(':[0-9]+$', '') }}"
+      when: outline_path.stat.exists
+
+    # =========================================================================
+    # Detect existing components (to avoid re-deploying)
+    # =========================================================================
+    - name: Check if shadowbox config exists
+      stat:
+        path: /opt/outline/persisted-state/shadowbox_server_config.json
+      register: shadowbox_config_path
+
+    - name: Read shadowbox config to check for WebSocket
+      slurp:
+        src: /opt/outline/persisted-state/shadowbox_server_config.json
+      register: shadowbox_config_raw
+      when: shadowbox_config_path.stat.exists
+
+    - name: Set WebSocket already installed flag
+      set_fact:
+        wss_already_installed: "{{ 'websocketStream' in (shadowbox_config_raw.content | b64decode) }}"
+      when: shadowbox_config_path.stat.exists
+
+    - name: Set WebSocket not installed flag
+      set_fact:
+        wss_already_installed: false
+      when: not shadowbox_config_path.stat.exists
+
+    - name: Check if slipstream is already installed
+      stat:
+        path: /usr/local/bin/slipstream-server
+      register: slipstream_installed
+
+    - name: Set slipstream already installed flag
+      set_fact:
+        slipstream_already_installed: "{{ slipstream_installed.stat.exists }}"
+
+    - name: Debug update configuration
+      debug:
+        msg:
+          - "Update mode: Adding components to existing server"
+          - "Detected hostname: {{ random_hostname | default('N/A') }}"
+          - "Existing components detected:"
+          - "  - WebSocket: {{ wss_already_installed | default(false) }}"
+          - "  - slipstream: {{ slipstream_already_installed | default(false) }}"
+          - "Components requested:"
+          - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
+          - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
+          - "Force reinstall flags:"
+          - "  - Force slipstream: {{ force_reinstall_slipstream | default(false) | bool }}"
+          - "  - Force WebSocket: {{ force_reinstall_wss | default(false) | bool }}"
+          - "Actions:"
+          - "  - Install WebSocket: {{ (outline_wss_enabled | default(false) | bool) and (not (wss_already_installed | default(false)) or (force_reinstall_wss | default(false) | bool)) }}"
+          - "  - Install slipstream: {{ (slipstream_enabled | default(false) | bool) and (not (slipstream_already_installed | default(false)) or (force_reinstall_slipstream | default(false) | bool)) }}"
+
+    # =========================================================================
+    # Track what will be installed
+    # =========================================================================
+    # Force reinstall flags override the "already installed" detection
+    - name: Calculate what will be installed
+      set_fact:
+        will_install_wss: "{{ (outline_wss_enabled | default(false) | bool) and (not (wss_already_installed | default(false)) or (force_reinstall_wss | default(false) | bool)) }}"
+        will_install_slipstream: "{{ (slipstream_enabled | default(false) | bool) and (not (slipstream_already_installed | default(false)) or (force_reinstall_slipstream | default(false) | bool)) }}"
+
+    - name: Check if anything needs to be installed
+      set_fact:
+        will_install_anything: "{{ will_install_wss or will_install_slipstream }}"
+
+    # =========================================================================
+    # Add WebSocket (if enabled AND not already installed)
+    # =========================================================================
+    - name: Add WebSocket configuration
+      include_tasks: setup/websocket.yml
+      when:
+        - outline_path.stat.exists
+        - will_install_wss | bool
+
+    - name: Mark WebSocket as newly installed
+      set_fact:
+        wss_newly_installed: true
+      when: will_install_wss | bool
+
+    # =========================================================================
+    # Add slipstream DNS Tunnel (if enabled AND not already installed)
+    # =========================================================================
+    - name: Add slipstream DNS tunnel
+      include_tasks: setup/slipstream.yml
+      when:
+        - will_install_slipstream | bool
+
+    - name: Mark slipstream as newly installed
+      set_fact:
+        slipstream_newly_installed: true
+      when: will_install_slipstream | bool
+
+    # =========================================================================
+    # Update KV store with new component config
+    # ONLY if something new was actually installed
+    # =========================================================================
+    - name: Update KV with new configuration
+      block:
+        # IMPORTANT: KV namespaces are on the MAIN Cloudflare account, not on
+        # per-domain accounts (like slipstream's yandex-ns.com). Never use
+        # domain_providers credentials for KV - always use global credentials.
+        - name: Set Cloudflare credentials for KV operations
+          set_fact:
+            cf_token: "{{ kv_cloudflare_api_token | default(cloudflare_api_token) }}"
+            cf_account_id: "{{ kv_cloudflare_account_id | default(cloudflare_account_id) }}"
+
+        # For update mode, we need to READ existing KV data and MERGE new config
+        - name: Read existing KV data from Cloudflare
+          uri:
+            url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ random_hostname }}"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ cf_token }}"
+            return_content: yes
+            status_code: [200, 404]  # 404 if key doesn't exist yet
+          register: existing_kv_data
+          delegate_to: localhost
+
+        - name: Debug existing KV response
+          debug:
+            msg:
+              - "KV Read Status: {{ existing_kv_data.status }}"
+              - "KV Content Length: {{ existing_kv_data.content | default('') | length }}"
+              - "KV Content (first 200 chars): {{ existing_kv_data.content | default('') | truncate(200) }}"
+
+
+        - name: Parse existing KV data (JSON format)
+          set_fact:
+            api_endpoint_data: "{{ existing_kv_data.content | from_json }}"
+          when:
+            - existing_kv_data.status == 200
+            - existing_kv_data.content | default('') | length > 0
+            - existing_kv_data.content | default('') | trim | first == '{'  # Must start with { to be JSON
+
+        # Handle legacy format: plain URL string (e.g., "https://hostname.domain.com/api/secret")
+        # Convert to new JSON format for backwards compatibility
+        - name: Migrate legacy KV format (plain URL to JSON)
+          set_fact:
+            api_endpoint_data:
+              apiUrl: "{{ existing_kv_data.content | trim }}"
+          when:
+            - existing_kv_data.status == 200
+            - existing_kv_data.content | default('') | length > 0
+            - existing_kv_data.content | default('') | trim | first != '{'  # Not JSON, assume legacy URL
+            - api_endpoint_data is not defined
+
+        - name: Debug migrated KV data
+          debug:
+            msg: "KV data (migrated from legacy): {{ api_endpoint_data }}"
+          when:
+            - api_endpoint_data is defined
+            - existing_kv_data.content | default('') | trim | first != '{'
+
+        - name: Fail if KV entry doesn't exist
+          fail:
+            msg: |
+              Cannot update KV for hostname '{{ random_hostname }}' - entry not found!
+              
+              This server may not have been deployed with KV storage, or the KV entry was deleted.
+              
+              To fix this:
+              1. Re-deploy the server with operation_mode=deploy
+              2. Or manually create the KV entry in Cloudflare
+          when:
+            - existing_kv_data.status == 404 or (existing_kv_data.content | default('') | length == 0)
+
+        - name: Add websocketDomain to existing data
+          set_fact:
+            api_endpoint_data: "{{ api_endpoint_data | combine({'websocketDomain': dns_hostname}) }}"
+          when:
+            - api_endpoint_data is defined
+            - wss_newly_installed | default(false) | bool
+
+        - name: Add slipstreamConfig to existing data
+          set_fact:
+            api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': {
+              'enabled': true,
+              'mode': slipstream_mode | default('shadowsocks'),
+              'domain': slipstream_domain,
+              'resolver': slipstream_resolver,
+              'resolverBackup': slipstream_resolver_backup | default(omit),
+              'certPem': slipstream_cert_pem | default(''),
+              'socksPort': slipstream_socks_port | default(1080) if slipstream_mode == 'raw' else omit
+            }}) }}"
+          when:
+            - api_endpoint_data is defined
+            - slipstream_newly_installed | default(false) | bool
+            - slipstream_cert_pem is defined
+
+        - name: Update Cloudflare KV store with merged data
+          uri:
+            url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ random_hostname }}"
+            method: PUT
+            headers:
+              Authorization: "Bearer {{ cf_token }}"
+              Content-Type: "application/json"
+            body: "{{ api_endpoint_data | to_json }}"
+            body_format: raw
+            status_code: 200
+          delegate_to: localhost
+          when:
+            - api_endpoint_data is defined
+
+        - name: Display update summary (components added)
+          debug:
+            msg: |
+              Update complete!
+              
+              Server: {{ dns_hostname | default('unknown') }}
+              
+              Components added:
+              {% if wss_newly_installed | default(false) | bool %}
+                ✓ WebSocket transport (WSS)
+              {% endif %}
+              {% if slipstream_newly_installed | default(false) | bool %}
+                ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
+              {% endif %}
+              
+              KV store updated with new configuration.
+      when:
+        - kv_provider == 'cloudflare'
+        - random_hostname is defined
+        - will_install_anything | bool
+
+    # =========================================================================
+    # Nothing to update - show status and exit cleanly
+    # =========================================================================
+    - name: Display no-op summary
+      debug:
+        msg: |
+          No update needed!
+          
+          Server: {{ dns_hostname | default('unknown') }}
+          
+          All requested components are already installed:
+          {% if wss_already_installed | default(false) %}
+            ✓ WebSocket: already installed
+          {% endif %}
+          {% if slipstream_already_installed | default(false) %}
+            ✓ slipstream: already installed
+          {% endif %}
+          
+          No changes were made.
+      when: not (will_install_anything | bool)
+  when: operation_mode == 'update'
+

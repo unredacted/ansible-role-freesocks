@@ -1,14 +1,20 @@
 ---
 # tasks/migrate/tunnel_cleanup.yml - Tunnel cleanup tasks
 
+# Set per-domain Cloudflare credentials (allows multi-account support)
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[base_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
+
 # Cleanup existing tunnel if source and destination hostnames match
 - name: Get existing tunnels
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/cfd_tunnel"
     method: GET
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   register: existing_tunnels
@@ -33,8 +39,8 @@
     method: GET
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   register: tunnel_dns_records
@@ -50,8 +56,8 @@
     method: DELETE
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   loop: "{{ tunnel_dns_records.json.result }}"
@@ -67,11 +73,11 @@
 
 - name: Delete existing tunnel
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ source_tunnel_id }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/cfd_tunnel/{{ source_tunnel_id }}"
     method: DELETE
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   when: 

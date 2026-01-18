@@ -1,5 +1,10 @@
 # tasks/dns.yml - DNS record management
 
+# Set per-domain Cloudflare credentials (allows multi-account support)
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+
 - name: Install wamerican package for word list
   apt:
     name: wamerican
@@ -45,7 +50,6 @@
       - "Inventory Hostname: {{ inventory_hostname }}"
       - "API Endpoint: {{ cloudflare_api_endpoint }}"
       - "Zone ID: {{ domain_providers[base_domain].zone_id }}"
-      - "Account ID: {{ cloudflare_account_id }}"
       - "Envoy Mappings Available: {{ envoy_mappings[inventory_hostname] is defined }}"
 
 # Base domain DNS records
@@ -55,8 +59,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: A
@@ -84,8 +88,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: AAAA
@@ -116,8 +120,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: A
@@ -143,8 +147,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: AAAA

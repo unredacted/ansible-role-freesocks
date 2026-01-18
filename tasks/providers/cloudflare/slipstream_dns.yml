@@ -1,0 +1,196 @@
+---
+# tasks/providers/cloudflare/slipstream_dns.yml
+# Create DNS records for slipstream DNS tunnel
+#
+# Creates:
+#   - NS record: dns1.your-dns.com → ns1.your-dns.com
+#   - A record: ns1.your-dns.com → server IPv4
+#   - AAAA record: ns1.your-dns.com → server IPv6 (if available)
+
+- name: Set slipstream DNS variables
+  set_fact:
+    slipstream_tunnel_fqdn: "{{ slipstream_subdomain }}.{{ slipstream_base_domain }}"
+    slipstream_ns_fqdn: "{{ slipstream_ns_hostname }}.{{ slipstream_base_domain }}"
+    slipstream_zone_id: "{{ domain_providers[slipstream_base_domain].zone_id }}"
+    # Use domain-specific credentials if defined, otherwise fall back to global
+    slipstream_cf_token: "{{ domain_providers[slipstream_base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+
+- name: Debug slipstream DNS configuration
+  debug:
+    msg:
+      - "slipstream DNS Configuration:"
+      - "  Tunnel FQDN: {{ slipstream_tunnel_fqdn }}"
+      - "  NS FQDN: {{ slipstream_ns_fqdn }}"
+      - "  Zone ID: {{ slipstream_zone_id }}"
+      - "  Server IPv4: {{ ansible_facts['default_ipv4']['address'] | default('N/A') }}"
+      - "  Server IPv6: {{ ansible_facts['default_ipv6']['address'] | default('N/A') }}"
+
+# ============================================================================
+# Check existing DNS records
+# ============================================================================
+- name: Check if NS record exists
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records?type=NS&name={{ slipstream_tunnel_fqdn }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+    return_content: yes
+  register: ns_record_check
+  delegate_to: localhost
+
+- name: Debug NS record check result
+  debug:
+    msg:
+      - "NS Record Check for: {{ slipstream_tunnel_fqdn }}"
+      - "API Response success: {{ ns_record_check.json.success | default(false) }}"
+      - "Records found: {{ ns_record_check.json.result | default([]) | length }}"
+      - "Full result: {{ ns_record_check.json.result | default([]) }}"
+
+- name: Check if A record exists for nameserver
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records?type=A&name={{ slipstream_ns_fqdn }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+    return_content: yes
+  register: a_record_check
+  delegate_to: localhost
+
+- name: Check if AAAA record exists for nameserver
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records?type=AAAA&name={{ slipstream_ns_fqdn }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+    return_content: yes
+  register: aaaa_record_check
+  delegate_to: localhost
+  when: ansible_default_ipv6.address is defined
+
+# ============================================================================
+# Create A record for nameserver (ns1.your-dns.com → server IP)
+# ============================================================================
+- name: Create A record for slipstream nameserver
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+      Content-Type: "application/json"
+    body: |
+      {
+        "type": "A",
+        "name": "{{ slipstream_ns_fqdn }}",
+        "content": "{{ ansible_default_ipv4.address }}",
+        "ttl": 300,
+        "proxied": false
+      }
+    body_format: json
+    status_code: 200
+  delegate_to: localhost
+  when:
+    - a_record_check.json.result | length == 0
+    - ansible_default_ipv4.address is defined
+  register: a_record_created
+
+- name: Update existing A record if IP changed
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records/{{ a_record_check.json.result[0].id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+      Content-Type: "application/json"
+    body: |
+      {
+        "content": "{{ ansible_default_ipv4.address }}"
+      }
+    body_format: json
+    status_code: 200
+  delegate_to: localhost
+  when:
+    - a_record_check.json.result | length > 0
+    - a_record_check.json.result[0].content != ansible_default_ipv4.address
+    - ansible_default_ipv4.address is defined
+
+# ============================================================================
+# Create AAAA record for nameserver (ns1.your-dns.com → server IPv6)
+# ============================================================================
+- name: Create AAAA record for slipstream nameserver
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+      Content-Type: "application/json"
+    body: |
+      {
+        "type": "AAAA",
+        "name": "{{ slipstream_ns_fqdn }}",
+        "content": "{{ ansible_default_ipv6.address }}",
+        "ttl": 300,
+        "proxied": false
+      }
+    body_format: json
+    status_code: 200
+  delegate_to: localhost
+  when:
+    - ansible_default_ipv6.address is defined
+    - aaaa_record_check.json.result | default([]) | length == 0
+  register: aaaa_record_created
+
+# ============================================================================
+# Create NS record (dns1.your-dns.com → ns1.your-dns.com)
+# ============================================================================
+- name: Create NS record for slipstream tunnel subdomain
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+      Content-Type: "application/json"
+    body: |
+      {
+        "type": "NS",
+        "name": "{{ slipstream_tunnel_fqdn }}",
+        "content": "{{ slipstream_ns_fqdn }}",
+        "ttl": 300
+      }
+    body_format: json
+    status_code: 200
+  delegate_to: localhost
+  when: ns_record_check.json.result | length == 0
+  register: ns_record_created
+
+# ============================================================================
+# Summary
+# ============================================================================
+- name: Display slipstream DNS setup summary
+  debug:
+    msg: |
+      slipstream DNS Records:
+      
+      {% if a_record_created.changed | default(false) %}
+      ✓ Created A record: {{ slipstream_ns_fqdn }} → {{ ansible_default_ipv4.address }}
+      {% else %}
+      • A record exists: {{ slipstream_ns_fqdn }}
+      {% endif %}
+      
+      {% if aaaa_record_created.changed | default(false) %}
+      ✓ Created AAAA record: {{ slipstream_ns_fqdn }} → {{ ansible_default_ipv6.address }}
+      {% elif ansible_default_ipv6.address is defined %}
+      • AAAA record exists: {{ slipstream_ns_fqdn }}
+      {% else %}
+      ○ No IPv6 available, skipped AAAA record
+      {% endif %}
+      
+      {% if ns_record_created.changed | default(false) %}
+      ✓ Created NS record: {{ slipstream_tunnel_fqdn }} → {{ slipstream_ns_fqdn }}
+      {% else %}
+      • NS record exists: {{ slipstream_tunnel_fqdn }}
+      {% endif %}
+      
+      Client should use domain: {{ slipstream_tunnel_fqdn }}
+
+- name: Set slipstream_domain fact for downstream tasks
+  set_fact:
+    slipstream_domain: "{{ slipstream_tunnel_fqdn }}"

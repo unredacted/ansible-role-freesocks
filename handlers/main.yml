@@ -1,2 +1,9 @@
 ---
 # handlers file for ansible-role-freesocks
+
+- name: restart slipstream
+  systemd:
+    name: slipstream-server
+    state: restarted
+  become: yes
+

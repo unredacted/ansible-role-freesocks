@@ -25,7 +25,7 @@
 
     # Cloudflare configuration
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-    cloudflare_email: "your-email@example.com"
+
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -68,7 +68,7 @@
 
     # Same Cloudflare configuration as above...
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-    cloudflare_email: "your-email@example.com"
+
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -122,7 +122,7 @@
 
     # Same Cloudflare configuration as above...
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-    cloudflare_email: "your-email@example.com"
+
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -168,7 +168,7 @@
 
     # Include same Cloudflare configuration as above
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-    cloudflare_email: "your-email@example.com"
+
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -215,7 +215,7 @@
 
     # Include same Cloudflare configuration as above
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-    cloudflare_email: "your-email@example.com"
+
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"

@@ -1,5 +1,21 @@
 ---
 # tasks/kv.yml - KV store updates
+#
+# Note: KV store is only updated when Outline is installed
+# Slipstream-only deployments skip KV (manual client config required)
+
+# IMPORTANT: KV namespaces are on the MAIN Cloudflare account, not on
+# per-domain accounts (like slipstream's yandex-ns.com). Never use
+# domain_providers credentials for KV - always use global credentials.
+- name: Set Cloudflare credentials for KV operations
+  set_fact:
+    cf_token: "{{ kv_cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ kv_cloudflare_account_id | default(cloudflare_account_id) }}"
+
+- name: Skip KV update if no Outline API info
+  debug:
+    msg: "Skipping KV update - no Outline installation (slipstream-only mode)"
+  when: outline_api_info is not defined
 
 - name: Extract random string from API URL
   set_fact:
@@ -11,25 +27,68 @@
     var: api_random_string
   when: api_random_string is defined
 
-- name: Update Cloudflare KV store with API endpoint
+# Build the API endpoint JSON object
+- name: Build API endpoint data structure
+  set_fact:
+    api_endpoint_data:
+      apiUrl: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string | default('') }}"
+      prometheusUrl: "https://{{ random_hostname }}{{ prom_hostname_suffix }}.{{ prom_domain }}"
+  when: 
+    - api_random_string is defined
+    - outline_api_info is defined
+
+# Add websocketDomain if WSS is enabled
+- name: Add websocketDomain to endpoint data
+  set_fact:
+    api_endpoint_data: "{{ api_endpoint_data | combine({'websocketDomain': dns_hostname}) }}"
+  when: 
+    - api_endpoint_data is defined
+    - outline_wss_enabled | default(false) | bool
+
+# Add slipstreamConfig if slipstream is enabled
+- name: Add slipstreamConfig to endpoint data
+  set_fact:
+    api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': {
+      'enabled': true,
+      'mode': slipstream_mode | default('shadowsocks'),
+      'domain': slipstream_domain,
+      'resolver': slipstream_resolver,
+      'resolverBackup': slipstream_resolver_backup | default(omit),
+      'certPem': slipstream_cert_pem | default(''),
+      'socksPort': slipstream_socks_port | default(1080) if slipstream_mode == 'raw' else omit
+    }}) }}"
+  when: 
+    - api_endpoint_data is defined
+    - slipstream_enabled | default(false) | bool
+    - slipstream_cert_pem is defined
+
+- name: Debug API endpoint data structure
+  debug:
+    var: api_endpoint_data
+  when: api_endpoint_data is defined
+
+- name: Update Cloudflare KV store with API endpoint (JSON format)
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ random_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ random_hostname }}"
     method: PUT
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
-    body: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string | default('') }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
+      Content-Type: "application/json"
+    body: "{{ api_endpoint_data | to_json }}"
+    body_format: raw
     status_code: 200
   delegate_to: localhost
-  when: api_random_string is defined
+  when: api_endpoint_data is defined
 
 - name: Update Cloudflare KV store with Prometheus endpoint
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ random_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ random_hostname }}"
     method: PUT
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body: "https://{{ random_hostname }}{{ prom_hostname_suffix }}.{{ prom_domain }}"
     status_code: 200
   delegate_to: localhost
+

@@ -1,5 +1,10 @@
 # tasks/migrate/dns_records.yml - DNS record management tasks
 
+# Set per-domain Cloudflare credentials (allows multi-account support)
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+
 # Get existing DNS records for base domain
 - name: Get existing DNS records for base domain
   uri:
@@ -7,8 +12,8 @@
     method: GET
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   register: existing_dns_records
@@ -21,8 +26,8 @@
     method: PUT
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: A
@@ -48,8 +53,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: A
@@ -74,8 +79,8 @@
     method: PUT
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: AAAA
@@ -101,8 +106,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: AAAA
@@ -128,8 +133,8 @@
     method: GET
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   register: api_dns_records
@@ -144,8 +149,8 @@
     method: DELETE
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   loop: "{{ api_dns_records.json.result }}"
@@ -163,8 +168,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: A
@@ -186,8 +191,8 @@
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: AAAA

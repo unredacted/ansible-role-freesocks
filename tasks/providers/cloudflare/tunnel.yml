@@ -1,14 +1,25 @@
 ---
 # tasks/tunnel.yml - Cloudflare tunnel setup
 
+# Set per-domain Cloudflare credentials (allows multi-account support)
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[base_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
+
+- name: Debug tunnel credentials
+  debug:
+    msg:
+      - "Account ID: {{ cf_account_id }}"
+
 - name: Create Cloudflare Tunnel
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/cfd_tunnel"
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       name: "{{ kv_hostname }}{{ hostname_extension }}"
@@ -23,12 +34,12 @@
 
 - name: Create DNS CNAME record for API domain
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: CNAME
@@ -41,12 +52,12 @@
 
 - name: Create DNS CNAME record for Prometheus domain
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       type: CNAME
@@ -60,11 +71,11 @@
 
 - name: Get Cloudflare Tunnel Token
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cf_tunnel.json.result.id }}/token"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/cfd_tunnel/{{ cf_tunnel.json.result.id }}/token"
     method: GET
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     return_content: yes
   delegate_to: localhost
   register: cf_tunnel_token
@@ -103,12 +114,12 @@
 
 - name: Configure Cloudflare Tunnel ingress
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/cfd_tunnel/{{ cf_tunnel.json.result.id }}/configurations"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/cfd_tunnel/{{ cf_tunnel.json.result.id }}/configurations"
     method: PUT
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body_format: json
     body:
       config:

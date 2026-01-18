@@ -1,14 +1,22 @@
 ---
 # tasks/migrate/kv_store.yml - KV store management tasks
+#
+# Note: KV uses per-domain credentials to support multi-account migrations
+
+# Set per-domain Cloudflare credentials (allows multi-account support)
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[base_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
 
 # KV store management
 - name: Check if KV entry already exists for new server
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
     method: GET
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: [200, 404]
   delegate_to: localhost
   register: new_server_kv
@@ -16,11 +24,11 @@
 
 - name: Update API KV store with new hostname
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ destination_kv_hostname }}"
     method: PUT
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body: "{{ source_server.content | regex_replace(source_kv_hostname, destination_kv_hostname) }}"
     status_code: 200
   delegate_to: localhost
@@ -32,11 +40,11 @@
 
 - name: Check if Prometheus KV entry already exists for new server
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ destination_kv_hostname }}"
     method: GET
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: [200, 404]
   delegate_to: localhost
   register: new_server_prom_kv
@@ -44,11 +52,11 @@
 
 - name: Update Prometheus KV store with new hostname
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ destination_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ destination_kv_hostname }}"
     method: PUT
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     body: "{{ source_prom.content | regex_replace(source_kv_hostname, destination_kv_hostname) }}"
     status_code: 200
   delegate_to: localhost
@@ -61,11 +69,11 @@
 # Cleanup source server KV entries
 - name: Delete source server API KV entry
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
     method: DELETE
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   when: 
@@ -75,11 +83,11 @@
 
 - name: Delete source server Prometheus KV entry
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ source_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ source_kv_hostname }}"
     method: DELETE
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   when: 

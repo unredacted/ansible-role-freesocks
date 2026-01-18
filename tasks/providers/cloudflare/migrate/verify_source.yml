@@ -1,14 +1,20 @@
 ---
 # tasks/migrate/verify_source.yml - Source server verification tasks
 
+# Set per-domain Cloudflare credentials (allows multi-account support)
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[base_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
+
 # Check source server status
 - name: Verify source server exists
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
     method: GET
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: [200, 404]
   delegate_to: localhost
   register: source_server
@@ -17,11 +23,11 @@
 
 - name: Get source server Prometheus endpoint
   uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ source_kv_hostname }}"
+    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ source_kv_hostname }}"
     method: GET
     headers:
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: [200, 404]
   delegate_to: localhost
   register: source_prom

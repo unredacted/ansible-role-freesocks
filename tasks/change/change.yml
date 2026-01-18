@@ -15,6 +15,19 @@
 #     --extra-vars "change_target_domain=example.app"
 
 # ============================================================================
+# Set per-domain Cloudflare credentials
+# ============================================================================
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[change_target_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
+
+- name: Debug change mode credentials
+  debug:
+    msg:
+      - "Target domain: {{ change_target_domain }}"
+
+# ============================================================================
 # STEP 0: Validation (moved to main.yml)
 # ============================================================================
 # Validation and provider setup is now performed in tasks/main.yml
@@ -200,8 +213,8 @@
     method: GET
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   register: existing_dns_records
@@ -213,8 +226,8 @@
     method: DELETE
     headers:
       Content-Type: "application/json"
-      X-Auth-Email: "{{ cloudflare_email }}"
-      X-Auth-Key: "{{ cloudflare_api_token }}"
+      Authorization: "Bearer {{ cf_token }}"
+      
     status_code: 200
   delegate_to: localhost
   loop: "{{ existing_dns_records.json.result | default([]) }}"
@@ -373,8 +386,8 @@
         method: GET
         headers:
           Content-Type: "application/json"
-          X-Auth-Email: "{{ cloudflare_email }}"
-          X-Auth-Key: "{{ cloudflare_api_token }}"
+          Authorization: "Bearer {{ cf_token }}"
+          
         status_code: 200
       delegate_to: localhost
       register: old_dns_records
@@ -385,8 +398,8 @@
         method: DELETE
         headers:
           Content-Type: "application/json"
-          X-Auth-Email: "{{ cloudflare_email }}"
-          X-Auth-Key: "{{ cloudflare_api_token }}"
+          Authorization: "Bearer {{ cf_token }}"
+          
         status_code: 200
       delegate_to: localhost
       loop: "{{ old_dns_records.json.result }}"
@@ -406,8 +419,8 @@
         url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ old_kv_hostname }}"
         method: DELETE
         headers:
-          X-Auth-Email: "{{ cloudflare_email }}"
-          X-Auth-Key: "{{ cloudflare_api_token }}"
+          Authorization: "Bearer {{ cf_token }}"
+          
         status_code: [200, 404]
       delegate_to: localhost
 
@@ -416,8 +429,8 @@
         url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ old_kv_hostname }}"
         method: DELETE
         headers:
-          X-Auth-Email: "{{ cloudflare_email }}"
-          X-Auth-Key: "{{ cloudflare_api_token }}"
+          Authorization: "Bearer {{ cf_token }}"
+          
         status_code: [200, 404]
       delegate_to: localhost
   when:

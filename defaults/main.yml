@@ -1,10 +1,47 @@
 # defaults/main.yml - Default variables for the role
 
-# Operation mode: 'deploy', 'migrate', or 'change'
-# - deploy: Install new Outline server with fresh hostname
-# - migrate: Migrate server from source to destination host
+# Operation mode: 'deploy', 'migrate', 'change', or 'update'
+# - deploy: Install server with selected components (outline, slipstream, etc.)
+# - migrate: Migrate server and its components from source to destination host
 # - change: Rotate hostname on existing server (for DNS blocking bypass)
+# - update: Add components (slipstream, WSS) to an existing server
 # operation_mode: deploy
+
+# ============================================================================
+# Component Selection (Deploy Mode)
+# ============================================================================
+# Deploy mode installs combinations of components based on these flags:
+#
+# Outline (Shadowsocks proxy):
+outline_enabled: true  # Default: deploy Outline SS server
+
+# slipstream DNS tunnel (see slipstream section below):
+# slipstream_enabled: false  # Disabled by default, enable in playbook
+# slipstream_mode: "shadowsocks"  # or "raw" for standalone SOCKS5 proxy
+#
+# Example deployment combinations:
+#   1. Outline only: outline_enabled=true, slipstream_enabled=false (default)
+#   2. Outline + slipstream: outline_enabled=true, slipstream_enabled=true, slipstream_mode=shadowsocks
+#   3. slipstream only (raw): outline_enabled=false, slipstream_enabled=true, slipstream_mode=raw
+#   4. Both transports: outline_enabled=true, slipstream_enabled=true, slipstream_mode=raw
+#      (slipstream provides standalone proxy, Outline provides SS)
+
+# ============================================================================
+# Force Reinstall Options (Update and Deploy modes)
+# ============================================================================
+# Force reinstall of components even if already detected as installed.
+# Useful for:
+#   - Recovery from partial installations (e.g., slipstream installed but KV not updated)
+#   - Updating component configuration after changes
+#   - Regenerating certificates/configs
+#
+# Usage: --extra-vars "force_reinstall_slipstream=true"
+force_reinstall_slipstream: false
+# Force rebuild of slipstream-server binary from source (even if already installed)
+# Useful for updating to a new version with bug fixes (e.g., increased max connections)
+# Usage: --extra-vars "force_rebuild_slipstream=true"
+force_rebuild_slipstream: false
+force_reinstall_wss: false
 
 # Migration settings
 # Whether to delete source server KV entries after successful migration
@@ -148,8 +185,7 @@ hostname_extension: ""
 
 # Required variables that must be set by the user:
 # cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-# cloudflare_email: "your-email@example.com"
-# cloudflare_api_token: "your-api-token"
+# cloudflare_api_token: "your-api-token"  # API Token (not Global API Key)
 # cloudflare_zone_id: "your-zone-id"
 # cloudflare_account_id: "your-account-id"
 # base_domain: "example.com"
@@ -176,3 +212,71 @@ envoy_mappings: {}  # Define your envoy mappings as shown in the example above
 # Additional required variables for migration mode:
 # source_hostname: "outline1-jfk"      # Hostname of the source server
 # destination_hostname: "outline2-rmo"  # Hostname of the destination server
+
+# ============================================================================
+# slipstream DNS Tunnel Configuration
+# ============================================================================
+# Enable slipstream-rust DNS tunnel for extreme censorship resistance
+# Traffic is tunneled through DNS queries via recursive resolvers
+slipstream_enabled: false
+
+# slipstream mode:
+#   - "shadowsocks": Tunnel to local Shadowsocks server (default)
+#                    - slipstream → outline-ss-server:443
+#                    - Client needs: slipstream-client + ss-local
+#   - "raw": Direct TCP tunnel via SOCKS5 proxy
+#            - slipstream → microsocks (SOCKS5) → internet
+#            - Client only needs: slipstream-client (as SOCKS proxy)
+slipstream_mode: "shadowsocks"
+
+# Note: slipstream_domain is auto-generated from slipstream_base_domain + slipstream_subdomain
+# e.g., slipstream_subdomain=dns1, slipstream_base_domain=your-dns.com → dns1.your-dns.com
+
+# DNS resolvers for clients
+# These should be public recursive resolvers accessible from censored regions
+# Common options:
+#   - Yandex DNS (Russia allowlist): 77.88.8.8:53, 77.88.8.1:53
+#   - Google DNS: 8.8.8.8:53, 8.8.4.4:53
+#   - Cloudflare DNS: 1.1.1.1:53, 1.0.0.1:53
+#   - Local ISP resolvers (check if they forward recursively)
+slipstream_resolver: "77.88.8.8:53"
+slipstream_resolver_backup: "77.88.8.1:53"
+
+# slipstream version/branch to build from
+slipstream_version: "main"
+slipstream_repo_url: "https://github.com/unredacted/slipstream-rust.git"
+
+# DNS port for slipstream server (default: 53)
+slipstream_dns_port: 53
+
+# Log level for slipstream server (debug, info, warn, error)
+slipstream_log_level: "info"
+
+# Raw mode SOCKS5 proxy configuration
+# When slipstream_mode is "raw", microsocks is installed and slipstream forwards to it
+slipstream_socks_port: 1080  # Local SOCKS5 port (microsocks)
+
+# ============================================================================
+# slipstream DNS Record Configuration (REQUIRED when slipstream_enabled=true)
+# ============================================================================
+# These variables MUST be set via --extra-vars when enabling slipstream.
+# No defaults are provided to force explicit configuration for each server.
+#
+# Example usage:
+#   ansible-playbook playbook.yml \
+#     --extra-vars "slipstream_enabled=true" \
+#     --extra-vars "slipstream_base_domain=your-dns.com" \
+#     --extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
+#
+# For multiple servers, use different subdomains:
+#   Server 1: slipstream_subdomain=dns1 slipstream_ns_hostname=ns1
+#   Server 2: slipstream_subdomain=dns2 slipstream_ns_hostname=ns2
+#   Server 3: slipstream_subdomain=mail1 slipstream_ns_hostname=ns3
+
+# slipstream_base_domain: ""      # REQUIRED - Base domain (must be in domain_providers)
+# slipstream_subdomain: ""        # REQUIRED - Tunnel subdomain (dns1, mail1, etc.)
+# slipstream_ns_hostname: ""      # REQUIRED - Nameserver hostname (ns1, ns2, etc.)
+
+# Whether to automatically create DNS records (NS + A/AAAA for nameserver)
+slipstream_create_dns_records: true
+

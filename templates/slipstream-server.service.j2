@@ -1,0 +1,30 @@
+[Unit]
+Description=slipstream DNS Tunnel Server ({{ slipstream_mode | default('shadowsocks') }} mode)
+Documentation=https://github.com/Mygod/slipstream-rust
+After=network.target
+{% if slipstream_mode == 'raw' %}
+After=microsocks.service
+Requires=microsocks.service
+{% endif %}
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/slipstream-server \
+  --dns-listen-port {{ slipstream_dns_port | default(53) }} \
+  --target-address 127.0.0.1:{{ slipstream_target_port }} \
+  --domain {{ slipstream_domain }} \
+  --cert /etc/slipstream/cert.pem \
+  --key /etc/slipstream/key.pem
+Restart=always
+RestartSec=5
+Environment="RUST_LOG={{ slipstream_log_level | default('info') }}"
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/slipstream
+
+[Install]
+WantedBy=multi-user.target
+

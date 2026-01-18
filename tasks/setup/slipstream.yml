@@ -1,0 +1,373 @@
+---
+# tasks/setup/slipstream.yml - Configure slipstream DNS tunnel support
+# This configures the slipstream-rust DNS tunnel server for censorship resistance.
+#
+# Supports two modes:
+# - "shadowsocks": Tunnel to local Shadowsocks server (requires ss-local on client)
+# - "raw": Direct SOCKS5 proxy via microsocks (slipstream-client acts as SOCKS proxy)
+#
+# Can be deployed on new or existing servers. Mode can be switched by re-running.
+
+# ============================================================================
+# Validate Required Variables
+# ============================================================================
+- name: Validate slipstream DNS configuration
+  fail:
+    msg: |
+      Missing required slipstream configuration!
+
+      When slipstream_enabled=true, you MUST set these variables:
+        - slipstream_base_domain: Base domain (must be in domain_providers)
+        - slipstream_subdomain: Tunnel subdomain (e.g., dns1, mail1)
+        - slipstream_ns_hostname: Nameserver hostname (e.g., ns1, ns2)
+
+      Example:
+        ansible-playbook playbook.yml \
+          --extra-vars "slipstream_enabled=true" \
+          --extra-vars "slipstream_base_domain=your-dns.com" \
+          --extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
+
+      For multiple servers, use different subdomains/nameservers for each.
+  when: >
+    slipstream_base_domain is not defined or
+    slipstream_subdomain is not defined or
+    slipstream_ns_hostname is not defined or
+    slipstream_base_domain == '' or
+    slipstream_subdomain == '' or
+    slipstream_ns_hostname == ''
+
+- name: Validate slipstream_base_domain is in domain_providers
+  fail:
+    msg: |
+      slipstream_base_domain '{{ slipstream_base_domain }}' is not configured in domain_providers!
+
+      Add it to your domain_providers configuration:
+        domain_providers:
+          {{ slipstream_base_domain }}:
+            dns_provider: cloudflare
+            tunnel_provider: none
+            zone_id: "your-zone-id"
+  when:
+    - slipstream_base_domain is defined
+    - slipstream_base_domain not in domain_providers
+
+# ============================================================================
+# DNS Record Setup (Cloudflare)
+# ============================================================================
+# Creates NS record for subdomain + A/AAAA for nameserver
+- name: Create slipstream DNS records (Cloudflare)
+  include_tasks: ../providers/cloudflare/slipstream_dns.yml
+  when:
+    - slipstream_create_dns_records | default(true) | bool
+    - slipstream_base_domain is defined
+    - slipstream_base_domain in domain_providers
+
+- name: Set slipstream_domain from config
+  set_fact:
+    slipstream_domain: "{{ slipstream_subdomain }}.{{ slipstream_base_domain }}"
+  when: slipstream_domain is not defined
+
+# ============================================================================
+# Mode Configuration
+# ============================================================================
+- name: Set slipstream target based on mode
+  set_fact:
+    slipstream_target_port: "{{ outline_keys_port | default(443) if slipstream_mode == 'shadowsocks' else slipstream_socks_port | default(1080) }}"
+    slipstream_target_description: "{{ 'Shadowsocks' if slipstream_mode == 'shadowsocks' else 'SOCKS5 proxy (microsocks)' }}"
+
+- name: Display slipstream configuration
+  debug:
+    msg: |
+      Configuring slipstream DNS tunnel:
+        Mode: {{ slipstream_mode | default('shadowsocks') }}
+        Target: 127.0.0.1:{{ slipstream_target_port }}
+        Domain: {{ slipstream_domain }}
+
+# ============================================================================
+# Build slipstream-server (if not installed or force rebuild)
+# ============================================================================
+- name: Check if slipstream is already installed
+  stat:
+    path: /usr/local/bin/slipstream-server
+  register: slipstream_installed
+
+- name: Set should_build_slipstream fact
+  set_fact:
+    should_build_slipstream: "{{ not slipstream_installed.stat.exists or (force_rebuild_slipstream | default(false) | bool) }}"
+
+- name: Install Rust toolchain (if not present)
+  block:
+    - name: Check if cargo is installed
+      command: which cargo
+      register: cargo_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install Rust via rustup
+      shell: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      args:
+        creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+      when: cargo_check.rc != 0
+
+    - name: Add cargo to PATH for this session
+      set_fact:
+        cargo_path: "{{ ansible_env.HOME }}/.cargo/bin"
+  when: should_build_slipstream
+
+- name: Install build dependencies for slipstream
+  apt:
+    name:
+      - build-essential
+      - cmake
+      - pkg-config
+      - libssl-dev
+      - git
+    state: present
+    update_cache: yes
+  become: yes
+  when: should_build_slipstream
+
+- name: Clone or update slipstream-rust repository
+  git:
+    repo: "{{ slipstream_repo_url | default('https://github.com/unredacted/slipstream-rust.git') }}"
+    dest: /opt/slipstream-rust
+    version: "{{ slipstream_version | default('main') }}"
+    recursive: yes
+    force: yes
+    update: yes
+  when: should_build_slipstream
+
+- name: Build slipstream-server
+  shell: |
+    export PATH="{{ cargo_path | default(ansible_env.HOME + '/.cargo/bin') }}:$PATH"
+    cd /opt/slipstream-rust
+    cargo build --release -p slipstream-server
+  when: should_build_slipstream
+  register: slipstream_build
+  async: 600  # Allow up to 10 minutes for build
+  poll: 30
+
+- name: Install slipstream-server binary
+  copy:
+    src: /opt/slipstream-rust/target/release/slipstream-server
+    dest: /usr/local/bin/slipstream-server
+    mode: '0755'
+    remote_src: yes
+  become: yes
+  when: should_build_slipstream
+  notify: restart slipstream
+
+# ============================================================================
+# RAW MODE: Install and configure microsocks SOCKS5 proxy
+# ============================================================================
+- name: Install microsocks for raw mode
+  apt:
+    name: microsocks
+    state: present
+    update_cache: yes
+  become: yes
+  when: slipstream_mode == 'raw'
+
+- name: Deploy microsocks systemd service
+  copy:
+    dest: /etc/systemd/system/microsocks.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=microsocks SOCKS5 proxy for slipstream raw mode
+      After=network.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/bin/microsocks -i 127.0.0.1 -p {{ slipstream_socks_port | default(1080) }}
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  become: yes
+  when: slipstream_mode == 'raw'
+  register: microsocks_service
+
+- name: Enable and start microsocks
+  systemd:
+    name: microsocks
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  become: yes
+  when: slipstream_mode == 'raw'
+
+- name: Restart microsocks if service file changed
+  systemd:
+    name: microsocks
+    state: restarted
+  become: yes
+  when:
+    - slipstream_mode == 'raw'
+    - microsocks_service.changed
+
+- name: Stop and disable microsocks when switching to shadowsocks mode
+  systemd:
+    name: microsocks
+    enabled: no
+    state: stopped
+  become: yes
+  ignore_errors: yes
+  when: slipstream_mode == 'shadowsocks'
+
+# ============================================================================
+# TLS Certificates (ECC for lightweight)
+# ============================================================================
+- name: Create slipstream config directory
+  file:
+    path: /etc/slipstream
+    state: directory
+    mode: '0750'
+    owner: root
+    group: root
+  become: yes
+
+- name: Generate ECC TLS certificate for slipstream
+  command: >
+    openssl ecparam -genkey -name prime256v1 -out /etc/slipstream/key.pem
+  args:
+    creates: /etc/slipstream/key.pem
+  become: yes
+
+- name: Generate ECC certificate from key
+  command: >
+    openssl req -new -x509 -key /etc/slipstream/key.pem
+    -out /etc/slipstream/cert.pem
+    -days 3650
+    -subj "/CN=slipstream"
+  args:
+    creates: /etc/slipstream/cert.pem
+  become: yes
+
+- name: Read certificate for distribution
+  slurp:
+    src: /etc/slipstream/cert.pem
+  register: slipstream_cert_raw
+  become: yes
+
+- name: Store cert in fact for KV storage
+  set_fact:
+    slipstream_cert_pem: "{{ slipstream_cert_raw.content | b64decode }}"
+
+# ============================================================================
+# DNS Port Configuration
+# ============================================================================
+- name: Check if systemd-resolved is using port 53
+  shell: ss -ulnp | grep ':53 ' | grep systemd-resolve || true
+  register: systemd_resolved_check
+  changed_when: false
+
+- name: Configure systemd-resolved to not use port 53 (if needed)
+  block:
+    - name: Disable DNSStubListener in resolved.conf
+      lineinfile:
+        path: /etc/systemd/resolved.conf
+        regexp: '^#?DNSStubListener='
+        line: 'DNSStubListener=no'
+        create: yes
+      become: yes
+      register: resolved_config
+
+    - name: Restart systemd-resolved
+      systemd:
+        name: systemd-resolved
+        state: restarted
+      become: yes
+      when: resolved_config.changed
+  when: systemd_resolved_check.stdout != ''
+
+# ============================================================================
+# Deploy slipstream-server service
+# ============================================================================
+- name: Deploy slipstream-server systemd service
+  template:
+    src: slipstream-server.service.j2
+    dest: /etc/systemd/system/slipstream-server.service
+    mode: '0644'
+  become: yes
+  register: slipstream_service
+
+- name: Enable and start slipstream-server
+  systemd:
+    name: slipstream-server
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  become: yes
+
+- name: Restart slipstream-server if service file changed
+  systemd:
+    name: slipstream-server
+    state: restarted
+  become: yes
+  when: slipstream_service.changed
+
+- name: Wait for slipstream to start
+  pause:
+    seconds: 3
+  ignore_errors: yes
+
+- name: Verify slipstream is running
+  systemd:
+    name: slipstream-server
+  register: slipstream_status
+
+- name: Display slipstream configuration success (shadowsocks mode)
+  debug:
+    msg: |
+      slipstream DNS tunnel configured successfully!
+      
+      Mode: shadowsocks (tunnel to Shadowsocks)
+      Domain: {{ slipstream_domain }}
+      DNS Listen Port: {{ slipstream_dns_port | default(53) }}
+      Target: 127.0.0.1:{{ slipstream_target_port }} (Shadowsocks)
+      TLS: ECC (prime256v1)
+      
+      Resolver(s) for clients:
+        - Primary: {{ slipstream_resolver }}
+        - Backup: {{ slipstream_resolver_backup | default('N/A') }}
+      
+      Client setup:
+        1. Run slipstream-client (TCP port 7000)
+        2. Connect ss-local to 127.0.0.1:7000
+        3. Use SOCKS proxy from ss-local
+  when:
+    - slipstream_status.status.ActiveState == 'active'
+    - slipstream_mode == 'shadowsocks'
+
+- name: Display slipstream configuration success (raw mode)
+  debug:
+    msg: |
+      slipstream DNS tunnel configured successfully!
+      
+      Mode: raw (direct SOCKS5 proxy via microsocks)
+      Domain: {{ slipstream_domain }}
+      DNS Listen Port: {{ slipstream_dns_port | default(53) }}
+      Target: 127.0.0.1:{{ slipstream_target_port }} (microsocks)
+      TLS: ECC (prime256v1)
+      
+      Resolver(s) for clients:
+        - Primary: {{ slipstream_resolver }}
+        - Backup: {{ slipstream_resolver_backup | default('N/A') }}
+      
+      Client setup:
+        1. Run slipstream-client (TCP port 1080)
+        2. Configure apps to use SOCKS5 proxy at 127.0.0.1:1080
+        No ss-local needed - slipstream-client IS the SOCKS proxy!
+  when:
+    - slipstream_status.status.ActiveState == 'active'
+    - slipstream_mode == 'raw'
+
+- name: Fail if slipstream did not start
+  fail:
+    msg: |
+      slipstream-server failed to start!
+      Check logs with: journalctl -u slipstream-server -n 50
+  when: slipstream_status.status.ActiveState != 'active'
