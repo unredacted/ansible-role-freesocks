@@ -47,23 +47,8 @@
       - "Fastly domain mode: {{ fastly_domain_mode_effective }}"
       - "Fastly service name: {{ fastly_service_name }}"
       - "Fastly WebSocket domain: {{ fastly_websocket_domain }}"
-      - "Origin server IP: {{ ansible_facts['default_ipv4']['address'] | default('unknown') }}"
+      - "Origin backend: {{ dns_hostname }}"
 
-# ============================================================================
-# Determine origin server address for backend
-# ============================================================================
-- name: Set origin address from envoy mappings
-  set_fact:
-    fastly_origin_address: "{{ envoy_mappings[inventory_hostname].ipv4 | first }}"
-  when:
-    - envoy_mappings is defined
-    - envoy_mappings[inventory_hostname] is defined
-    - envoy_mappings[inventory_hostname].ipv4 is defined
-
-- name: Set origin address from server IP (fallback)
-  set_fact:
-    fastly_origin_address: "{{ ansible_facts['default_ipv4']['address'] }}"
-  when: fastly_origin_address is not defined
 
 # ============================================================================
 # Create Fastly service
@@ -96,6 +81,27 @@
       - "Fastly version: {{ fastly_version }}"
 
 # ============================================================================
+# Enable WebSocket passthrough via Products API
+# ============================================================================
+# MUST be enabled BEFORE adding the VCL snippet and activating the version,
+# because the VCL uses return(upgrade) which requires WebSocket to be enabled.
+# The toggle takes effect immediately across all service versions.
+- name: Enable WebSocket passthrough on Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/enabled-products/v1/websockets/services/{{ fastly_service_id }}"
+    method: PUT
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_websocket_result
+
+- name: Debug WebSocket enablement
+  debug:
+    msg: "WebSocket passthrough enabled on Fastly service {{ fastly_service_id }}"
+
+# ============================================================================
 # Add domain to service
 # ============================================================================
 - name: Add domain to Fastly service
@@ -122,6 +128,9 @@
 # ============================================================================
 # Note: When WebSocket passthrough is enabled, only Name, Address,
 # Enable TLS, and Override Host settings are supported.
+# We always use the DNS hostname as the origin address (not raw IP) so that:
+#   1. TLS SNI works correctly with Caddy's Let's Encrypt certificate
+#   2. Fastly can resolve the hostname to get the correct IP
 - name: Add backend to Fastly service
   uri:
     url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/backend"
@@ -133,7 +142,7 @@
     body_format: form-urlencoded
     body:
       name: "origin-{{ random_hostname }}"
-      address: "{{ fastly_origin_address }}"
+      address: "{{ dns_hostname }}"
       port: "443"
       use_ssl: "true"
       override_host: "{{ dns_hostname }}"
@@ -145,7 +154,37 @@
 
 - name: Debug Fastly backend addition
   debug:
-    msg: "Backend added: {{ fastly_origin_address }}:443 (override_host: {{ dns_hostname }})"
+    msg: "Backend added: {{ dns_hostname }}:443"
+
+# ============================================================================
+# Add VCL snippet for WebSocket handoff
+# ============================================================================
+# Fastly requires a VCL snippet that returns (upgrade) when it sees the
+# Upgrade header. This hands the connection off from VCL processing to
+# Fastly's WebSocket relay. Must be added BEFORE activating the version.
+# See: https://www.fastly.com/documentation/guides/concepts/real-time-messaging/websockets-tunnel/
+- name: Add WebSocket VCL snippet to Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "websocket_upgrade"
+      type: "recv"
+      priority: "10"
+      dynamic: "0"
+      content: "if (req.http.Upgrade) { return (upgrade); }"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_vcl_snippet_result
+
+- name: Debug VCL snippet addition
+  debug:
+    msg: "WebSocket VCL snippet added to Fastly service"
 
 # ============================================================================
 # Activate service version
@@ -165,25 +204,6 @@
   debug:
     msg: "Fastly service version {{ fastly_version }} activated"
 
-# ============================================================================
-# Enable WebSocket passthrough via Products API
-# ============================================================================
-# This uses the Products API toggle — no VCL snippets needed.
-# The toggle takes effect immediately across all service versions.
-- name: Enable WebSocket passthrough on Fastly service
-  uri:
-    url: "{{ fastly_api_endpoint }}/enabled-products/v1/websockets/services/{{ fastly_service_id }}"
-    method: PUT
-    headers:
-      Fastly-Key: "{{ fastly_token }}"
-      Accept: "application/json"
-    status_code: [200, 201]
-  delegate_to: localhost
-  register: fastly_websocket_result
-
-- name: Debug WebSocket enablement
-  debug:
-    msg: "WebSocket passthrough enabled on Fastly service {{ fastly_service_id }}"
 
 # ============================================================================
 # Store Fastly service ID locally and as facts
@@ -204,8 +224,9 @@
       Service Name: {{ fastly_service_name }}
       Domain Mode: {{ fastly_domain_mode_effective }}
       WebSocket Domain: {{ fastly_websocket_domain }}
-      Origin Backend: {{ fastly_origin_address }}:443
+      Origin Backend: {{ dns_hostname }}:443
       WebSocket Passthrough: Enabled
+      VCL Snippet: websocket_upgrade (return upgrade)
 
       {% if fastly_domain_mode_effective == 'shared' %}
       Clients connect to: wss://{{ fastly_websocket_domain }}
