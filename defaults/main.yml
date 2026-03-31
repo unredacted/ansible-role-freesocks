@@ -325,3 +325,10 @@ fastly_api_endpoint: "https://api.fastly.com"
 # Keep short to avoid hitting domain length limits
 fastly_service_name_prefix: "fs"
 
+# Fastly backend connection settings (optimized for WebSocket passthrough)
+# connect_timeout: Time in ms to wait for a TCP connection to origin (default: 1000)
+fastly_backend_connect_timeout: 5000
+# first_byte_timeout: Time in ms to wait for the first byte from origin (default: 15000)
+# Covers TLS handshake + WebSocket upgrade response
+fastly_backend_first_byte_timeout: 30000
+

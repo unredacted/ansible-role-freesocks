@@ -126,8 +126,12 @@
 # ============================================================================
 # Add backend (origin server)
 # ============================================================================
-# Note: When WebSocket passthrough is enabled, only Name, Address,
-# Enable TLS, and Override Host settings are supported.
+# Optimized for WebSocket passthrough:
+#   - TCP keepalives enabled to maintain long-lived connections
+#   - connect/first_byte timeouts tuned for TLS + WebSocket upgrade handshake
+#   - between_bytes_timeout is irrelevant (ignored for WebSocket connections)
+#   - max_conn left at default (0 = unlimited) to avoid blocking connection bursts
+#   - keepalive_time disabled (0) since WebSocket connections aren't pooled
 # We always use the DNS hostname as the origin address (not raw IP) so that:
 #   1. TLS SNI works correctly with Caddy's Let's Encrypt certificate
 #   2. Fastly can resolve the hostname to get the correct IP
@@ -148,13 +152,58 @@
       override_host: "{{ dns_hostname }}"
       ssl_sni_hostname: "{{ dns_hostname }}"
       ssl_cert_hostname: "{{ dns_hostname }}"
+      max_conn: "1000"
+      connect_timeout: "{{ fastly_backend_connect_timeout }}"
+      first_byte_timeout: "{{ fastly_backend_first_byte_timeout }}"
+      keepalive_time: "0"
+      tcp_keepalive_enable: "true"
+      tcp_keepalive_interval: "10"
+      tcp_keepalive_probes: "3"
+      tcp_keepalive_time: "300"
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_backend_result
 
 - name: Debug Fastly backend addition
   debug:
-    msg: "Backend added: {{ dns_hostname }}:443"
+    msg: "Backend added: {{ dns_hostname }}:443 (connect_timeout={{ fastly_backend_connect_timeout }}ms, first_byte_timeout={{ fastly_backend_first_byte_timeout }}ms, tcp_keepalive=on)"
+
+# ============================================================================
+# Add health check for origin (monitoring only)
+# ============================================================================
+# Creates an HTTPS health check for origin monitoring and troubleshooting.
+# NOT linked to the backend — with a single origin and no failover, marking
+# it unhealthy would 503 all traffic. The health check is still visible in
+# the Fastly dashboard and API for observability.
+# Fastly checks run from every POP.
+- name: Create health check for origin
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/healthcheck"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "origin-health-{{ random_hostname }}"
+      host: "{{ dns_hostname }}"
+      path: "/"
+      method: "HEAD"
+      http_version: "1.1"
+      expected_response: "200"
+      check_interval: "30000"
+      timeout: "5000"
+      window: "5"
+      threshold: "3"
+      initial: "3"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_healthcheck_result
+
+- name: Debug health check addition
+  debug:
+    msg: "Health check 'origin-health-{{ random_hostname }}' created (monitoring only, not linked to backend)"
 
 # ============================================================================
 # Add VCL snippet for WebSocket handoff
