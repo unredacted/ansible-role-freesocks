@@ -73,6 +73,14 @@
     - tunnel_provider is defined
     - tunnel_provider not in ['cloudflare', 'none']
 
+- name: Fail if cdn_provider is invalid (when explicitly set)
+  fail:
+    msg: "cdn_provider must be 'cloudflare', 'fastly', or 'none', got: {{ cdn_provider }}"
+  when:
+    - operation_mode not in ['change', 'deploy', 'update']
+    - cdn_provider is defined
+    - cdn_provider not in ['cloudflare', 'fastly', 'none']
+
 - name: Fail if kv_provider is not specified
   fail:
     msg: "kv_provider must be explicitly set (e.g., 'cloudflare')"
@@ -120,6 +128,8 @@
     target_domain_config: "{{ domain_providers[deploy_target_domain] }}"
     effective_dns_provider: "{{ domain_providers[deploy_target_domain].dns_provider }}"
     effective_tunnel_provider: "{{ domain_providers[deploy_target_domain].tunnel_provider | default('none') }}"
+    effective_cdn_provider: "{{ domain_providers[deploy_target_domain].cdn_provider | default('none') }}"
+    effective_fastly_domain_mode: "{{ domain_providers[deploy_target_domain].fastly_domain_mode | default('shared') }}"
     effective_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
     # Override global variables for this deployment
     base_domain: "{{ deploy_target_domain }}"
@@ -127,6 +137,16 @@
     prom_domain: "{{ deploy_target_domain }}"
     cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
   when: operation_mode == 'deploy'
+
+- name: Validate Fastly configuration (deploy)
+  fail:
+    msg: |
+      Fastly API token is required when cdn_provider is 'fastly'.
+      Set fastly_api_token globally or fastly_api_token in domain_providers[{{ deploy_target_domain }}].
+  when:
+    - operation_mode == 'deploy'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - domain_providers[deploy_target_domain].fastly_api_token | default(fastly_api_token | default('')) == ''
 
 # ============================================================================
 # KV NAMESPACE SETUP (provider-specific)
@@ -180,6 +200,8 @@
     target_domain_config: "{{ domain_providers[change_target_domain] }}"
     effective_dns_provider: "{{ domain_providers[change_target_domain].dns_provider }}"
     effective_tunnel_provider: "{{ domain_providers[change_target_domain].tunnel_provider | default('none') }}"
+    effective_cdn_provider: "{{ domain_providers[change_target_domain].cdn_provider | default('none') }}"
+    effective_fastly_domain_mode: "{{ domain_providers[change_target_domain].fastly_domain_mode | default('shared') }}"
     effective_zone_id: "{{ domain_providers[change_target_domain].zone_id }}"
   when: operation_mode == 'change'
 
@@ -190,6 +212,7 @@
       - "Environment Mode: {{ environment_mode }}"
       - "DNS Provider: {{ effective_dns_provider | default(dns_provider) | default('pending') }}"
       - "Tunnel Provider: {{ effective_tunnel_provider | default(tunnel_provider) | default('pending') }}"
+      - "CDN Provider: {{ effective_cdn_provider | default('none') }}"
       - "KV Provider: {{ kv_provider }}"
       - "API KV Namespace: {{ cloudflare_api_kv_namespace | default('N/A') }}"
       - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace | default('N/A') }}"
@@ -310,6 +333,18 @@
       when: not (outline_enabled | default(true) | bool)
 
     # Provider-specific DNS setup
+    # Origin DNS records are ALWAYS needed, even with Fastly CDN, because:
+    #   1. Caddy needs to resolve the hostname for Let's Encrypt certificate issuance
+    #   2. API health checks need DNS resolution
+    #   3. Fastly backends need to reach the origin server
+    # When Fastly is the CDN, we disable Cloudflare proxy (orange cloud) to avoid
+    # double-CDN and ensure Fastly talks directly to the origin.
+    - name: Override dns_proxied for Fastly CDN (avoid double-CDN)
+      set_fact:
+        dns_proxied: false
+      when:
+        - effective_cdn_provider | default('none') == 'fastly'
+
     - name: Include DNS tasks (Cloudflare)
       include_tasks: providers/cloudflare/dns.yml
       when: 
@@ -332,6 +367,34 @@
         - outline_install_success | bool
         - outline_enabled | default(true) | bool
         - outline_wss_enabled | default(false) | bool
+
+    # =========================================================================
+    # CDN PROVIDER: Fastly (WSS fronting via Fastly CDN)
+    # =========================================================================
+    # Fastly service creation + WebSocket enablement
+    - name: Include Fastly CDN service tasks
+      include_tasks: providers/fastly/service.yml
+      when:
+        - outline_install_success | bool
+        - effective_cdn_provider | default('none') == 'fastly'
+        - outline_wss_enabled | default(false) | bool
+
+    # Fastly TLS subscription (custom domain mode only)
+    - name: Include Fastly TLS tasks (custom domain mode)
+      include_tasks: providers/fastly/tls.yml
+      when:
+        - outline_install_success | bool
+        - effective_cdn_provider | default('none') == 'fastly'
+        - effective_fastly_domain_mode | default('shared') == 'custom'
+
+    # DNS CNAME to Fastly edge (custom domain mode only)
+    - name: Include Fastly DNS tasks (custom domain mode)
+      include_tasks: providers/fastly/dns.yml
+      when:
+        - outline_install_success | bool
+        - effective_cdn_provider | default('none') == 'fastly'
+        - effective_fastly_domain_mode | default('shared') == 'custom'
+        - effective_dns_provider == 'cloudflare'
 
     # =========================================================================
     # COMPONENT: slipstream DNS Tunnel
@@ -686,21 +749,42 @@
             - api_endpoint_data is defined
             - wss_newly_installed | default(false) | bool
 
-        - name: Add slipstreamConfig to existing data
+        # NOTE: Build slipstreamConfig in steps to avoid Ansible's omit sentinel
+        # leaking __omit_place_holder__ strings into the JSON output.
+        - name: Build base slipstreamConfig for update
           set_fact:
-            api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': {
-              'enabled': true,
-              'mode': slipstream_mode | default('shadowsocks'),
-              'domain': slipstream_domain,
-              'resolver': slipstream_resolver,
-              'resolverBackup': slipstream_resolver_backup | default(omit),
-              'certPem': slipstream_cert_pem | default(''),
-              'socksPort': slipstream_socks_port | default(1080) if slipstream_mode == 'raw' else omit
-            }}) }}"
+            _slipstream_kv_config:
+              enabled: true
+              mode: "{{ slipstream_mode | default('shadowsocks') }}"
+              domain: "{{ slipstream_domain }}"
+              resolver: "{{ slipstream_resolver }}"
+              certPem: "{{ slipstream_cert_pem | default('') }}"
           when:
             - api_endpoint_data is defined
             - slipstream_newly_installed | default(false) | bool
             - slipstream_cert_pem is defined
+
+        - name: Add resolverBackup to slipstreamConfig for update
+          set_fact:
+            _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'resolverBackup': slipstream_resolver_backup}) }}"
+          when:
+            - _slipstream_kv_config is defined
+            - slipstream_resolver_backup is defined
+            - slipstream_resolver_backup != ''
+
+        - name: Add socksPort to slipstreamConfig for update (raw mode only)
+          set_fact:
+            _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'socksPort': slipstream_socks_port | default(1080) | int}) }}"
+          when:
+            - _slipstream_kv_config is defined
+            - slipstream_mode == 'raw'
+
+        - name: Merge slipstreamConfig into existing data
+          set_fact:
+            api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': _slipstream_kv_config}) }}"
+          when:
+            - api_endpoint_data is defined
+            - _slipstream_kv_config is defined
 
         - name: Update Cloudflare KV store with merged data
           uri:

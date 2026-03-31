@@ -22,6 +22,12 @@
     cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
     cf_account_id: "{{ domain_providers[change_target_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
 
+# Set Fastly credentials if CDN provider is Fastly
+- name: Set Fastly credentials for change mode
+  set_fact:
+    fastly_token: "{{ domain_providers[change_target_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
+  when: effective_cdn_provider | default('none') == 'fastly'
+
 - name: Debug change mode credentials
   debug:
     msg:
@@ -243,9 +249,44 @@
 # ============================================================================
 # STEP 5: Create new DNS records (provider-specific)
 # ============================================================================
+# Clean up old Fastly service before creating new one
+- name: Include Fastly cleanup tasks
+  include_tasks: ../providers/fastly/cleanup.yml
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+# Override dns_proxied when Fastly is CDN (avoid double-CDN)
+- name: Override dns_proxied for Fastly CDN (change mode)
+  set_fact:
+    dns_proxied: false
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+# Origin DNS records are ALWAYS needed (Caddy TLS, health checks, Fastly backend)
 - name: Include DNS tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/dns.yml
-  when: effective_dns_provider == 'cloudflare'
+  when:
+    - effective_dns_provider == 'cloudflare'
+
+# Fastly CDN service creation + WebSocket enablement
+- name: Include Fastly CDN service tasks (change mode)
+  include_tasks: ../providers/fastly/service.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - outline_wss_enabled | default(false) | bool
+
+# Fastly TLS subscription (custom domain mode only)
+- name: Include Fastly TLS tasks (change mode, custom domain)
+  include_tasks: ../providers/fastly/tls.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+# DNS CNAME to Fastly edge (custom domain mode only)
+- name: Include Fastly DNS tasks (change mode, custom domain)
+  include_tasks: ../providers/fastly/dns.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - effective_dns_provider == 'cloudflare'
 
 # ============================================================================
 # STEP 6: Create new tunnel records (provider-specific)
@@ -411,32 +452,38 @@
 
 # ============================================================================
 # STEP 13: Delete old KV entries (optional)
+# Uses KV-specific credentials (same as kv.yml) since KV namespaces
+# may be on a different Cloudflare account from the domain.
 # ============================================================================
 - name: Delete old KV entries (Cloudflare)
   block:
+    - name: Set KV credentials for old entry cleanup
+      set_fact:
+        _kv_token: "{{ kv_cloudflare_api_token | default(cloudflare_api_token) }}"
+        _kv_account_id: "{{ kv_cloudflare_account_id | default(cloudflare_account_id) }}"
+
     - name: Delete old API KV entry
       uri:
-        url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ old_kv_hostname }}"
+        url: "{{ cloudflare_api_endpoint }}/accounts/{{ _kv_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ old_kv_hostname }}"
         method: DELETE
         headers:
-          Authorization: "Bearer {{ cf_token }}"
-          
+          Authorization: "Bearer {{ _kv_token }}"
         status_code: [200, 404]
       delegate_to: localhost
 
     - name: Delete old Prometheus KV entry
       uri:
-        url: "{{ cloudflare_api_endpoint }}/accounts/{{ cloudflare_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ old_kv_hostname }}"
+        url: "{{ cloudflare_api_endpoint }}/accounts/{{ _kv_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ old_kv_hostname }}"
         method: DELETE
         headers:
-          Authorization: "Bearer {{ cf_token }}"
-          
+          Authorization: "Bearer {{ _kv_token }}"
         status_code: [200, 404]
       delegate_to: localhost
   when:
     - kv_provider == 'cloudflare'  # KV is global, not per-domain
     - change_delete_old_kv | default(true) | bool
     - old_kv_hostname != ''
+
 
 # ============================================================================
 # COMPLETE

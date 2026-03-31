@@ -1,0 +1,216 @@
+---
+# tasks/providers/fastly/service.yml - Create and configure Fastly VCL service
+#
+# Creates a Fastly CDN service for WebSocket passthrough (WSS fronting).
+# Supports two domain modes:
+#   - shared: Uses {prefix}-{hostname}.global.ssl.fastly.net (no external DNS/TLS needed)
+#   - custom: Uses your own domain (requires TLS subscription + DNS CNAME)
+#
+# Requires:
+#   - fastly_api_token (global or per-domain in domain_providers)
+#   - random_hostname (set by main.yml or dns.yml)
+#   - Server IP for backend origin
+
+# ============================================================================
+# Set Fastly credentials
+# ============================================================================
+- name: Set Fastly API credentials
+  set_fact:
+    fastly_token: "{{ domain_providers[base_domain].fastly_api_token | default(fastly_api_token) }}"
+    fastly_domain_mode_effective: "{{ domain_providers[base_domain].fastly_domain_mode | default('shared') }}"
+
+- name: Fail if Fastly API token is not set
+  fail:
+    msg: |
+      Fastly API token is required when cdn_provider is 'fastly'.
+      Set fastly_api_token globally or per-domain in domain_providers.
+  when: fastly_token is not defined or fastly_token == ''
+
+# ============================================================================
+# Determine domain name based on mode
+# ============================================================================
+- name: Set Fastly shared domain name
+  set_fact:
+    fastly_service_name: "{{ fastly_service_name_prefix }}-{{ random_hostname }}"
+    fastly_websocket_domain: "{{ fastly_service_name_prefix }}-{{ random_hostname }}.global.ssl.fastly.net"
+  when: fastly_domain_mode_effective == 'shared'
+
+- name: Set Fastly custom domain name
+  set_fact:
+    fastly_service_name: "{{ random_hostname }}-{{ base_domain | replace('.', '-') }}"
+    fastly_websocket_domain: "{{ dns_hostname }}"
+  when: fastly_domain_mode_effective == 'custom'
+
+- name: Debug Fastly configuration
+  debug:
+    msg:
+      - "Fastly domain mode: {{ fastly_domain_mode_effective }}"
+      - "Fastly service name: {{ fastly_service_name }}"
+      - "Fastly WebSocket domain: {{ fastly_websocket_domain }}"
+      - "Origin server IP: {{ ansible_facts['default_ipv4']['address'] | default('unknown') }}"
+
+# ============================================================================
+# Determine origin server address for backend
+# ============================================================================
+- name: Set origin address from envoy mappings
+  set_fact:
+    fastly_origin_address: "{{ envoy_mappings[inventory_hostname].ipv4 | first }}"
+  when:
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv4 is defined
+
+- name: Set origin address from server IP (fallback)
+  set_fact:
+    fastly_origin_address: "{{ ansible_facts['default_ipv4']['address'] }}"
+  when: fastly_origin_address is not defined
+
+# ============================================================================
+# Create Fastly service
+# ============================================================================
+- name: Create Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/service"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "{{ fastly_service_name }}"
+      type: "vcl"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_service_result
+
+- name: Extract Fastly service ID and version
+  set_fact:
+    fastly_service_id: "{{ fastly_service_result.json.id }}"
+    fastly_version: "{{ fastly_service_result.json.versions[0].number }}"
+
+- name: Debug Fastly service creation
+  debug:
+    msg:
+      - "Fastly service ID: {{ fastly_service_id }}"
+      - "Fastly version: {{ fastly_version }}"
+
+# ============================================================================
+# Add domain to service
+# ============================================================================
+- name: Add domain to Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/domain"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "{{ fastly_websocket_domain }}"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_domain_result
+
+- name: Debug Fastly domain addition
+  debug:
+    msg: "Domain {{ fastly_websocket_domain }} added to Fastly service"
+
+# ============================================================================
+# Add backend (origin server)
+# ============================================================================
+# Note: When WebSocket passthrough is enabled, only Name, Address,
+# Enable TLS, and Override Host settings are supported.
+- name: Add backend to Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/backend"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "origin-{{ random_hostname }}"
+      address: "{{ fastly_origin_address }}"
+      port: "443"
+      use_ssl: "true"
+      override_host: "{{ dns_hostname }}"
+      ssl_sni_hostname: "{{ dns_hostname }}"
+      ssl_cert_hostname: "{{ dns_hostname }}"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_backend_result
+
+- name: Debug Fastly backend addition
+  debug:
+    msg: "Backend added: {{ fastly_origin_address }}:443 (override_host: {{ dns_hostname }})"
+
+# ============================================================================
+# Activate service version
+# ============================================================================
+- name: Activate Fastly service version
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/activate"
+    method: PUT
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: 200
+  delegate_to: localhost
+  register: fastly_activate_result
+
+- name: Debug Fastly service activation
+  debug:
+    msg: "Fastly service version {{ fastly_version }} activated"
+
+# ============================================================================
+# Enable WebSocket passthrough via Products API
+# ============================================================================
+# This uses the Products API toggle — no VCL snippets needed.
+# The toggle takes effect immediately across all service versions.
+- name: Enable WebSocket passthrough on Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/enabled-products/v1/websockets/services/{{ fastly_service_id }}"
+    method: PUT
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_websocket_result
+
+- name: Debug WebSocket enablement
+  debug:
+    msg: "WebSocket passthrough enabled on Fastly service {{ fastly_service_id }}"
+
+# ============================================================================
+# Store Fastly service ID locally and as facts
+# ============================================================================
+- name: Save Fastly service ID to server
+  copy:
+    content: "{{ fastly_service_id }}"
+    dest: /opt/outline/fastly_service_id
+    mode: '0644'
+  become: yes
+
+- name: Display Fastly service summary
+  debug:
+    msg: |
+      Fastly CDN service created successfully!
+
+      Service ID: {{ fastly_service_id }}
+      Service Name: {{ fastly_service_name }}
+      Domain Mode: {{ fastly_domain_mode_effective }}
+      WebSocket Domain: {{ fastly_websocket_domain }}
+      Origin Backend: {{ fastly_origin_address }}:443
+      WebSocket Passthrough: Enabled
+
+      {% if fastly_domain_mode_effective == 'shared' %}
+      Clients connect to: wss://{{ fastly_websocket_domain }}
+      No additional DNS or TLS configuration needed.
+      {% else %}
+      Clients connect to: wss://{{ fastly_websocket_domain }}
+      TLS subscription and DNS CNAME still needed (see tls.yml and dns.yml).
+      {% endif %}

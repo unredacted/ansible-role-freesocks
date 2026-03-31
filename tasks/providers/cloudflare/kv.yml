@@ -3,6 +3,9 @@
 #
 # Note: KV store is only updated when Outline is installed
 # Slipstream-only deployments skip KV (manual client config required)
+#
+# IMPORTANT: All KV values are stored as clean JSON objects.
+# The freesocks-control-plane parses these with JSON.parse().
 
 # IMPORTANT: KV namespaces are on the MAIN Cloudflare account, not on
 # per-domain accounts (like slipstream's yandex-ns.com). Never use
@@ -38,29 +41,70 @@
     - outline_api_info is defined
 
 # Add websocketDomain if WSS is enabled
-- name: Add websocketDomain to endpoint data
+# When Fastly CDN is active, use the Fastly-fronted domain instead of direct hostname
+- name: Add websocketDomain to endpoint data (Fastly CDN)
+  set_fact:
+    api_endpoint_data: "{{ api_endpoint_data | combine({'websocketDomain': fastly_websocket_domain}) }}"
+  when: 
+    - api_endpoint_data is defined
+    - outline_wss_enabled | default(false) | bool
+    - effective_cdn_provider | default('none') == 'fastly'
+    - fastly_websocket_domain is defined
+
+- name: Add websocketDomain to endpoint data (non-Fastly)
   set_fact:
     api_endpoint_data: "{{ api_endpoint_data | combine({'websocketDomain': dns_hostname}) }}"
   when: 
     - api_endpoint_data is defined
     - outline_wss_enabled | default(false) | bool
+    - effective_cdn_provider | default('none') != 'fastly'
 
 # Add slipstreamConfig if slipstream is enabled
-- name: Add slipstreamConfig to endpoint data
+# NOTE: We build the config in steps to avoid Ansible's omit sentinel
+# leaking __omit_place_holder__ strings into the JSON output.
+- name: Build base slipstreamConfig
   set_fact:
-    api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': {
-      'enabled': true,
-      'mode': slipstream_mode | default('shadowsocks'),
-      'domain': slipstream_domain,
-      'resolver': slipstream_resolver,
-      'resolverBackup': slipstream_resolver_backup | default(omit),
-      'certPem': slipstream_cert_pem | default(''),
-      'socksPort': slipstream_socks_port | default(1080) if slipstream_mode == 'raw' else omit
-    }}) }}"
-  when: 
+    _slipstream_kv_config:
+      enabled: true
+      mode: "{{ slipstream_mode | default('shadowsocks') }}"
+      domain: "{{ slipstream_domain }}"
+      resolver: "{{ slipstream_resolver }}"
+      certPem: "{{ slipstream_cert_pem | default('') }}"
+  when:
     - api_endpoint_data is defined
     - slipstream_enabled | default(false) | bool
     - slipstream_cert_pem is defined
+
+- name: Add resolverBackup to slipstreamConfig
+  set_fact:
+    _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'resolverBackup': slipstream_resolver_backup}) }}"
+  when:
+    - _slipstream_kv_config is defined
+    - slipstream_resolver_backup is defined
+    - slipstream_resolver_backup != ''
+
+- name: Add socksPort to slipstreamConfig (raw mode only)
+  set_fact:
+    _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'socksPort': slipstream_socks_port | default(1080) | int}) }}"
+  when:
+    - _slipstream_kv_config is defined
+    - slipstream_mode == 'raw'
+
+- name: Merge slipstreamConfig into endpoint data
+  set_fact:
+    api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': _slipstream_kv_config}) }}"
+  when:
+    - api_endpoint_data is defined
+    - _slipstream_kv_config is defined
+
+# Add Fastly CDN metadata if applicable
+- name: Add Fastly CDN metadata to endpoint data
+  set_fact:
+    api_endpoint_data: "{{ api_endpoint_data | combine({'fastlyServiceId': fastly_service_id, 'cdnProvider': 'fastly'}) }}"
+  when:
+    - api_endpoint_data is defined
+    - effective_cdn_provider | default('none') == 'fastly'
+    - fastly_service_id is defined
 
 - name: Debug API endpoint data structure
   debug:
@@ -73,7 +117,6 @@
     method: PUT
     headers:
       Authorization: "Bearer {{ cf_token }}"
-      
       Content-Type: "application/json"
     body: "{{ api_endpoint_data | to_json }}"
     body_format: raw
@@ -81,14 +124,14 @@
   delegate_to: localhost
   when: api_endpoint_data is defined
 
-- name: Update Cloudflare KV store with Prometheus endpoint
+- name: Update Cloudflare KV store with Prometheus endpoint (JSON format)
   uri:
     url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ random_hostname }}"
     method: PUT
     headers:
       Authorization: "Bearer {{ cf_token }}"
-      
-    body: "https://{{ random_hostname }}{{ prom_hostname_suffix }}.{{ prom_domain }}"
+      Content-Type: "application/json"
+    body: "{{ {'prometheusUrl': 'https://' + random_hostname + prom_hostname_suffix + '.' + prom_domain} | to_json }}"
+    body_format: raw
     status_code: 200
   delegate_to: localhost
-

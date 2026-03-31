@@ -1,0 +1,50 @@
+---
+# tasks/providers/fastly/dns.yml - DNS CNAME to Fastly edge (custom domain mode)
+#
+# Creates a CNAME record in the DNS provider pointing the custom hostname
+# to Fastly's edge network. Only used when fastly_domain_mode == 'custom'.
+#
+# In custom mode, traffic flows:
+#   Client → DNS CNAME → Fastly edge → origin backend
+#
+# In shared mode, this file is NOT used because clients connect directly
+# to *.global.ssl.fastly.net which is managed by Fastly.
+#
+# Requires:
+#   - fastly_cname_target (set by tls.yml — e.g., x.sni.global.fastly.net)
+#   - effective_dns_provider == 'cloudflare'
+#   - domain_providers[base_domain].zone_id
+
+# ============================================================================
+# Set DNS provider credentials
+# ============================================================================
+- name: Set domain-specific Cloudflare credentials for Fastly DNS
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+
+# ============================================================================
+# Create CNAME record pointing to Fastly edge
+# ============================================================================
+- name: Create DNS CNAME record for Fastly (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    body_format: json
+    body:
+      type: CNAME
+      name: "{{ random_hostname }}"
+      content: "{{ fastly_cname_target }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_dns_cname_result
+
+- name: Debug Fastly DNS CNAME result
+  debug:
+    msg:
+      - "CNAME record created: {{ dns_hostname }} → {{ fastly_cname_target }}"
+      - "DNS provider: Cloudflare (zone {{ domain_providers[base_domain].zone_id }})"

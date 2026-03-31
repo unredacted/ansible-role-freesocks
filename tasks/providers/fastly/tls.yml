@@ -1,0 +1,191 @@
+---
+# tasks/providers/fastly/tls.yml - Fastly TLS subscription for custom domain mode
+#
+# Creates a Fastly-managed TLS subscription using Let's Encrypt.
+# Only used when fastly_domain_mode == 'custom'.
+#
+# Flow:
+#   1. Create TLS subscription via Fastly API
+#   2. Extract ACME challenge info
+#   3. Create _acme-challenge CNAME via DNS provider (Cloudflare)
+#   4. Wait for certificate issuance
+#   5. Extract the CNAME target for DNS routing
+#
+# Requires:
+#   - fastly_token (set by service.yml)
+#   - fastly_websocket_domain (set by service.yml)
+#   - effective_dns_provider == 'cloudflare' (for ACME challenge DNS)
+
+# ============================================================================
+# Create TLS subscription
+# ============================================================================
+- name: Create Fastly TLS subscription
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/vnd.api+json"
+      Accept: "application/vnd.api+json"
+    body_format: json
+    body:
+      data:
+        type: tls_subscription
+        attributes:
+          certificate_authority: "lets-encrypt"
+        relationships:
+          tls_domains:
+            data:
+              - type: tls_domain
+                id: "{{ fastly_websocket_domain }}"
+    status_code: [200, 201]
+  delegate_to: localhost
+  register: fastly_tls_sub_result
+
+- name: Extract TLS subscription ID
+  set_fact:
+    fastly_tls_subscription_id: "{{ fastly_tls_sub_result.json.data.id }}"
+
+- name: Debug TLS subscription creation
+  debug:
+    msg:
+      - "TLS subscription created: {{ fastly_tls_subscription_id }}"
+      - "Domain: {{ fastly_websocket_domain }}"
+
+# ============================================================================
+# Get TLS subscription details (includes ACME challenge info)
+# ============================================================================
+- name: Get TLS subscription details
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ fastly_tls_subscription_id }}?include=tls_authorizations"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  register: fastly_tls_details
+
+- name: Extract ACME challenge info
+  set_fact:
+    fastly_tls_challenges: "{{ fastly_tls_details.json.included | selectattr('type', 'equalto', 'tls_authorization') | list }}"
+
+- name: Debug TLS authorization details
+  debug:
+    msg:
+      - "TLS authorizations found: {{ fastly_tls_challenges | length }}"
+      - "Challenge details: {{ fastly_tls_challenges }}"
+
+# ============================================================================
+# Create ACME challenge DNS record via Cloudflare
+# ============================================================================
+# Extract the ACME challenge record values from the authorization
+- name: Extract ACME challenge record name and values
+  set_fact:
+    fastly_acme_challenge_record: "{{ fastly_tls_challenges[0].attributes.challenges | selectattr('type', 'equalto', 'dns-01') | first }}"
+  when: fastly_tls_challenges | length > 0
+
+- name: Debug ACME challenge record
+  debug:
+    msg:
+      - "ACME challenge record name: {{ fastly_acme_challenge_record.record_name | default('N/A') }}"
+      - "ACME challenge record type: {{ fastly_acme_challenge_record.record_type | default('N/A') }}"
+      - "ACME challenge values: {{ fastly_acme_challenge_record.values | default([]) }}"
+  when: fastly_acme_challenge_record is defined
+
+# Set per-domain Cloudflare credentials for ACME record creation
+- name: Set domain-specific Cloudflare credentials for ACME
+  set_fact:
+    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+
+- name: Create ACME challenge CNAME record in Cloudflare
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    body_format: json
+    body:
+      type: "CNAME"
+      name: "{{ fastly_acme_challenge_record.record_name }}"
+      content: "{{ fastly_acme_challenge_record.values | first }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - fastly_acme_challenge_record is defined
+    - fastly_acme_challenge_record.values | default([]) | length > 0
+  register: acme_dns_result
+
+- name: Debug ACME DNS record creation
+  debug:
+    msg: "ACME challenge CNAME record created in Cloudflare"
+  when: acme_dns_result is defined
+
+# ============================================================================
+# Wait for TLS certificate issuance
+# ============================================================================
+- name: Wait for Fastly TLS certificate to be issued
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ fastly_tls_subscription_id }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  register: fastly_tls_status
+  retries: 30
+  delay: 10
+  until: >
+    fastly_tls_status.json.data.attributes.state == 'issued' or
+    fastly_tls_status.json.data.attributes.state == 'renewing'
+
+- name: Debug TLS certificate status
+  debug:
+    msg:
+      - "TLS subscription state: {{ fastly_tls_status.json.data.attributes.state }}"
+      - "Certificate issued for: {{ fastly_websocket_domain }}"
+
+# ============================================================================
+# Extract CNAME target for DNS routing
+# ============================================================================
+# After TLS is issued, get the specific CNAME Target (e.g., x.sni.global.fastly.net)
+- name: Get TLS domain details for CNAME target
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/activations?filter[tls_subscription.id]={{ fastly_tls_subscription_id }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  register: fastly_tls_activations
+
+- name: Extract Fastly CNAME target
+  set_fact:
+    # The CNAME target comes from the TLS configuration
+    # Format is typically: {letter}.sni.global.fastly.net
+    fastly_cname_target: "{{ fastly_tls_activations.json.data[0].attributes.cname_target | default('') }}"
+  when: fastly_tls_activations.json.data | length > 0
+
+# Fallback: if the activation doesn't include cname_target directly,
+# use the standard Fastly mapping
+- name: Set fallback CNAME target
+  set_fact:
+    fastly_cname_target: "dualstack.{{ fastly_websocket_domain | regex_replace('[^a-z0-9]', '') | truncate(10, False, '') }}.sni.global.fastly.net"
+  when: fastly_cname_target is not defined or fastly_cname_target == ''
+
+- name: Display TLS setup summary
+  debug:
+    msg: |
+      Fastly TLS certificate issued!
+
+      Domain: {{ fastly_websocket_domain }}
+      CNAME Target: {{ fastly_cname_target }}
+      Subscription ID: {{ fastly_tls_subscription_id }}
+
+      DNS CNAME record needed: {{ fastly_websocket_domain }} → {{ fastly_cname_target }}

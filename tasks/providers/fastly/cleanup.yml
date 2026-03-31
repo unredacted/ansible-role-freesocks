@@ -1,0 +1,98 @@
+---
+# tasks/providers/fastly/cleanup.yml - Clean up Fastly service
+#
+# Deletes a Fastly service when rotating hostnames or cleaning up.
+# Used during hostname changes to remove the old Fastly service
+# before creating a new one for the new hostname.
+#
+# Reads the service ID from:
+#   1. /opt/outline/fastly_service_id (local file on server)
+#   2. Existing KV data (via fastlyServiceId field)
+#
+# Requires:
+#   - fastly_token (set by caller)
+#   - old_fastly_service_id (set by caller, or read from local file)
+
+# ============================================================================
+# Read Fastly service ID from server
+# ============================================================================
+- name: Check if Fastly service ID file exists
+  stat:
+    path: /opt/outline/fastly_service_id
+  register: fastly_service_id_file
+
+- name: Read Fastly service ID from file
+  slurp:
+    src: /opt/outline/fastly_service_id
+  register: fastly_service_id_raw
+  when: fastly_service_id_file.stat.exists
+
+- name: Set old Fastly service ID from file
+  set_fact:
+    old_fastly_service_id: "{{ fastly_service_id_raw.content | b64decode | trim }}"
+  when:
+    - fastly_service_id_file.stat.exists
+    - old_fastly_service_id is not defined
+
+- name: Debug Fastly cleanup target
+  debug:
+    msg: "Cleaning up Fastly service: {{ old_fastly_service_id | default('none found') }}"
+
+# ============================================================================
+# Deactivate and delete old Fastly service
+# ============================================================================
+- name: Get active version of old Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ old_fastly_service_id }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 404]
+  delegate_to: localhost
+  register: old_fastly_service_info
+  when: old_fastly_service_id is defined and old_fastly_service_id != ''
+
+- name: Find active version number
+  set_fact:
+    old_fastly_active_version: "{{ old_fastly_service_info.json.versions | selectattr('active', 'equalto', true) | map(attribute='number') | first | default('') }}"
+  when:
+    - old_fastly_service_info is defined
+    - old_fastly_service_info.status == 200
+    - old_fastly_service_info.json.versions is defined
+
+- name: Deactivate old Fastly service version
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ old_fastly_service_id }}/version/{{ old_fastly_active_version }}/deactivate"
+    method: PUT
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 404]
+  delegate_to: localhost
+  when:
+    - old_fastly_service_id is defined and old_fastly_service_id != ''
+    - old_fastly_active_version is defined and old_fastly_active_version != ''
+
+- name: Delete old Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ old_fastly_service_id }}"
+    method: DELETE
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 404]
+  delegate_to: localhost
+  when: old_fastly_service_id is defined and old_fastly_service_id != ''
+
+- name: Debug Fastly service deletion
+  debug:
+    msg: "Old Fastly service {{ old_fastly_service_id | default('N/A') }} deleted (or not found)"
+  when: old_fastly_service_id is defined
+
+- name: Remove old Fastly service ID file
+  file:
+    path: /opt/outline/fastly_service_id
+    state: absent
+  become: yes
+  when: fastly_service_id_file.stat.exists

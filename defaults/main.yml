@@ -280,3 +280,48 @@ slipstream_socks_port: 1080  # Local SOCKS5 port (microsocks)
 # Whether to automatically create DNS records (NS + A/AAAA for nameserver)
 slipstream_create_dns_records: true
 
+# ============================================================================
+# Fastly CDN Configuration
+# ============================================================================
+# When cdn_provider is set to 'fastly' in domain_providers, Fastly is used
+# for CDN/WSS fronting instead of Cloudflare proxy.
+#
+# Fastly provides WebSocket passthrough support, allowing Shadowsocks-over-WSS
+# traffic to be fronted through Fastly's CDN network.
+#
+# Two domain modes are supported (set per-domain in domain_providers):
+#   - "shared": Use {prefix}-{hostname}.global.ssl.fastly.net
+#               No DNS/TLS setup needed — Fastly handles everything
+#   - "custom": Use your own domain with Fastly TLS subscription
+#               Requires DNS provider for ACME validation + CNAME to Fastly edge
+#
+# Example domain_providers configuration:
+#
+#   # Shared mode (simplest — no DNS changes for WSS domain)
+#   example.com:
+#     dns_provider: cloudflare
+#     cdn_provider: fastly
+#     tunnel_provider: none
+#     zone_id: "your-zone-id"
+#     fastly_domain_mode: shared
+#
+#   # Custom mode (your own domain, looks less like CDN)
+#   example.app:
+#     dns_provider: cloudflare
+#     cdn_provider: fastly
+#     tunnel_provider: none
+#     zone_id: "your-zone-id"
+#     fastly_domain_mode: custom
+
+# Fastly API endpoint
+fastly_api_endpoint: "https://api.fastly.com"
+
+# Global Fastly API token (can be overridden per-domain in domain_providers)
+# Required when any domain uses cdn_provider: fastly
+# fastly_api_token: ""
+
+# Fastly service name prefix (for shared mode)
+# Used to construct {prefix}-{hostname}.global.ssl.fastly.net
+# Keep short to avoid hitting domain length limits
+fastly_service_name_prefix: "fs"
+

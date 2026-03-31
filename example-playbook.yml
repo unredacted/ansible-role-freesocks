@@ -1,31 +1,37 @@
-# Example playbook for ansible-role-freesocks
+# Example playbooks for ansible-role-freesocks
 # See README.md for complete documentation and variable descriptions
+#
+# Usage pattern:
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "environment_mode=prod" \
+#     --limit <play_hosts>
+#
+# IMPORTANT: Each play below is a self-contained example.
+# In practice, you would typically have ONE playbook with your
+# specific configuration, not all examples combined.
+#
+# Common variables (shared across plays) are shown inline.
+# In production, use group_vars, host_vars, or Ansible Vault.
 
-- name: Deploy new Outline server
+###############################################################################
+# DEPLOY MODE: Basic Outline server
+###############################################################################
+- name: "Deploy: Outline only (basic)"
   hosts: new_servers
   remote_user: root
   vars:
     operation_mode: deploy
-    deploy_target_domain: "example.com"  # Deploy to this domain
+    deploy_target_domain: "example.com"
     kv_hostname_prefix: "outline1-ams"
 
-    # Domain-to-Provider Mapping
     domain_providers:
       example.com:
         dns_provider: cloudflare
         tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
-      example.app:
-        dns_provider: cloudflare
-        tunnel_provider: none
-        zone_id: "your-zone-id-for-app"
 
-    # KV provider (global)
     kv_provider: cloudflare
-
-    # Cloudflare configuration
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -35,40 +41,33 @@
     cloudflare_access_team_name: "your-team-name"
     cloudflare_access_aud_tag: "your-aud-tag"
 
-    # Server configuration
     envoy_mappings:
       outline1-ams:
-        ipv4: ["1.2.3.4", "5.6.7.8"]
-        ipv6: ["2001:db8::1", "2001:db8::2"]
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
 
   roles:
     - ansible-role-freesocks
 
-- name: Deploy new Outline server (without tunnel)
+###############################################################################
+# DEPLOY MODE: Outline without CF tunnel (direct port access)
+###############################################################################
+- name: "Deploy: Outline without tunnel"
   hosts: new_servers
   remote_user: root
   vars:
     operation_mode: deploy
-    deploy_target_domain: "example.app"  # Deploy to different domain
+    deploy_target_domain: "example.app"
     kv_hostname_prefix: "outline2-ams"
 
-    # Domain-to-Provider Mapping (tunnel_provider: none for this domain)
     domain_providers:
-      example.com:
-        dns_provider: cloudflare
-        tunnel_provider: cloudflare
-        zone_id: "your-zone-id-for-com"
       example.app:
         dns_provider: cloudflare
-        tunnel_provider: none  # Direct port access
+        tunnel_provider: none  # Direct port access, no CF tunnel
         zone_id: "your-zone-id-for-app"
 
-    # KV provider (global)
     kv_provider: cloudflare
-
-    # Same Cloudflare configuration as above...
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -80,13 +79,16 @@
 
     envoy_mappings:
       outline2-ams:
-        ipv4: ["1.2.3.4", "5.6.7.8"]
-        ipv6: ["2001:db8::1", "2001:db8::2"]
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
 
   roles:
     - ansible-role-freesocks
 
-- name: Deploy Outline server with WSS support
+###############################################################################
+# DEPLOY MODE: Outline + WebSocket (WSS)
+###############################################################################
+- name: "Deploy: Outline + WSS (random dictionary paths)"
   hosts: new_servers
   remote_user: root
   vars:
@@ -94,35 +96,26 @@
     deploy_target_domain: "example.com"
     kv_hostname_prefix: "outline3-ams"
 
-    # WSS Configuration - enables Shadowsocks over WebSocket
+    # WSS Configuration
     outline_wss_enabled: true
-    outline_keys_port: 853  # Use non-443 port for SS to allow Caddy on 443
+    outline_keys_port: 853            # Non-443 port for SS, so Caddy gets 443
     outline_caddy_auto_https: true
     outline_caddy_email: "admin@example.com"
-    # outline_caddy_domain: ""  # Defaults to dns_hostname
 
-    # WSS Path Configuration (random dictionary word paths are default)
+    # Random dictionary-word paths (DEFAULT behavior)
     # outline_wss_random_paths: true              # Default: true
-    # outline_wss_random_path_min_words: 3        # Default: 3 (e.g., /apple-banana-cherry)
-    # outline_wss_random_path_max_words: 5        # Default: 5 (random word count in range)
-    # Or use custom static paths:
-    # outline_wss_random_paths: false
-    # outline_wss_tcp_path: "/stream"
-    # outline_wss_udp_path: "/packet"
+    # outline_wss_random_path_min_words: 3        # Default: 3
+    # outline_wss_random_path_max_words: 5        # Default: 5
+    # Generates paths like /apple-banana-cherry for TCP, /dog-elephant for UDP
 
-    # Domain-to-Provider Mapping
     domain_providers:
       example.com:
         dns_provider: cloudflare
         tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    # KV provider (global)
     kv_provider: cloudflare
-
-    # Same Cloudflare configuration as above...
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -134,41 +127,317 @@
 
     envoy_mappings:
       outline3-ams:
-        ipv4: ["1.2.3.4", "5.6.7.8"]
-        ipv6: ["2001:db8::1", "2001:db8::2"]
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
 
   roles:
     - ansible-role-freesocks
 
-- name: Migrate Outline server
+###############################################################################
+# DEPLOY MODE: Outline + WSS (custom static paths)
+###############################################################################
+- name: "Deploy: Outline + WSS (static custom paths)"
   hosts: new_servers
   remote_user: root
   vars:
-    operation_mode: migrate
-    source_hostname: "outline1-ams"
-    source_kv_hostname: "apple-banana-cherry"  # KV key from old deployment
-    destination_hostname: "outline2-fra"
-    destination_kv_hostname: "dog-elephant-fox"  # New KV key for destination
-    migrate_delete_source: false
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+    kv_hostname_prefix: "outline4-ams"
 
-    # Domain-to-Provider Mapping (base_domain used for migration)
+    outline_wss_enabled: true
+    outline_keys_port: 853
+    outline_caddy_auto_https: true
+    outline_caddy_email: "admin@example.com"
+
+    # Custom STATIC paths (disable random generation)
+    outline_wss_random_paths: false
+    outline_wss_tcp_path: "/stream"
+    outline_wss_udp_path: "/packet"
+
     domain_providers:
       example.com:
         dns_provider: cloudflare
         tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    # Active domain for migration
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+    cloudflare_access_team_name: "your-team-name"
+    cloudflare_access_aud_tag: "your-aud-tag"
+
+    envoy_mappings:
+      outline4-ams:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Outline + slipstream (shadowsocks mode)
+# Tunnels Shadowsocks traffic through DNS for extreme censorship resistance
+###############################################################################
+- name: "Deploy: Outline + slipstream (shadowsocks mode)"
+  hosts: new_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+    kv_hostname_prefix: "outline5-ams"
+
+    # slipstream Configuration
+    slipstream_enabled: true
+    slipstream_mode: shadowsocks      # Tunnel to SS server (requires ss-local on client)
+
+    # REQUIRED slipstream vars (no defaults - must be set):
+    slipstream_base_domain: "your-dns.com"     # Must be in domain_providers
+    slipstream_subdomain: "dns1"               # Creates dns1.your-dns.com
+    slipstream_ns_hostname: "ns1"              # NS record: ns1.your-dns.com
+
+    # Optional slipstream settings (shown with defaults):
+    # slipstream_resolver: "77.88.8.8:53"
+    # slipstream_resolver_backup: "77.88.8.1:53"
+    # slipstream_dns_port: 53
+    # slipstream_version: "main"
+    # slipstream_create_dns_records: true
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      your-dns.com:                            # slipstream domain must also be here
+        dns_provider: cloudflare
+        tunnel_provider: none
+        zone_id: "your-zone-id-for-dns"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+    cloudflare_access_team_name: "your-team-name"
+    cloudflare_access_aud_tag: "your-aud-tag"
+
+    envoy_mappings:
+      outline5-ams:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Outline + slipstream (raw mode)
+# Direct SOCKS5 proxy via DNS tunnel - no Shadowsocks client needed
+###############################################################################
+- name: "Deploy: Outline + slipstream (raw/SOCKS5 mode)"
+  hosts: new_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+    kv_hostname_prefix: "outline6-ams"
+
+    slipstream_enabled: true
+    slipstream_mode: raw               # Direct SOCKS5 proxy (via microsocks)
+
+    slipstream_base_domain: "your-dns.com"
+    slipstream_subdomain: "dns2"
+    slipstream_ns_hostname: "ns2"
+
+    # Raw mode optional settings:
+    # slipstream_socks_port: 1080      # microsocks listen port
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      your-dns.com:
+        dns_provider: cloudflare
+        tunnel_provider: none
+        zone_id: "your-zone-id-for-dns"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+    cloudflare_access_team_name: "your-team-name"
+    cloudflare_access_aud_tag: "your-aud-tag"
+
+    envoy_mappings:
+      outline6-ams:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Full Stack (Outline + WSS + slipstream)
+# Maximum censorship resistance: WebSocket AND DNS tunnel transports
+###############################################################################
+- name: "Deploy: Full stack (Outline + WSS + slipstream)"
+  hosts: new_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+    kv_hostname_prefix: "outline7-ams"
+
+    # WSS
+    outline_wss_enabled: true
+    outline_keys_port: 853
+    outline_caddy_auto_https: true
+    outline_caddy_email: "admin@example.com"
+    # outline_wss_random_paths: true   # Default
+
+    # slipstream
+    slipstream_enabled: true
+    slipstream_mode: shadowsocks
+    slipstream_base_domain: "your-dns.com"
+    slipstream_subdomain: "dns3"
+    slipstream_ns_hostname: "ns3"
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      your-dns.com:
+        dns_provider: cloudflare
+        tunnel_provider: none
+        zone_id: "your-zone-id-for-dns"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+    cloudflare_access_team_name: "your-team-name"
+    cloudflare_access_aud_tag: "your-aud-tag"
+
+    envoy_mappings:
+      outline7-ams:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# CHANGE MODE: Rotate hostname (same domain)
+# For when DNS blocking targets the current hostname
+###############################################################################
+- name: "Change: Rotate hostname (same domain)"
+  hosts: existing_servers
+  remote_user: root
+  vars:
+    operation_mode: change
+    change_target_domain: "example.com"   # Rotate within same domain
+
+    # WSS servers need Caddy config
+    outline_caddy_auto_https: true
+    outline_caddy_email: "admin@example.com"
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# CHANGE MODE: Rotate hostname (different domain)
+# Move from a blocked domain to a fresh one
+###############################################################################
+- name: "Change: Rotate hostname (different domain)"
+  hosts: existing_servers
+  remote_user: root
+  vars:
+    operation_mode: change
+    change_target_domain: "example.app"   # Rotate to DIFFERENT domain
+
+    outline_caddy_auto_https: true
+    outline_caddy_email: "admin@example.com"
+
+    # Both old and new domains must be configured
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      example.app:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-app"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# MIGRATE MODE: Move server to new host
+###############################################################################
+- name: "Migrate: Move Outline server to new host"
+  hosts: new_servers
+  remote_user: root
+  vars:
+    operation_mode: migrate
+    source_hostname: "outline1-ams"
+    source_kv_hostname: "apple-banana-cherry"    # KV key from old deployment
+    destination_hostname: "outline2-fra"
+    destination_kv_hostname: "dog-elephant-fox"   # New KV key for destination
+    migrate_delete_source: false                  # Set true to delete old DNS/KV
+
     base_domain: "example.com"
     api_domain: "example.com"
     prom_domain: "example.com"
 
-    # KV provider (global)
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+
     kv_provider: cloudflare
-
-    # Include same Cloudflare configuration as above
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -180,42 +449,43 @@
 
     envoy_mappings:
       outline2-fra:
-        ipv4: ["9.10.11.12", "13.14.15.16"]
-        ipv6: ["2001:db8::3", "2001:db8::4"]
+        ipv4: ["9.10.11.12"]
+        ipv6: ["2001:db8::3"]
 
   roles:
     - ansible-role-freesocks
 
-- name: Change hostname (rotate to new domain)
+###############################################################################
+# UPDATE MODE: Add slipstream to existing Outline server
+###############################################################################
+- name: "Update: Add slipstream to existing server"
   hosts: existing_servers
   remote_user: root
   vars:
-    operation_mode: change
-    # Target domain for the new hostname (generates random hostname like apple-banana-cherry.example.app)
-    change_target_domain: "example.app"
+    operation_mode: update
 
-    # Provider configuration (global - also needed for KV operations)
-    kv_provider: cloudflare
+    # Component to add
+    slipstream_enabled: true
+    slipstream_mode: shadowsocks
+    slipstream_base_domain: "your-dns.com"
+    slipstream_subdomain: "dns1"
+    slipstream_ns_hostname: "ns1"
 
-    # Domain-to-Provider Mapping (for change mode)
-    # Maps each domain to its DNS and tunnel provider configuration
+    # Optional: Force rebuild even if binary exists
+    # force_rebuild_slipstream: true
+
     domain_providers:
       example.com:
         dns_provider: cloudflare
         tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
-      example.app:
+      your-dns.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
-        zone_id: "your-zone-id-for-app"
-      # Future: other providers
-      # example.org:
-      #   dns_provider: fastly
-      #   tunnel_provider: none
+        tunnel_provider: none
+        zone_id: "your-zone-id-for-dns"
 
-    # Include same Cloudflare configuration as above
+    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
     cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
@@ -223,30 +493,373 @@
     cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
     cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
 
-    # Caddy configuration (for WSS servers)
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# UPDATE MODE: Add WSS to existing Outline server
+###############################################################################
+- name: "Update: Add WSS to existing server"
+  hosts: existing_servers
+  remote_user: root
+  vars:
+    operation_mode: update
+
+    # Component to add
+    outline_wss_enabled: true
+    outline_keys_port: 853
+    outline_caddy_auto_https: true
     outline_caddy_email: "admin@example.com"
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
 
   roles:
     - ansible-role-freesocks
 
+###############################################################################
+# UPDATE MODE: Add both WSS AND slipstream to existing server
+###############################################################################
+- name: "Update: Add WSS + slipstream (full upgrade)"
+  hosts: existing_servers
+  remote_user: root
+  vars:
+    operation_mode: update
+
+    # Both components
+    outline_wss_enabled: true
+    outline_keys_port: 853
+    outline_caddy_auto_https: true
+    outline_caddy_email: "admin@example.com"
+
+    slipstream_enabled: true
+    slipstream_mode: shadowsocks
+    slipstream_base_domain: "your-dns.com"
+    slipstream_subdomain: "dns1"
+    slipstream_ns_hostname: "ns1"
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+      your-dns.com:
+        dns_provider: cloudflare
+        tunnel_provider: none
+        zone_id: "your-zone-id-for-dns"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Custom hostname (instead of random words)
+###############################################################################
+- name: "Deploy: Custom hostname"
+  hosts: new_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+    kv_hostname_prefix: "outline-custom"
+    custom_hostname: "my-proxy-server"  # Results in my-proxy-server.example.com
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+    cloudflare_access_team_name: "your-team-name"
+    cloudflare_access_aud_tag: "your-aud-tag"
+
+    envoy_mappings:
+      outline-custom:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Separate KV credentials (multi-account setup)
+# When KV namespaces are on a different CF account from DNS domains
+###############################################################################
+- name: "Deploy: Multi-account (separate KV credentials)"
+  hosts: new_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+    kv_hostname_prefix: "outline8-ams"
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        tunnel_provider: cloudflare
+        zone_id: "your-zone-id-for-com"
+        cloudflare_api_token: "per-domain-token"     # Domain-specific token
+        cloudflare_account_id: "per-domain-account"   # Domain-specific account
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+
+    # Global fallback token (used for DNS if domain doesn't have its own)
+    cloudflare_api_token: "global-api-token"
+    cloudflare_account_id: "global-account-id"
+
+    # SEPARATE KV credentials (overrides global for KV operations only)
+    kv_cloudflare_api_token: "kv-specific-api-token"
+    kv_cloudflare_account_id: "kv-specific-account-id"
+
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+    cloudflare_access_team_name: "your-team-name"
+    cloudflare_access_aud_tag: "your-aud-tag"
+
+    envoy_mappings:
+      outline8-ams:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
 # Example inventory (hosts):
+#
 # [new_servers]
+# outline1-ams ansible_host=10.0.0.1
 # outline2-fra ansible_host=10.0.0.2
+#
 # [existing_servers]
 # outline1-ams ansible_host=10.0.0.1
+#
+###############################################################################
+# Usage examples:
+#
+# Deploy Outline only (production):
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "environment_mode=prod" \
+#     --limit new_servers
+#
+# Deploy with WSS (production):
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "environment_mode=prod deploy_target_domain=example.com" \
+#     --extra-vars "outline_wss_enabled=true outline_keys_port=853"
+#
+# Deploy with slipstream (production):
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "environment_mode=prod" \
+#     --extra-vars "slipstream_enabled=true slipstream_mode=shadowsocks" \
+#     --extra-vars "slipstream_base_domain=your-dns.com slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
+#
+# Update existing server with slipstream:
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "operation_mode=update environment_mode=prod" \
+#     --extra-vars "slipstream_enabled=true slipstream_mode=shadowsocks" \
+#     --extra-vars "slipstream_base_domain=your-dns.com slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
+#
+# Change hostname (rotate):
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "operation_mode=change environment_mode=prod" \
+#     --extra-vars "change_target_domain=example.app"
+#
+# Migrate server:
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "operation_mode=migrate environment_mode=prod" \
+#     --extra-vars "source_hostname=outline1-ams source_kv_hostname=apple-banana-cherry" \
+#     --extra-vars "destination_hostname=outline2-fra destination_kv_hostname=dog-elephant-fox"
+#
+# Force rebuild slipstream binary:
+#   ansible-playbook -i hosts example-playbook.yml \
+#     --extra-vars "operation_mode=update environment_mode=prod" \
+#     --extra-vars "slipstream_enabled=true force_rebuild_slipstream=true" \
+#     --extra-vars "slipstream_base_domain=your-dns.com slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
 
-# Usage:
-# Deploy to example.com (production):
-#   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "environment_mode=prod deploy_target_domain=example.com"
+###############################################################################
+# DEPLOY MODE: Outline + WSS via Fastly CDN (shared domain)
+###############################################################################
+# Fastest setup: uses *.global.ssl.fastly.net — no external DNS or TLS needed
+# for the WSS domain. Fastly handles TLS automatically.
 #
-# Deploy to example.app without tunnel (dev mode):
-#   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "environment_mode=dev deploy_target_domain=example.app"
+# Client connects to: wss://fs-{random-words}.global.ssl.fastly.net/tcp
+- name: "Deploy: Outline + WSS via Fastly CDN (shared domain)"
+  hosts: fastly_shared_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+
+    # Outline + WebSocket configuration
+    outline_enabled: true
+    outline_wss_enabled: true
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare            # DNS for origin hostname (Caddy TLS)
+        cdn_provider: fastly                # CDN/WSS fronting via Fastly
+        tunnel_provider: none               # No Cloudflare tunnel needed
+        zone_id: "your-cloudflare-zone-id"
+        fastly_domain_mode: shared          # Use *.global.ssl.fastly.net
+
+    # Fastly API configuration
+    fastly_api_token: "your-fastly-api-token"
+    fastly_service_name_prefix: "fs"        # Results in fs-{hostname}.global.ssl.fastly.net
+
+    # Cloudflare for DNS + KV (unchanged from existing setup)
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    envoy_mappings:
+      fastly-shared-1:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Outline + WSS via Fastly CDN (custom domain)
+###############################################################################
+# Uses your own domain with Fastly TLS subscription (Let's Encrypt).
+# Requires DNS provider for ACME validation + CNAME to Fastly edge.
+# Takes 2-5 minutes longer due to TLS certificate issuance.
 #
-# Migrate (production):
-#   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "environment_mode=prod source_hostname=outline1-ams source_kv_hostname=apple-banana-cherry destination_hostname=outline2-fra destination_kv_hostname=dog-elephant-fox"
-# Change hostname (rotate to new domain when blocked):
-#   ansible-playbook -i hosts example-playbook.yml \
-#     --extra-vars "environment_mode=prod change_target_domain=example.app"
+# Client connects to: wss://{random-words}.example.app/tcp
+- name: "Deploy: Outline + WSS via Fastly CDN (custom domain)"
+  hosts: fastly_custom_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.app"
+
+    # Outline + WebSocket configuration
+    outline_enabled: true
+    outline_wss_enabled: true
+
+    domain_providers:
+      example.app:
+        dns_provider: cloudflare            # DNS under Cloudflare for ACME + CNAME
+        cdn_provider: fastly                # CDN/WSS fronting via Fastly
+        tunnel_provider: none               # No tunnel needed — Fastly handles CDN
+        zone_id: "your-cloudflare-zone-id-for-app"
+        fastly_domain_mode: custom          # Use your own domain with Fastly TLS
+
+    # Fastly API configuration
+    fastly_api_token: "your-fastly-api-token"
+
+    # Cloudflare for DNS + KV
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    envoy_mappings:
+      fastly-custom-1:
+        ipv4: ["5.6.7.8"]
+        ipv6: ["2001:db8::2"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# CHANGE MODE: Rotate hostname with Fastly CDN
+###############################################################################
+# Rotates the hostname for a Fastly-fronted server. Handles:
+# 1. Old Fastly service cleanup
+# 2. New Fastly service creation + WebSocket enablement
+# 3. DNS updates (shared: none needed, custom: new CNAME + TLS)
+# 4. KV store update with new Fastly domain
+- name: "Change: Rotate hostname with Fastly CDN"
+  hosts: fastly_shared_servers
+  remote_user: root
+  vars:
+    operation_mode: change
+    change_target_domain: "example.com"
+
+    outline_wss_enabled: true
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        cdn_provider: fastly
+        tunnel_provider: none
+        zone_id: "your-cloudflare-zone-id"
+        fastly_domain_mode: shared
+
+    fastly_api_token: "your-fastly-api-token"
+    fastly_service_name_prefix: "fs"
+
+    kv_provider: cloudflare
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
+    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
+    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
+    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+  roles:
+    - ansible-role-freesocks
+
+# =============================================================================
+# QUICK REFERENCE: Fastly CDN commands
+# =============================================================================
+#
+# Deploy with Fastly shared domain (fastest):
+#   ansible-playbook -i hosts playbook.yml \
+#     --extra-vars "operation_mode=deploy environment_mode=prod" \
+#     --extra-vars "deploy_target_domain=example.com" \
+#     --extra-vars "outline_wss_enabled=true"
+#
+# Deploy with Fastly custom domain:
+#   ansible-playbook -i hosts playbook.yml \
+#     --extra-vars "operation_mode=deploy environment_mode=prod" \
+#     --extra-vars "deploy_target_domain=example.app" \
+#     --extra-vars "outline_wss_enabled=true"
+#
+# Rotate hostname (Fastly):
+#   ansible-playbook -i hosts playbook.yml \
+#     --extra-vars "operation_mode=change environment_mode=prod" \
+#     --extra-vars "change_target_domain=example.com"

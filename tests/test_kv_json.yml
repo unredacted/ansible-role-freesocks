@@ -1,0 +1,230 @@
+---
+# tests/test_kv_json.yml - Verify KV JSON output is clean
+#
+# Run with: ansible-playbook tests/test_kv_json.yml
+#
+# This test exercises the same set_fact logic used in kv.yml to
+# build the api_endpoint_data, then validates the JSON output:
+# - No __omit_place_holder__ sentinel strings
+# - Proper structure for all modes
+# - Clean JSON roundtrip (to_json -> from_json)
+# - PEM cert newlines are properly escaped in JSON
+
+- name: Test KV JSON output is clean
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Mock variables simulating a real deployment
+    random_hostname: "apple-banana-cherry"
+    api_hostname_suffix: "-api"
+    prom_hostname_suffix: "-prom"
+    api_domain: "example.com"
+    prom_domain: "example.com"
+    dns_hostname: "apple-banana-cherry.example.com"
+    outline_api_proxy_path: "/api"
+    api_random_string: "abc123secret"
+    slipstream_domain: "dns1.yandex-dns.com"
+    slipstream_resolver: "77.88.8.8:53"
+    # A realistic multi-line PEM certificate
+    mock_cert_pem: |
+      -----BEGIN CERTIFICATE-----
+      MIIBkTCB+wIJALRiMLAh1gMlMAoGCCqGSM49BAMCMBYxFDASBgNVBAMMC3NsaXBz
+      dHJlYW0wHhcNMjUwMTE4MDAwMDAwWhcNMzUwMTE2MDAwMDAwWjAWMRQwEgYDVQQD
+      DAtzbGlwc3RyZWFtMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtestcertdata
+      -----END CERTIFICATE-----
+
+  tasks:
+    # =========================================================================
+    # TEST 1: Shadowsocks mode WITH resolverBackup
+    # =========================================================================
+    - name: "TEST 1: Build API endpoint data (shadowsocks + resolverBackup)"
+      set_fact:
+        api_endpoint_data:
+          apiUrl: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}{{ outline_api_proxy_path }}/{{ api_random_string }}"
+          prometheusUrl: "https://{{ random_hostname }}{{ prom_hostname_suffix }}.{{ prom_domain }}"
+
+    - name: "TEST 1: Add websocketDomain"
+      set_fact:
+        api_endpoint_data: "{{ api_endpoint_data | combine({'websocketDomain': dns_hostname}) }}"
+
+    - name: "TEST 1: Build base slipstreamConfig"
+      set_fact:
+        _slipstream_kv_config:
+          enabled: true
+          mode: "shadowsocks"
+          domain: "{{ slipstream_domain }}"
+          resolver: "{{ slipstream_resolver }}"
+          certPem: "{{ mock_cert_pem }}"
+
+    - name: "TEST 1: Add resolverBackup"
+      set_fact:
+        _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'resolverBackup': '77.88.8.1:53'}) }}"
+
+    - name: "TEST 1: Merge slipstreamConfig"
+      set_fact:
+        api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': _slipstream_kv_config}) }}"
+
+    - name: "TEST 1: Convert to JSON"
+      set_fact:
+        test1_json: "{{ api_endpoint_data | to_json }}"
+
+    - name: "TEST 1: Display JSON output"
+      debug:
+        msg: "{{ test1_json }}"
+
+    - name: "TEST 1: Assert no omit sentinel"
+      assert:
+        that:
+          - "'__omit_place_holder__' not in test1_json"
+        fail_msg: "FAIL: __omit_place_holder__ found in JSON!"
+        success_msg: "PASS: No omit sentinel in JSON"
+
+    - name: "TEST 1: Assert JSON roundtrips cleanly"
+      assert:
+        that:
+          - "(test1_json | from_json).apiUrl is defined"
+          - "(test1_json | from_json).prometheusUrl is defined"
+          - "(test1_json | from_json).websocketDomain == dns_hostname"
+          - "(test1_json | from_json).slipstreamConfig.enabled == true"
+          - "(test1_json | from_json).slipstreamConfig.mode == 'shadowsocks'"
+          - "(test1_json | from_json).slipstreamConfig.resolverBackup == '77.88.8.1:53'"
+          - "(test1_json | from_json).slipstreamConfig.certPem is defined"
+        fail_msg: "FAIL: JSON roundtrip failed!"
+        success_msg: "PASS: JSON roundtrips cleanly"
+
+    - name: "TEST 1: Assert no socksPort in shadowsocks mode"
+      assert:
+        that:
+          - "(test1_json | from_json).slipstreamConfig.socksPort is not defined"
+        fail_msg: "FAIL: socksPort should NOT be present in shadowsocks mode"
+        success_msg: "PASS: socksPort correctly absent in shadowsocks mode"
+
+    - name: "TEST 1: Assert certPem contains proper PEM markers"
+      assert:
+        that:
+          - "'BEGIN CERTIFICATE' in (test1_json | from_json).slipstreamConfig.certPem"
+          - "'END CERTIFICATE' in (test1_json | from_json).slipstreamConfig.certPem"
+        fail_msg: "FAIL: certPem doesn't contain valid PEM markers"
+        success_msg: "PASS: certPem contains valid PEM markers"
+
+    # =========================================================================
+    # TEST 2: Raw mode WITHOUT resolverBackup
+    # =========================================================================
+    - name: "TEST 2: Build base slipstreamConfig (raw, no backup)"
+      set_fact:
+        _slipstream_kv_config:
+          enabled: true
+          mode: "raw"
+          domain: "{{ slipstream_domain }}"
+          resolver: "{{ slipstream_resolver }}"
+          certPem: "{{ mock_cert_pem }}"
+
+    # Skip resolverBackup - simulating it not being defined
+
+    - name: "TEST 2: Add socksPort (raw mode)"
+      set_fact:
+        _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'socksPort': 1080 | int}) }}"
+
+    - name: "TEST 2: Build endpoint data"
+      set_fact:
+        api_endpoint_data_raw:
+          apiUrl: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}{{ outline_api_proxy_path }}/{{ api_random_string }}"
+          prometheusUrl: "https://{{ random_hostname }}{{ prom_hostname_suffix }}.{{ prom_domain }}"
+
+    - name: "TEST 2: Merge slipstreamConfig"
+      set_fact:
+        api_endpoint_data_raw: "{{ api_endpoint_data_raw | combine({'slipstreamConfig': _slipstream_kv_config}) }}"
+
+    - name: "TEST 2: Convert to JSON"
+      set_fact:
+        test2_json: "{{ api_endpoint_data_raw | to_json }}"
+
+    - name: "TEST 2: Display JSON output"
+      debug:
+        msg: "{{ test2_json }}"
+
+    - name: "TEST 2: Assert no omit sentinel"
+      assert:
+        that:
+          - "'__omit_place_holder__' not in test2_json"
+        fail_msg: "FAIL: __omit_place_holder__ found in raw mode JSON!"
+        success_msg: "PASS: No omit sentinel in raw mode JSON"
+
+    - name: "TEST 2: Assert socksPort present and is integer"
+      assert:
+        that:
+          - "(test2_json | from_json).slipstreamConfig.socksPort is defined"
+          - "(test2_json | from_json).slipstreamConfig.socksPort == 1080"
+        fail_msg: "FAIL: socksPort should be present in raw mode"
+        success_msg: "PASS: socksPort correctly present in raw mode"
+
+    - name: "TEST 2: Assert resolverBackup absent"
+      assert:
+        that:
+          - "(test2_json | from_json).slipstreamConfig.resolverBackup is not defined"
+        fail_msg: "FAIL: resolverBackup should NOT be present when not defined"
+        success_msg: "PASS: resolverBackup correctly absent"
+
+    # =========================================================================
+    # TEST 3: Prometheus KV JSON format
+    # =========================================================================
+    - name: "TEST 3: Build Prometheus KV JSON"
+      set_fact:
+        prom_json: "{{ {'prometheusUrl': 'https://' + random_hostname + prom_hostname_suffix + '.' + prom_domain} | to_json }}"
+
+    - name: "TEST 3: Display Prometheus JSON"
+      debug:
+        msg: "{{ prom_json }}"
+
+    - name: "TEST 3: Assert Prometheus JSON is valid"
+      assert:
+        that:
+          - "(prom_json | from_json).prometheusUrl is defined"
+          - "(prom_json | from_json).prometheusUrl == 'https://apple-banana-cherry-prom.example.com'"
+        fail_msg: "FAIL: Prometheus KV JSON is not valid"
+        success_msg: "PASS: Prometheus KV JSON is valid"
+
+    # =========================================================================
+    # TEST 4: Minimal config (Outline only, no WSS, no slipstream)
+    # =========================================================================
+    - name: "TEST 4: Build minimal endpoint data"
+      set_fact:
+        api_endpoint_data_minimal:
+          apiUrl: "https://{{ random_hostname }}{{ api_hostname_suffix }}.{{ api_domain }}{{ outline_api_proxy_path }}/{{ api_random_string }}"
+          prometheusUrl: "https://{{ random_hostname }}{{ prom_hostname_suffix }}.{{ prom_domain }}"
+
+    - name: "TEST 4: Convert to JSON"
+      set_fact:
+        test4_json: "{{ api_endpoint_data_minimal | to_json }}"
+
+    - name: "TEST 4: Assert clean minimal JSON"
+      assert:
+        that:
+          - "'__omit_place_holder__' not in test4_json"
+          - "(test4_json | from_json).apiUrl is defined"
+          - "(test4_json | from_json).prometheusUrl is defined"
+          - "(test4_json | from_json).websocketDomain is not defined"
+          - "(test4_json | from_json).slipstreamConfig is not defined"
+        fail_msg: "FAIL: Minimal JSON contains unexpected fields"
+        success_msg: "PASS: Minimal JSON is clean"
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    - name: All tests passed!
+      debug:
+        msg: |
+          ✅ All KV JSON tests passed!
+
+          Test 1: Shadowsocks mode + resolverBackup  ✓
+          Test 2: Raw mode + socksPort, no backup     ✓
+          Test 3: Prometheus JSON format              ✓
+          Test 4: Minimal (Outline only)              ✓
+
+          The JSON output is clean:
+          - No __omit_place_holder__ sentinels
+          - PEM certs properly handled
+          - Conditional fields present/absent correctly
+          - JSON roundtrips cleanly (to_json -> from_json)
