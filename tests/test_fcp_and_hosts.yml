@@ -1,0 +1,82 @@
+---
+# tests/test_fcp_and_hosts.yml
+#
+# Self-asserting tests for the FCP slug->id resolution and the Host body shaping
+# logic — pure filter expressions, no API calls. Mirrors the expressions used in
+# tasks/providers/fcp/{register,delete}_server.yml and
+# tasks/providers/remnawave/create_{hosts,reality_host}.yml.
+#
+# Run: ansible-playbook tests/test_fcp_and_hosts.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dns_hostname: "apple-banana-cherry.example.com"
+    outline_api_proxy_path: "/api"
+    _fastly_domain: "fs-apple-banana-cherry.global.ssl.fastly.net"
+    # NOTE: mock mirrors FCP's real response shape — backendServersList returns
+    # { servers: [{ id, slug, ... }] } (convex/adminApi.ts backendServersList +
+    # mapBackendServer). The register/delete tasks read `.json.servers`.
+    _mock_fcp_list:
+      servers:
+        - { id: "id-aaa", slug: "alpha" }
+        - { id: "id-bbb", slug: "bravo" }
+  tasks:
+    # (a) FCP slug -> id resolution (register/delete pattern): hit + miss
+    - name: Resolve slugs
+      set_fact:
+        _hit: "{{ (_mock_fcp_list.servers | selectattr('slug', 'equalto', 'bravo') | map(attribute='id') | first) | default('') }}"
+        _miss: "{{ (_mock_fcp_list.servers | selectattr('slug', 'equalto', 'zulu') | map(attribute='id') | first) | default('') }}"
+    - name: Assert slug resolution
+      assert:
+        that:
+          - _hit == 'id-bbb'
+          - _miss == ''
+        success_msg: "FCP slug->id resolution OK (hit returns id, miss returns '')."
+
+    # (b) Outline FCP apiUrl construction (register_server pattern)
+    - name: Extract API secret + build apiUrl
+      set_fact:
+        _api_secret: "{{ 'https://x:8443/SUPERSECRET' | regex_search('/([^/]+)$') | regex_replace('/', '') }}"
+    - name: Assert apiUrl construction
+      vars:
+        _api_url: "https://{{ dns_hostname }}{{ outline_api_proxy_path | default('') }}/{{ _api_secret }}"
+      assert:
+        that:
+          - _api_secret == 'SUPERSECRET'
+          - _api_url == 'https://apple-banana-cherry.example.com/api/SUPERSECRET'
+        success_msg: "Outline FCP apiUrl construction OK."
+
+    # (c) create_hosts address fallback: Fastly edge when set, else dns_hostname
+    - name: Compute address fallback (Fastly present and absent)
+      set_fact:
+        _addr_fastly: "{{ _fastly_domain | default(dns_hostname, true) }}"
+        _addr_direct: "{{ fastly_websocket_domain | default(dns_hostname, true) }}"
+    - name: Assert address fallback
+      assert:
+        that:
+          - _addr_fastly == _fastly_domain
+          - _addr_direct == dns_hostname
+        success_msg: "Host address = Fastly edge when set, else origin dns_hostname."
+
+    # (d) Reality host body shaping (create_reality_host)
+    - name: Build Reality host body
+      set_fact:
+        _reality_body:
+          inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "rin-1" }
+          remark: "{{ 'apple-banana-cherry' ~ '-reality' }}"
+          address: "{{ dns_hostname }}"
+          sni: "www.microsoft.com"
+          securityLayer: "DEFAULT"
+    - name: Assert Reality host body
+      assert:
+        that:
+          - _reality_body.securityLayer == 'DEFAULT'
+          - _reality_body.sni == 'www.microsoft.com'
+          - _reality_body.inbound.configProfileInboundUuid == 'rin-1'
+          - _reality_body.remark.endswith('-reality')
+        success_msg: "Reality host body OK (DEFAULT securityLayer, borrowed sni, inbound ref)."
+
+    - name: All FCP + Host shaping tests passed
+      debug:
+        msg: "All FCP + Host shaping tests passed."

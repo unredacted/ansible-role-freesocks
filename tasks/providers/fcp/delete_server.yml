@@ -1,0 +1,52 @@
+---
+# tasks/providers/fcp/delete_server.yml
+#
+# Delete a backendServers row from FCP by slug. Used by migrate to remove the
+# stale SOURCE server row after the destination has been (re)registered under a
+# new slug. Idempotent: resolves slug -> id via the admin list and no-ops if the
+# slug is absent.
+#
+# Caller sets: fcp_delete_slug (the slug to remove).
+
+- name: Validate FCP delete prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - fcp_delete_slug is defined and fcp_delete_slug | length > 0
+    fail_msg: "FCP delete requires fcp_api_url, fcp_api_token, and fcp_delete_slug."
+
+- name: List existing FCP backend servers (for delete)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: fcp_delete_list
+
+- name: Resolve FCP id for the slug to delete
+  set_fact:
+    _fcp_delete_id: "{{ (fcp_delete_list.json.servers | default([]) | selectattr('slug', 'equalto', fcp_delete_slug) | map(attribute='id') | first) | default('') }}"
+
+- name: Delete FCP backend server by id
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/{{ _fcp_delete_id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 204, 404]
+  delegate_to: localhost
+  no_log: true
+  when: _fcp_delete_id | length > 0
+
+- name: Note FCP delete result
+  debug:
+    msg: >-
+      FCP backend server slug '{{ fcp_delete_slug }}'
+      {{ 'deleted' if (_fcp_delete_id | length > 0) else 'not found (no-op)' }}.
