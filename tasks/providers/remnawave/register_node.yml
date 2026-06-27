@@ -1,0 +1,81 @@
+---
+# tasks/providers/remnawave/register_node.yml
+# Create the node entry on the panel via POST {{ panel_url }}/api/nodes.
+#
+# The response is shaped:
+#   { "response": { "uuid": "...", "name": "...", "address": "...", ... } }
+#
+# We capture the uuid into remnawave_node_uuid and persist it to
+# /opt/remnanode/.node_uuid so update/change/migrate modes can find it later
+# without re-querying the panel.
+
+- name: Validate node registration prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token is defined
+      - remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid is defined
+      - remnawave_panel_config_profile_uuid | length > 0
+      - remnawave_panel_active_inbounds is defined
+      - remnawave_panel_active_inbounds | length > 0
+    fail_msg: |
+      Node registration requires:
+        remnawave_panel_api_token (vault)
+        remnawave_panel_config_profile_uuid (UUID of the Xray config profile to attach)
+        remnawave_panel_active_inbounds (list of inbound UUIDs from that profile)
+
+- name: Register node with Panel
+  uri:
+    url: "{{ remnawave_panel_url }}/api/nodes"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      name: "{{ random_hostname }}"
+      address: "{{ dns_hostname }}"
+      port: "{{ remnawave_node_port | int }}"
+      countryCode: "{{ remnawave_panel_country_code }}"
+      configProfile:
+        activeConfigProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
+        activeInbounds: "{{ remnawave_panel_active_inbounds }}"
+    # 409 = a node with this name/address already exists (re-deploy / retry).
+    # Tolerate it so the run doesn't hard-fail; UUID is only captured on a
+    # fresh create below.
+    status_code: [200, 201, 409]
+    return_content: yes
+  register: remnawave_register_response
+  delegate_to: localhost
+  no_log: true   # request carries the panel API bearer token
+
+- name: Warn that node already exists on Panel (409)
+  debug:
+    msg: >-
+      Panel returned 409 — a node named "{{ random_hostname }}" already exists.
+      Skipping UUID capture. If this is a re-deploy, run update mode instead, or
+      write the node's UUID to {{ remnawave_node_install_dir }}/.node_uuid
+      manually so change/migrate can PATCH the panel.
+  when: remnawave_register_response.status == 409
+
+- name: Capture node UUID from registration response
+  set_fact:
+    remnawave_node_uuid: "{{ remnawave_register_response.json.response.uuid }}"
+  when: remnawave_register_response.status in [200, 201]
+
+- name: Persist node UUID to /opt/remnanode/.node_uuid
+  copy:
+    content: "{{ remnawave_node_uuid }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.node_uuid"
+    mode: '0640'
+  become: yes
+  when:
+    - remnawave_node_uuid is defined
+    - remnawave_node_uuid | length > 0
+
+- name: Log node UUID
+  debug:
+    msg: "Registered node uuid={{ remnawave_node_uuid }} address={{ dns_hostname }} port={{ remnawave_node_port }}"
+  when:
+    - remnawave_node_uuid is defined
+    - remnawave_node_uuid | length > 0

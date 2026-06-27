@@ -1,0 +1,9 @@
+---
+# Ansible collection dependencies for ansible-role-freesocks.
+# Install with: ansible-galaxy collection install -r requirements.yml
+collections:
+  # community.docker provides docker_container (used in tasks/migrate/containers.yml)
+  # and docker_compose_v2 (used by tasks/setup/remnawave.yml).
+  # docker_compose_v2 requires community.docker >= 3.4.0.
+  - name: community.docker
+    version: ">=3.4.0"

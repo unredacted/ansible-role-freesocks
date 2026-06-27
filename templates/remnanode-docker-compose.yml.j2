@@ -1,0 +1,27 @@
+{# templates/remnanode-docker-compose.yml.j2
+   Rendered to {{ remnawave_node_install_dir }}/docker-compose.yml
+   Mirrors the Panel UI's generated compose, with our additions:
+     - configurable image tag (remnawave_node_image)
+     - host log volume mount (remnawave_log_dir) for logrotate
+   NOTE: SECRET_KEY is intentionally UNQUOTED. In compose list-env syntax
+   (- KEY=VALUE) surrounding quotes are kept literally, which would corrupt
+   the base64 key value.
+#}
+services:
+  remnanode:
+    image: {{ remnawave_node_image }}
+    container_name: remnanode
+    hostname: remnanode
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT={{ remnawave_node_port }}
+      - SECRET_KEY={{ remnawave_panel_secret_key }}
+    volumes:
+      - {{ remnawave_log_dir }}:/var/log/remnanode

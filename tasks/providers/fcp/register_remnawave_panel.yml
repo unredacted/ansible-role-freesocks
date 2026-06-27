@@ -1,0 +1,88 @@
+---
+# tasks/providers/fcp/register_remnawave_panel.yml
+#
+# Register a Remnawave PANEL with FCP. FCP stores the panel's baseUrl + apiToken
+# and dials the panel's API; it has NO concept of individual nodes — per-node
+# config (transports/Hosts) reaches users through the panel's subscription
+# output. So this registers the panel once, not each node.
+#
+# This is opt-in (fcp_register_remnawave_panel). Most deployments run a single
+# panel that is seeded into FCP once via its REMNAWAVE_* env or the admin CMS;
+# use this only to register an ADDITIONAL panel from the role. Idempotent by slug.
+
+- name: Validate FCP panel-registration prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - fcp_remnawave_panel_slug is defined and fcp_remnawave_panel_slug | length > 0
+      - remnawave_panel_url is defined and remnawave_panel_url | length > 0
+      - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
+    fail_msg: >-
+      Registering a Remnawave panel with FCP requires fcp_api_url, fcp_api_token,
+      fcp_remnawave_panel_slug, remnawave_panel_url, and remnawave_panel_api_token.
+  no_log: true
+
+- name: List existing FCP backend servers
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: fcp_panel_list
+
+- name: Find existing FCP panel entry by slug
+  set_fact:
+    _fcp_panel_id: "{{ (fcp_panel_list.json.response | default([]) | selectattr('slug', 'equalto', fcp_remnawave_panel_slug) | map(attribute='id') | first) | default('') }}"
+
+- name: Build FCP panel body (Remnawave)
+  set_fact:
+    _fcp_panel_body:
+      backend: "remnawave"
+      name: "{{ fcp_remnawave_panel_slug }}"
+      slug: "{{ fcp_remnawave_panel_slug }}"
+      baseUrl: "{{ remnawave_panel_url }}"
+      apiToken: "{{ remnawave_panel_api_token }}"
+  no_log: true
+
+- name: Create FCP panel (Remnawave)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: "{{ _fcp_panel_body }}"
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true
+  when: _fcp_panel_id | length == 0
+
+- name: Update FCP panel (Remnawave, PATCH by id)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/{{ _fcp_panel_id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: "{{ _fcp_panel_body }}"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  when: _fcp_panel_id | length > 0
+
+- name: Display FCP panel registration result
+  debug:
+    msg: >-
+      FCP Remnawave panel '{{ fcp_remnawave_panel_slug }}'
+      {{ 'updated' if (_fcp_panel_id | length > 0) else 'created' }}
+      at {{ fcp_api_url }} (panel {{ remnawave_panel_url }}).

@@ -1,0 +1,209 @@
+---
+# tasks/update/remnawave_update.yml - Update mode tasks for Remnawave hosts.
+#
+# Triggered when update_component == 'remnawave' (set in tasks/main.yml).
+# Reads existing state from /opt/remnanode/, re-templates / recreates the
+# container if force_reinstall_remnawave is set, and re-syncs KV.
+
+# === Read existing state ===
+- name: Stat persisted hostname file
+  stat:
+    path: "{{ remnawave_node_install_dir }}/.hostname"
+  register: hostname_file_stat
+  become: yes
+
+- name: Fail if .hostname is missing and no dns_hostname override given
+  fail:
+    msg: >-
+      {{ remnawave_node_install_dir }}/.hostname not found. This Remnawave host
+      predates hostname persistence or was installed manually. Re-supply the
+      deployed FQDN via --extra-vars dns_hostname=<fqdn>, or re-deploy.
+  when:
+    - not hostname_file_stat.stat.exists
+    - dns_hostname is not defined
+
+- name: Read deployed hostname from disk
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.hostname"
+  register: existing_hostname_raw
+  become: yes
+  when: hostname_file_stat.stat.exists
+
+- name: Set hostname facts from disk
+  set_fact:
+    dns_hostname: "{{ existing_hostname_raw.content | b64decode | trim }}"
+    random_hostname: "{{ (existing_hostname_raw.content | b64decode | trim).split('.')[0] }}"
+    kv_hostname: "{{ (existing_hostname_raw.content | b64decode | trim).split('.')[0] }}"
+    base_domain: "{{ (existing_hostname_raw.content | b64decode | trim).split('.')[1:] | join('.') }}"
+  when: hostname_file_stat.stat.exists
+
+- name: Set hostname facts from dns_hostname override (no .hostname file)
+  set_fact:
+    random_hostname: "{{ dns_hostname.split('.')[0] }}"
+    kv_hostname: "{{ dns_hostname.split('.')[0] }}"
+    base_domain: "{{ dns_hostname.split('.')[1:] | join('.') }}"
+  when:
+    - not hostname_file_stat.stat.exists
+    - dns_hostname is defined
+
+- name: Read existing node UUID (if present)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.node_uuid"
+  register: existing_uuid_raw
+  become: yes
+  failed_when: false
+
+- name: Set remnawave_node_uuid fact
+  set_fact:
+    remnawave_node_uuid: "{{ existing_uuid_raw.content | b64decode | trim }}"
+  when:
+    - existing_uuid_raw.content is defined
+    - (existing_uuid_raw.content | b64decode | trim) | length > 0
+
+- name: Debug detected state
+  debug:
+    msg:
+      - "Detected Remnawave at {{ remnawave_node_install_dir }}"
+      - "dns_hostname: {{ dns_hostname }}"
+      - "node_uuid: {{ remnawave_node_uuid | default('(none)') }}"
+      - "force_reinstall_remnawave: {{ force_reinstall_remnawave | default(false) | bool }}"
+
+# === DESTRUCTIVE: force_wipe_remnawave — decommission this node entirely ===
+# Removes the panel-side node (when uuid + token known), tears down the
+# container, and deletes the install dir, then ends the play for THIS host so
+# the re-template / KV-resync / slipstream tasks below (and in main.yml) are
+# skipped. Gated on a default-false flag, so this is a no-op unless requested.
+- name: Wipe Remnawave node (destructive decommission)
+  when: force_wipe_remnawave | default(false) | bool
+  block:
+    - name: Warn — wiping Remnawave node
+      debug:
+        msg: >-
+          force_wipe_remnawave is set. Removing {{ remnawave_node_install_dir }}
+          and (if uuid known) deleting node
+          {{ remnawave_node_uuid | default('(unknown)') }} from
+          {{ remnawave_panel_url | default('(no panel url)') }}.
+
+    - name: Delete node on Panel (when uuid + token known)
+      include_tasks: ../providers/remnawave/delete_node.yml
+      when:
+        - remnawave_node_uuid is defined
+        - remnawave_node_uuid | length > 0
+        - remnawave_panel_api_token | default('') | length > 0
+
+    - name: Warn that Panel node could not be auto-deleted
+      debug:
+        msg: >-
+          Skipped panel-side DELETE — no .node_uuid on disk or no
+          remnawave_panel_api_token supplied. Remove the node manually in the
+          Panel UI if it still exists.
+      when: >-
+        remnawave_node_uuid is not defined
+        or remnawave_node_uuid | length == 0
+        or remnawave_panel_api_token | default('') | length == 0
+
+    - name: Tear down Remnawave container
+      community.docker.docker_compose_v2:
+        project_src: "{{ remnawave_node_install_dir }}"
+        state: absent
+        remove_volumes: true
+      become: yes
+      failed_when: false   # compose file may already be partially gone
+
+    - name: Remove Remnawave install dir + logrotate config
+      file:
+        path: "{{ item }}"
+        state: absent
+      become: yes
+      loop:
+        - "{{ remnawave_node_install_dir }}"
+        - /etc/logrotate.d/remnanode
+
+    - name: End play for this host after wipe
+      meta: end_host
+
+# === Re-template / recreate container if forced ===
+- name: Read existing SECRET_KEY from compose
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+  register: existing_compose_raw
+  become: yes
+  when: force_reinstall_remnawave | default(false) | bool
+
+# Tolerant of both the unquoted form (current template) and the legacy
+# quoted form (SECRET_KEY="...") left on disk by hosts deployed before the
+# quoting fix, so the first reinstall after the fix also repairs the on-disk
+# value. The base64 character class stops at the closing quote or newline.
+- name: Extract SECRET_KEY from existing compose
+  set_fact:
+    remnawave_panel_secret_key: "{{ (existing_compose_raw.content | b64decode | regex_search('SECRET_KEY=\"?([A-Za-z0-9+/=._-]+)\"?', '\\1') | first) }}"
+  no_log: true
+  when:
+    - force_reinstall_remnawave | default(false) | bool
+    - existing_compose_raw is defined
+
+- name: Assert SECRET_KEY was recovered from compose
+  assert:
+    that:
+      - remnawave_panel_secret_key is defined
+      - remnawave_panel_secret_key | length > 0
+    fail_msg: >-
+      Could not extract SECRET_KEY from
+      {{ remnawave_node_install_dir }}/docker-compose.yml. The compose file may
+      be corrupt; re-supply remnawave_panel_secret_key (vault) and re-run.
+  no_log: true
+  when:
+    - force_reinstall_remnawave | default(false) | bool
+    - existing_compose_raw is defined
+
+- name: Re-render docker-compose.yml
+  template:
+    src: remnanode-docker-compose.yml.j2
+    dest: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+    mode: '0640'
+  become: yes
+  register: compose_template_update
+  when: force_reinstall_remnawave | default(false) | bool
+
+- name: Pull image (force)
+  community.docker.docker_image:
+    name: "{{ remnawave_node_image }}"
+    source: pull
+    force_source: true
+  become: yes
+  when: force_reinstall_remnawave | default(false) | bool
+
+- name: Recreate container
+  community.docker.docker_compose_v2:
+    project_src: "{{ remnawave_node_install_dir }}"
+    state: present
+    recreate: always
+  become: yes
+  when: force_reinstall_remnawave | default(false) | bool
+
+- name: Wait for NODE_PORT after recreate
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ remnawave_node_port }}"
+    timeout: 60
+    delay: 2
+  when: force_reinstall_remnawave | default(false) | bool
+
+# === Set component_install_success so downstream gates work ===
+- name: Mark Remnawave component as ready for downstream tasks
+  set_fact:
+    remnawave_install_success: true
+    component_install_success: true
+
+# Remnawave update does NOT touch FCP. FCP stores only the panel (baseUrl +
+# apiToken), which is unchanged when a node is re-templated/recreated. Per-node
+# config (transports/Hosts) lives panel-side and is fed to FCP by the panel.
+
+- name: Display Remnawave update summary
+  debug:
+    msg: |
+      Remnawave update complete!
+
+      Server: {{ dns_hostname }}
+      Force reinstall: {{ force_reinstall_remnawave | default(false) | bool }}
+      Node UUID: {{ remnawave_node_uuid | default('(none)') }}

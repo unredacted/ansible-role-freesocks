@@ -20,14 +20,14 @@
 - name: Set random hostname from dictionary words
   set_fact:
     random_hostname: "{{ random_words.stdout_lines | join('-') }}"
-  when: 
+  when:
     - random_hostname is not defined
     - custom_hostname is not defined
 
 - name: Set random hostname from custom override
   set_fact:
     random_hostname: "{{ custom_hostname }}"
-  when: 
+  when:
     - random_hostname is not defined
     - custom_hostname is defined
 
@@ -43,7 +43,7 @@
 
 - name: Debug DNS variables
   debug:
-    msg: 
+    msg:
       - "Random Hostname: {{ random_hostname }}"
       - "DNS Hostname: {{ dns_hostname }}"
       - "KV Hostname: {{ kv_hostname }}"
@@ -60,7 +60,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: A
@@ -71,7 +71,7 @@
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ envoy_mappings[inventory_hostname].ipv4 }}"
-  when: 
+  when:
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv4 is defined
@@ -89,7 +89,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: AAAA
@@ -100,7 +100,7 @@
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ envoy_mappings[inventory_hostname].ipv6 }}"
-  when: 
+  when:
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv6 is defined
@@ -121,7 +121,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: A
@@ -131,7 +131,7 @@
       proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
-  when: 
+  when:
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined
     - ansible_facts['default_ipv4']['address'] is defined
   register: fallback_dns_a_record_result
@@ -148,7 +148,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: AAAA
@@ -158,7 +158,7 @@
       proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
-  when: 
+  when:
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined
     - ansible_facts['default_ipv6']['address'] is defined
   register: fallback_dns_aaaa_record_result
@@ -167,5 +167,3 @@
   debug:
     var: fallback_dns_aaaa_record_result
   when: fallback_dns_aaaa_record_result is defined
-
-

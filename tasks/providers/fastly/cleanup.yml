@@ -6,7 +6,7 @@
 # before creating a new one for the new hostname.
 #
 # Reads the service ID from:
-#   1. /opt/outline/fastly_service_id (local file on server)
+#   1. {{ fastly_service_id_dir }}/fastly_service_id (local file on server)
 #   2. Existing KV data (via fastlyServiceId field)
 #
 # Requires:
@@ -18,12 +18,12 @@
 # ============================================================================
 - name: Check if Fastly service ID file exists
   stat:
-    path: /opt/outline/fastly_service_id
+    path: "{{ fastly_service_id_dir }}/fastly_service_id"
   register: fastly_service_id_file
 
 - name: Read Fastly service ID from file
   slurp:
-    src: /opt/outline/fastly_service_id
+    src: "{{ fastly_service_id_dir }}/fastly_service_id"
   register: fastly_service_id_raw
   when: fastly_service_id_file.stat.exists
 
@@ -92,7 +92,7 @@
 
 - name: Remove old Fastly service ID file
   file:
-    path: /opt/outline/fastly_service_id
+    path: "{{ fastly_service_id_dir }}/fastly_service_id"
     state: absent
   become: yes
   when: fastly_service_id_file.stat.exists

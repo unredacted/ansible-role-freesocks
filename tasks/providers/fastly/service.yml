@@ -235,6 +235,55 @@
   debug:
     msg: "WebSocket VCL snippet added to Fastly service"
 
+# XHTTP (packet-up) transports need their own VCL: the request carries no
+# Upgrade header, so the websocket_upgrade snippet above does not apply. Each
+# enabled xhttp transport gets (1) a recv snippet making its path uncacheable
+# (return(pass)), and (2) a fetch snippet that streams the long-lived GET
+# (beresp.do_stream) and caps timeouts at Fastly's ~60s clustering ceiling.
+# No-op while all xhttp transports are disabled (the default until the Phase C
+# PoC passes). MUST-TEST: do_stream-on-pass streaming + X-Padding integrity.
+- name: Add XHTTP pass VCL snippet (uncacheable) per transport
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "xhttp_pass_{{ item.name }}"
+      type: "recv"
+      priority: "20"
+      dynamic: "0"
+      content: 'if (req.url.url ~ "^{{ item.path }}/") { return(pass); }'
+    status_code: [200, 201]
+  delegate_to: localhost
+  loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Add XHTTP stream VCL snippet (do_stream + 60s timeouts) per transport
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "xhttp_stream_{{ item.name }}"
+      type: "fetch"
+      priority: "20"
+      dynamic: "0"
+      content: 'if (req.url.url ~ "^{{ item.path }}/") { set beresp.do_stream = true; set bereq.first_byte_timeout = 60s; set bereq.between_bytes_timeout = 60s; }'
+    status_code: [200, 201]
+  delegate_to: localhost
+  loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
 # ============================================================================
 # Activate service version
 # ============================================================================
@@ -260,7 +309,7 @@
 - name: Save Fastly service ID to server
   copy:
     content: "{{ fastly_service_id }}"
-    dest: /opt/outline/fastly_service_id
+    dest: "{{ fastly_service_id_dir }}/fastly_service_id"
     mode: '0644'
   become: yes
 

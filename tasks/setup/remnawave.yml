@@ -1,0 +1,134 @@
+---
+# tasks/setup/remnawave.yml - Remnawave Node container deployment
+
+# === Validation ===
+- name: Validate Remnawave required variables
+  assert:
+    that:
+      - remnawave_panel_url is defined
+      - remnawave_panel_url | length > 0
+    fail_msg: "remnawave_panel_url must be set when remnawave_enabled=true"
+
+- name: Validate secret_key_source
+  assert:
+    that: remnawave_secret_key_source in ['vault', 'panel_api']
+    fail_msg: "remnawave_secret_key_source must be 'vault' or 'panel_api', got: {{ remnawave_secret_key_source }}"
+
+- name: Validate vault SECRET_KEY is supplied
+  assert:
+    that:
+      - remnawave_panel_secret_key is defined
+      - remnawave_panel_secret_key | length > 0
+    fail_msg: |
+      remnawave_panel_secret_key must be set (vault-encrypted) when
+      remnawave_secret_key_source='vault'. Get the value from the Panel UI
+      when adding a node, or switch to remnawave_secret_key_source='panel_api'.
+  when: remnawave_secret_key_source == 'vault'
+
+- name: Validate Panel API token when needed
+  assert:
+    that:
+      - remnawave_panel_api_token is defined
+      - remnawave_panel_api_token | length > 0
+    fail_msg: |
+      remnawave_panel_api_token (vault-encrypted) is required when:
+        - remnawave_secret_key_source='panel_api', or
+        - remnawave_panel_register_node=true
+  when: >-
+    remnawave_secret_key_source == 'panel_api'
+    or (remnawave_panel_register_node | default(false) | bool)
+
+# === Directories (must exist before register_node persists .node_uuid) ===
+- name: Create Remnawave install directory
+  file:
+    path: "{{ remnawave_node_install_dir }}"
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Create Remnawave log directory
+  file:
+    path: "{{ remnawave_log_dir }}"
+    state: directory
+    mode: '0755'
+  become: yes
+
+# === Panel API: fetch SECRET_KEY ===
+- name: Fetch SECRET_KEY from Panel keygen endpoint
+  include_tasks: ../providers/remnawave/keygen.yml
+  when: remnawave_secret_key_source == 'panel_api'
+
+# Derive the panel's active inbounds from the enabled CDN transports so node
+# registration and Host creation can't drift. Falls back to an explicitly-set
+# remnawave_panel_active_inbounds when no transport carries an inbound_uuid yet.
+- name: Derive active inbounds from enabled CDN transports
+  set_fact:
+    remnawave_panel_active_inbounds: "{{ _derived_active_inbounds }}"
+  vars:
+    _derived_active_inbounds: >-
+      {{ remnawave_cdn_transports | default([]) | selectattr('enabled') | map(attribute='inbound_uuid')
+         | select('string') | reject('equalto', '') | list }}
+  when: _derived_active_inbounds | length > 0
+
+# === Panel API: register node ===
+# Hostname/DNS must already be set (main.yml generates them earlier in deploy
+# mode). Registration happens before the container starts so the node has a
+# UUID we can persist locally for change/migrate flows.
+- name: Register node with Panel
+  include_tasks: ../providers/remnawave/register_node.yml
+  when: remnawave_panel_register_node | default(false) | bool
+
+# === Render config ===
+- name: Render docker-compose.yml
+  template:
+    src: remnanode-docker-compose.yml.j2
+    dest: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+    mode: '0640'
+  become: yes
+  register: compose_template
+  no_log: true   # rendered file contains the panel-wide SECRET_KEY
+
+- name: Render logrotate config
+  template:
+    src: remnanode-logrotate.j2
+    dest: /etc/logrotate.d/remnanode
+    mode: '0644'
+  become: yes
+
+# Persist the deployed hostname so change/migrate flows can reconstruct
+# the "old" hostname when rotating. The compose file doesn't carry this.
+- name: Persist deployed hostname
+  copy:
+    content: "{{ dns_hostname }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.hostname"
+    mode: '0640'
+  become: yes
+
+# === Container lifecycle ===
+- name: Pull image (force when force_reinstall_remnawave is set)
+  community.docker.docker_image:
+    name: "{{ remnawave_node_image }}"
+    source: pull
+    force_source: "{{ force_reinstall_remnawave | default(false) | bool }}"
+  become: yes
+
+- name: Bring up Remnawave node container
+  community.docker.docker_compose_v2:
+    project_src: "{{ remnawave_node_install_dir }}"
+    state: present
+    recreate: "{{ 'always' if (compose_template.changed or (force_reinstall_remnawave | default(false) | bool)) else 'auto' }}"
+  become: yes
+
+# === Health check ===
+- name: Wait for Remnawave NODE_PORT to be open
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ remnawave_node_port }}"
+    timeout: 60
+    delay: 2
+
+# === Success fact ===
+- name: Set Remnawave install success fact
+  set_fact:
+    remnawave_install_success: true
+    component_install_success: true

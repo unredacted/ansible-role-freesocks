@@ -1,0 +1,64 @@
+---
+# tasks/setup/docker.yml - Docker CE installation (Debian)
+#
+# Used by:
+#   - Remnawave Node component (always)
+#   - As a no-op safety net before Outline (Outline's installer also handles Docker,
+#     but running this first makes the dependency explicit and idempotent)
+#
+# Installs Docker CE + the Compose v2 plugin + the python3-docker library so
+# Ansible's community.docker modules can talk to the local daemon.
+
+- name: Install Docker apt prerequisites
+  apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - apt-transport-https
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  become: yes
+
+- name: Create /etc/apt/keyrings directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Download Docker apt signing key
+  get_url:
+    url: "https://download.docker.com/linux/debian/gpg"
+    dest: /etc/apt/keyrings/docker.asc
+    mode: '0644'
+    force: no
+  become: yes
+
+- name: Add Docker apt repository
+  apt_repository:
+    repo: "deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+    filename: docker
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Install Docker CE and Compose plugin
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+      - python3-docker
+    state: present
+  become: yes
+
+- name: Ensure docker service is enabled and running
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+  become: yes

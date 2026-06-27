@@ -1,0 +1,14 @@
+{# templates/remnanode-logrotate.j2
+   Rendered to /etc/logrotate.d/remnanode
+   The Remnawave docs require log rotation — without it the container
+   logs (xray.out.log, xray.err.log) will fill the disk.
+#}
+{{ remnawave_log_dir }}/*.log {
+    size 50M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

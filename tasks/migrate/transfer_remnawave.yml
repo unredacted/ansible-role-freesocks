@@ -1,0 +1,62 @@
+---
+# tasks/migrate/transfer_remnawave.yml - Transfer /opt/remnanode from source
+# to destination during migration.
+#
+# Unlike Outline's transfer_config.yml, no hostname string substitution is
+# needed — Remnawave's compose file carries SECRET_KEY (panel-wide) and the
+# panel pushes Xray config at runtime; nothing in /opt/remnanode is host-
+# specific except .hostname (which we rewrite for the new host).
+
+- name: Create archive of Remnawave directory on source
+  archive:
+    path: "{{ remnawave_node_install_dir }}"
+    dest: "/tmp/remnanode.tar.gz"
+    format: gz
+  become: yes
+  no_log: true   # archive contains docker-compose.yml with the SECRET_KEY
+  when: inventory_hostname == source_hostname
+
+- name: Fetch archive from source server
+  fetch:
+    src: "/tmp/remnanode.tar.gz"
+    dest: "/tmp/remnanode-migration-{{ source_kv_hostname }}.tar.gz"
+    flat: yes
+  become: yes
+  when: inventory_hostname == source_hostname
+
+- name: Rename source Remnawave directory (keep for rollback)
+  command: "mv {{ remnawave_node_install_dir }} {{ remnawave_node_install_dir }}.migrated"
+  become: yes
+  when: inventory_hostname == source_hostname
+
+- name: Copy archive to destination server
+  copy:
+    src: "/tmp/remnanode-migration-{{ source_kv_hostname }}.tar.gz"
+    dest: "/tmp/remnanode.tar.gz"
+    mode: '0644'
+    remote_src: no
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Extract archive on destination server
+  unarchive:
+    src: "/tmp/remnanode.tar.gz"
+    dest: "/opt"
+    remote_src: yes
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Update .hostname for destination
+  copy:
+    content: "{{ destination_kv_hostname }}.{{ base_domain }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.hostname"
+    mode: '0640'
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Clean up archive files
+  file:
+    path: "/tmp/remnanode.tar.gz"
+    state: absent
+  become: yes
+  when: inventory_hostname in [source_hostname, destination_hostname]

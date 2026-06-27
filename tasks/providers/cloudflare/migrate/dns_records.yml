@@ -13,7 +13,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     status_code: 200
   delegate_to: localhost
   register: existing_dns_records
@@ -27,7 +27,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: A
@@ -40,7 +40,7 @@
   with_nested:
     - "{{ existing_dns_records.json.result | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname) | list }}"
     - "{{ envoy_mappings[inventory_hostname].ipv4 }}"
-  when: 
+  when:
     - inventory_hostname == destination_hostname
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
@@ -54,7 +54,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: A
@@ -65,7 +65,7 @@
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ envoy_mappings[inventory_hostname].ipv4 }}"
-  when: 
+  when:
     - inventory_hostname == destination_hostname
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
@@ -80,7 +80,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: AAAA
@@ -93,7 +93,7 @@
   with_nested:
     - "{{ existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list }}"
     - "{{ envoy_mappings[inventory_hostname].ipv6 }}"
-  when: 
+  when:
     - inventory_hostname == destination_hostname
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
@@ -107,7 +107,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: AAAA
@@ -118,13 +118,12 @@
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ envoy_mappings[inventory_hostname].ipv6 }}"
-  when: 
+  when:
     - inventory_hostname == destination_hostname
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv6 is defined
     - existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0
-
 
 # Cleanup API and Prometheus domain records
 - name: Get existing DNS records for API domain cleanup
@@ -134,7 +133,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     status_code: 200
   delegate_to: localhost
   register: api_dns_records
@@ -150,7 +149,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     status_code: 200
   delegate_to: localhost
   loop: "{{ api_dns_records.json.result }}"
@@ -169,7 +168,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: A
@@ -179,7 +178,7 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  when: 
+  when:
     - inventory_hostname == destination_hostname
     - (existing_dns_records.json.result | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0)
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
@@ -192,7 +191,7 @@
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{ cf_token }}"
-      
+
     body_format: json
     body:
       type: AAAA
@@ -202,7 +201,7 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  when: 
+  when:
     - inventory_hostname == destination_hostname
     - (existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0)
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)

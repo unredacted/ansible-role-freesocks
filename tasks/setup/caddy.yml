@@ -1,0 +1,108 @@
+---
+# tasks/setup/caddy.yml - Standalone Caddy install (TLS terminator + WS proxy
+# for Remnawave node).
+#
+# Caddy listens on remnawave_caddy_listen_port (default 443), auto-issues a
+# Let's Encrypt cert via HTTP-01 (port 80 — must be free), and path-routes each
+# enabled remnawave_cdn_transports entry to its loopback Xray inbound (all other
+# paths fall through to a decoy site). The Panel-side Xray inbounds must be
+# configured to listen on those internal ports with plaintext WS/XHTTP —
+# coordinate panel config accordingly.
+
+- name: Validate Caddy required variables
+  assert:
+    that:
+      - remnawave_caddy_email is defined
+      - remnawave_caddy_email | length > 0
+    fail_msg: "remnawave_caddy_email must be set when remnawave_caddy_enabled=true (used for ACME registration)"
+
+# === Install Caddy from the official apt repo ===
+- name: Install Caddy apt prerequisites
+  apt:
+    name:
+      - debian-keyring
+      - debian-archive-keyring
+      - apt-transport-https
+      - curl
+    state: present
+  become: yes
+
+- name: Download Caddy apt signing key
+  get_url:
+    url: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+    dest: /etc/apt/keyrings/caddy-stable-archive-keyring.asc
+    mode: '0644'
+    force: no
+  become: yes
+
+- name: Add Caddy apt repository
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/caddy-stable-archive-keyring.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+    filename: caddy-stable
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Install Caddy
+  apt:
+    name: caddy
+    state: present
+  become: yes
+
+# === Decoy site (served by Caddy on all non-transport paths) ===
+- name: Set up decoy/camouflage site
+  include_tasks: decoy.yml
+
+# === Render Caddyfile ===
+- name: Render Caddyfile
+  template:
+    src: remnanode-caddyfile.j2
+    dest: /etc/caddy/Caddyfile
+    mode: '0644'
+    validate: "caddy validate --config %s --adapter caddyfile"
+  become: yes
+  notify: reload caddy
+
+- name: Ensure Caddy is enabled and running
+  systemd:
+    name: caddy
+    state: started
+    enabled: yes
+  become: yes
+
+# Run any pending notifies (Caddyfile reload) before the next task chain.
+- name: Flush handlers (apply Caddyfile changes immediately)
+  meta: flush_handlers
+
+# === Health check ===
+- name: Wait for Caddy to bind the listen port
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ remnawave_caddy_listen_port }}"
+    timeout: 30
+    delay: 2
+
+# Verify Caddy actually OWNS the port. If the panel-side Xray inbound was
+# misconfigured to bind it, Xray (host network) grabs it first and the wait_for
+# above passes against Xray, masking the conflict. Read-only check; requires
+# `ss` (iproute2, standard on Debian/Ubuntu) — skipped gracefully if absent.
+- name: Check which process owns the Caddy listen port
+  shell: "ss -ltnHp 'sport = :{{ remnawave_caddy_listen_port }}'"
+  register: caddy_port_owner
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Assert Caddy (not Xray) owns the public TLS port
+  assert:
+    that:
+      - "'caddy' in caddy_port_owner.stdout"
+    fail_msg: >-
+      Port {{ remnawave_caddy_listen_port }} is not owned by Caddy
+      (listeners: {{ caddy_port_owner.stdout | trim | default('none') }}).
+      A panel-side Xray inbound is likely bound to this port. Reconfigure the
+      inbounds to listen on their loopback ports
+      ({{ remnawave_cdn_transports | selectattr('enabled') | map(attribute='internal_port') | join(', ') }})
+      with plaintext WS/XHTTP so Caddy can own {{ remnawave_caddy_listen_port }}.
+    success_msg: "Caddy owns port {{ remnawave_caddy_listen_port }}."
+  when: caddy_port_owner.stdout | default('') | length > 0

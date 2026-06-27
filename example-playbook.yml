@@ -22,24 +22,24 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline1-ams"
 
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration (replaces Cloudflare KV).
+    # The role registers this server with FCP via its admin REST API.
+    # NOTE: an Outline server registered with FCP needs the Caddy API proxy,
+    # which is enabled automatically when outline_wss_enabled=true or when
+    # fcp_enabled=true.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline1-ams:
@@ -50,32 +50,28 @@
     - ansible-role-freesocks
 
 ###############################################################################
-# DEPLOY MODE: Outline without CF tunnel (direct port access)
+# DEPLOY MODE: Outline on a second domain
 ###############################################################################
-- name: "Deploy: Outline without tunnel"
+- name: "Deploy: Outline on a second domain"
   hosts: new_servers
   remote_user: root
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.app"
-    kv_hostname_prefix: "outline2-ams"
 
     domain_providers:
       example.app:
         dns_provider: cloudflare
-        tunnel_provider: none  # Direct port access, no CF tunnel
         zone_id: "your-zone-id-for-app"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline2-ams:
@@ -94,7 +90,6 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline3-ams"
 
     # WSS Configuration
     outline_wss_enabled: true
@@ -111,19 +106,17 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration. With WSS enabled the role registers
+    # websocketEnabled + websocketDomain alongside the Caddy-proxied apiUrl.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline3-ams:
@@ -142,7 +135,6 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline4-ams"
 
     outline_wss_enabled: true
     outline_keys_port: 853
@@ -157,19 +149,16 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline4-ams:
@@ -189,7 +178,6 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline5-ams"
 
     # slipstream Configuration
     slipstream_enabled: true
@@ -210,23 +198,19 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
       your-dns.com:                            # slipstream domain must also be here
         dns_provider: cloudflare
-        tunnel_provider: none
         zone_id: "your-zone-id-for-dns"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline5-ams:
@@ -246,7 +230,6 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline6-ams"
 
     slipstream_enabled: true
     slipstream_mode: raw               # Direct SOCKS5 proxy (via microsocks)
@@ -261,23 +244,19 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
       your-dns.com:
         dns_provider: cloudflare
-        tunnel_provider: none
         zone_id: "your-zone-id-for-dns"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline6-ams:
@@ -297,7 +276,6 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline7-ams"
 
     # WSS
     outline_wss_enabled: true
@@ -316,23 +294,19 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
       your-dns.com:
         dns_provider: cloudflare
-        tunnel_provider: none
         zone_id: "your-zone-id-for-dns"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline7-ams:
@@ -360,17 +334,16 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration (PATCH the new hostname into FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
   roles:
     - ansible-role-freesocks
@@ -393,21 +366,19 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
       example.app:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-app"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration (PATCH the new hostname into FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
   roles:
     - ansible-role-freesocks
@@ -421,10 +392,9 @@
   vars:
     operation_mode: migrate
     source_hostname: "outline1-ams"
-    source_kv_hostname: "apple-banana-cherry"    # KV key from old deployment
+    source_kv_hostname: "apple-banana-cherry"    # slug/hostname from old deployment
     destination_hostname: "outline2-fra"
-    destination_kv_hostname: "dog-elephant-fox"   # New KV key for destination
-    migrate_delete_source: false                  # Set true to delete old DNS/KV
+    destination_kv_hostname: "dog-elephant-fox"   # slug/hostname for destination
 
     base_domain: "example.com"
     api_domain: "example.com"
@@ -433,19 +403,16 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration (PATCH the destination address into FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline2-fra:
@@ -477,21 +444,19 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
       your-dns.com:
         dns_provider: cloudflare
-        tunnel_provider: none
         zone_id: "your-zone-id-for-dns"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration (re-syncs the server record in FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
   roles:
     - ansible-role-freesocks
@@ -514,17 +479,16 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration (re-syncs the server record in FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
   roles:
     - ansible-role-freesocks
@@ -553,21 +517,19 @@
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
       your-dns.com:
         dns_provider: cloudflare
-        tunnel_provider: none
         zone_id: "your-zone-id-for-dns"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration (re-syncs the server record in FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
   roles:
     - ansible-role-freesocks
@@ -581,25 +543,22 @@
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline-custom"
     custom_hostname: "my-proxy-server"  # Results in my-proxy-server.example.com
 
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+
+    # FreeSocks Control Plane registration
+    # custom_hostname also becomes the default fcp_server_slug.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline-custom:
@@ -610,42 +569,33 @@
     - ansible-role-freesocks
 
 ###############################################################################
-# DEPLOY MODE: Separate KV credentials (multi-account setup)
-# When KV namespaces are on a different CF account from DNS domains
+# DEPLOY MODE: Per-domain DNS credentials (multi-account setup)
+# When a domain's DNS zone lives on a different CF account from the global one
 ###############################################################################
-- name: "Deploy: Multi-account (separate KV credentials)"
+- name: "Deploy: Multi-account (per-domain DNS credentials)"
   hosts: new_servers
   remote_user: root
   vars:
     operation_mode: deploy
     deploy_target_domain: "example.com"
-    kv_hostname_prefix: "outline8-ams"
 
     domain_providers:
       example.com:
         dns_provider: cloudflare
-        tunnel_provider: cloudflare
         zone_id: "your-zone-id-for-com"
         cloudflare_api_token: "per-domain-token"     # Domain-specific token
         cloudflare_account_id: "per-domain-account"   # Domain-specific account
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
 
     # Global fallback token (used for DNS if domain doesn't have its own)
     cloudflare_api_token: "global-api-token"
     cloudflare_account_id: "global-account-id"
 
-    # SEPARATE KV credentials (overrides global for KV operations only)
-    kv_cloudflare_api_token: "kv-specific-api-token"
-    kv_cloudflare_account_id: "kv-specific-account-id"
-
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
-    cloudflare_access_team_name: "your-team-name"
-    cloudflare_access_aud_tag: "your-aud-tag"
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       outline8-ams:
@@ -729,7 +679,6 @@
       example.com:
         dns_provider: cloudflare            # DNS for origin hostname (Caddy TLS)
         cdn_provider: fastly                # CDN/WSS fronting via Fastly
-        tunnel_provider: none               # No Cloudflare tunnel needed
         zone_id: "your-cloudflare-zone-id"
         fastly_domain_mode: shared          # Use *.global.ssl.fastly.net
 
@@ -737,18 +686,108 @@
     fastly_api_token: "your-fastly-api-token"
     fastly_service_name_prefix: "fs"        # Results in fs-{hostname}.global.ssl.fastly.net
 
-    # Cloudflare for DNS + KV (unchanged from existing setup)
-    kv_provider: cloudflare
+    # Cloudflare for DNS (origin A/AAAA records)
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-cloudflare-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration.
+    # websocketDomain is registered as the Fastly edge domain when fronted.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       fastly-shared-1:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Remnawave node + WS transport via Fastly
+###############################################################################
+# Remnawave (Xray-core) node fronted by Fastly, with a standalone Caddy on the
+# host terminating TLS and path-routing the WebSocket transport to the panel's
+# loopback Xray inbound. The role registers the node on the panel AND creates
+# one Remnawave Host per enabled CDN transport (so issued keys reach
+# subscriptions). XHTTP ships disabled — leave it off until the Phase C PoC.
+#
+# Phase 0 prerequisite (one-time, MANUAL in the panel): add a raw-Xray WS
+# inbound to the Config Profile (tag VLESS_WS_CDN, listen 127.0.0.1:8443,
+# network ws, security none, wsSettings.path /ws), then copy its UUID from
+# GET /api/config-profiles/inbounds into remnawave_cdn_transports[0].inbound_uuid.
+- name: "Deploy: Remnawave node + WS transport via Fastly"
+  hosts: fastly_remnawave_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+
+    # Remnawave instead of Outline (mutually exclusive)
+    outline_enabled: false
+    remnawave_enabled: true
+
+    # Standalone Caddy on the host (required for Fastly fronting)
+    remnawave_caddy_enabled: true
+    remnawave_caddy_email: "admin@example.com"
+
+    # Panel connection + API (register_node needs the API token)
+    remnawave_panel_url: "https://panel.example.com"
+    remnawave_panel_api_token: "your-remnawave-panel-token"        # vault me
+    remnawave_panel_register_node: true
+    remnawave_panel_config_profile_uuid: "your-config-profile-uuid"
+    remnawave_panel_country_code: "US"
+    # SECRET_KEY: paste the panel-generated value into vault (default source)
+    remnawave_panel_secret_key: "your-panel-secret-key"            # vault me
+
+    # CDN transports: fill the WS inbound UUID (from Phase 0). The `path` is
+    # panel-global (must equal the inbound's wsSettings.path). XHTTP stays off.
+    remnawave_cdn_transports:
+      - name: ws
+        network: ws
+        path: "/ws"
+        internal_port: 8443
+        inbound_uuid: "your-ws-inbound-uuid"   # configProfileInboundUuid
+        alpn: "http/1.1"
+        fingerprint: chrome
+        enabled: true
+      - name: xhttp
+        network: xhttp
+        path: "/xh"
+        internal_port: 8444
+        inbound_uuid: ""
+        mode: "packet-up"
+        alpn: "h2,http/1.1"
+        fingerprint: chrome
+        enabled: false                          # Phase C gate — keep disabled
+
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare            # DNS for origin hostname (Caddy TLS)
+        cdn_provider: fastly                # CDN fronting via Fastly
+        zone_id: "your-cloudflare-zone-id"
+        fastly_domain_mode: shared          # Use *.global.ssl.fastly.net
+
+    # Fastly API configuration
+    fastly_api_token: "your-fastly-api-token"
+    fastly_service_name_prefix: "fs"
+
+    # Cloudflare for DNS (origin A/AAAA records)
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+
+    # FreeSocks Control Plane: for Remnawave, FCP stores the PANEL (not nodes).
+    # Opt in to registering the panel record with fcp_register_remnawave_panel.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
+    fcp_register_remnawave_panel: true
+
+    envoy_mappings:
+      fastly-remnawave-1:
         ipv4: ["1.2.3.4"]
         ipv6: ["2001:db8::1"]
 
@@ -778,22 +817,21 @@
       example.app:
         dns_provider: cloudflare            # DNS under Cloudflare for ACME + CNAME
         cdn_provider: fastly                # CDN/WSS fronting via Fastly
-        tunnel_provider: none               # No tunnel needed — Fastly handles CDN
         zone_id: "your-cloudflare-zone-id-for-app"
         fastly_domain_mode: custom          # Use your own domain with Fastly TLS
 
     # Fastly API configuration
     fastly_api_token: "your-fastly-api-token"
 
-    # Cloudflare for DNS + KV
-    kv_provider: cloudflare
+    # Cloudflare for DNS (origin records + ACME/CNAME for custom domain)
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-cloudflare-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
     envoy_mappings:
       fastly-custom-1:
@@ -810,7 +848,7 @@
 # 1. Old Fastly service cleanup
 # 2. New Fastly service creation + WebSocket enablement
 # 3. DNS updates (shared: none needed, custom: new CNAME + TLS)
-# 4. KV store update with new Fastly domain
+# 4. FCP registration update with new Fastly domain
 - name: "Change: Rotate hostname with Fastly CDN"
   hosts: fastly_shared_servers
   remote_user: root
@@ -824,21 +862,20 @@
       example.com:
         dns_provider: cloudflare
         cdn_provider: fastly
-        tunnel_provider: none
         zone_id: "your-cloudflare-zone-id"
         fastly_domain_mode: shared
 
     fastly_api_token: "your-fastly-api-token"
     fastly_service_name_prefix: "fs"
 
-    kv_provider: cloudflare
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
     cloudflare_api_token: "your-cloudflare-api-token"
     cloudflare_account_id: "your-account-id"
-    cloudflare_api_kv_namespace_prod: "your-prod-api-kv-namespace"
-    cloudflare_prom_kv_namespace_prod: "your-prod-prom-kv-namespace"
-    cloudflare_api_kv_namespace_dev: "your-dev-api-kv-namespace"
-    cloudflare_prom_kv_namespace_dev: "your-dev-prom-kv-namespace"
+
+    # FreeSocks Control Plane registration (PATCH the new Fastly domain into FCP)
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
 
   roles:
     - ansible-role-freesocks
