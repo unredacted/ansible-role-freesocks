@@ -86,7 +86,7 @@
         "proxied": false
       }
     body_format: json
-    status_code: 200
+    status_code: [200, 201]
   delegate_to: localhost
   when:
     - a_record_check.json.result | length == 0
@@ -131,12 +131,31 @@
         "proxied": false
       }
     body_format: json
-    status_code: 200
+    status_code: [200, 201]
   delegate_to: localhost
   when:
     - ansible_default_ipv6.address is defined
     - aaaa_record_check.json.result | default([]) | length == 0
   register: aaaa_record_created
+
+- name: Update existing AAAA record if IPv6 changed
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ slipstream_zone_id }}/dns_records/{{ aaaa_record_check.json.result[0].id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ slipstream_cf_token }}"
+      Content-Type: "application/json"
+    body: |
+      {
+        "content": "{{ ansible_default_ipv6.address }}"
+      }
+    body_format: json
+    status_code: 200
+  delegate_to: localhost
+  when:
+    - ansible_default_ipv6.address is defined
+    - aaaa_record_check.json.result | default([]) | length > 0
+    - aaaa_record_check.json.result[0].content != ansible_default_ipv6.address
 
 # ============================================================================
 # Create NS record (dns1.your-dns.com → ns1.your-dns.com)
@@ -156,7 +175,7 @@
         "ttl": 300
       }
     body_format: json
-    status_code: 200
+    status_code: [200, 201]
   delegate_to: localhost
   when: ns_record_check.json.result | length == 0
   register: ns_record_created
@@ -168,13 +187,13 @@
   debug:
     msg: |
       slipstream DNS Records:
-      
+
       {% if a_record_created.changed | default(false) %}
       ✓ Created A record: {{ slipstream_ns_fqdn }} → {{ ansible_default_ipv4.address }}
       {% else %}
       • A record exists: {{ slipstream_ns_fqdn }}
       {% endif %}
-      
+
       {% if aaaa_record_created.changed | default(false) %}
       ✓ Created AAAA record: {{ slipstream_ns_fqdn }} → {{ ansible_default_ipv6.address }}
       {% elif ansible_default_ipv6.address is defined %}
@@ -182,13 +201,13 @@
       {% else %}
       ○ No IPv6 available, skipped AAAA record
       {% endif %}
-      
+
       {% if ns_record_created.changed | default(false) %}
       ✓ Created NS record: {{ slipstream_tunnel_fqdn }} → {{ slipstream_ns_fqdn }}
       {% else %}
       • NS record exists: {{ slipstream_tunnel_fqdn }}
       {% endif %}
-      
+
       Client should use domain: {{ slipstream_tunnel_fqdn }}
 
 - name: Set slipstream_domain fact for downstream tasks

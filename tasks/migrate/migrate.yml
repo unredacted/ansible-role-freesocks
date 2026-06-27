@@ -1,12 +1,58 @@
 # tasks/migrate/migrate.yml - Migration tasks orchestration
+#
+# Detects whether the source host runs Outline or Remnawave and branches
+# the rest of the flow accordingly.
 
-# Verify source server and stop containers (provider-specific)
-- name: Include source verification tasks (Cloudflare)
+# ============================================================================
+# Detect source component
+# ============================================================================
+- name: Detect Outline on source
+  stat:
+    path: /opt/outline
+  register: source_outline_path
+  when: inventory_hostname == source_hostname
+
+- name: Detect Remnawave on source
+  stat:
+    path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+  register: source_remnawave_path
+  when: inventory_hostname == source_hostname
+
+- name: Set migrate_component on source
+  set_fact:
+    migrate_component: >-
+      {{ 'outline' if source_outline_path.stat.exists
+         else ('remnawave' if source_remnawave_path.stat.exists
+               else 'unknown') }}
+  when: inventory_hostname == source_hostname
+
+- name: Fail if source has neither Outline nor Remnawave
+  fail:
+    msg: "Source host {{ source_hostname }} has no detectable VPN backend (neither /opt/outline nor {{ remnawave_node_install_dir }})"
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'unknown'
+
+- name: Propagate migrate_component to destination
+  set_fact:
+    migrate_component: "{{ hostvars[source_hostname].migrate_component }}"
+  when: inventory_hostname == destination_hostname
+
+- name: Debug detected migration component
+  debug:
+    msg: "Migrating {{ migrate_component }} from {{ source_hostname }} to {{ destination_hostname }}"
+
+# ============================================================================
+# Prepare source (stop Outline containers before transfer)
+# ============================================================================
+- name: Stop source Outline containers before transfer
   include_tasks: ../providers/cloudflare/migrate/verify_source.yml
-  when: kv_provider == 'cloudflare'
+  when: migrate_component == 'outline'
 
-# Setup destination server
-- name: Set variables for Outline installation
+# ============================================================================
+# Set destination hostname facts
+# ============================================================================
+- name: Set variables for destination installation
   set_fact:
     random_hostname: "{{ destination_kv_hostname }}"
     dns_hostname: "{{ destination_kv_hostname }}.{{ base_domain }}"
@@ -21,11 +67,25 @@
       - "KV Hostname: {{ kv_hostname }}"
   when: inventory_hostname == destination_hostname
 
-- name: Install Outline on new server
+# ============================================================================
+# Install on destination
+# ============================================================================
+# Outline path: full install (Outline's installer is idempotent on Docker)
+- name: Install Outline on destination
   include_tasks: ../setup/outline.yml
-  when: inventory_hostname == destination_hostname
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
 
-- name: Stop Outline containers on new server
+# Remnawave path: just install Docker on destination — the actual config
+# (compose with SECRET_KEY, .node_uuid, .hostname) is transferred from source.
+- name: Install Docker on destination (Remnawave)
+  include_tasks: ../setup/docker.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
+- name: Stop Outline-installer containers on destination (Outline only)
   docker_container:
     name: "{{ item }}"
     state: stopped
@@ -33,45 +93,179 @@
     - watchtower
     - shadowbox
   become: yes
-  when: 
-    - inventory_hostname == destination_hostname
-    - outline_install_success | default(false) | bool
-
-# Transfer configuration and update files (provider-agnostic)
-- name: Include configuration transfer tasks
-  include_tasks: transfer_config.yml
-
-# Clean up existing tunnel if needed (provider-specific)
-- name: Include tunnel cleanup tasks (Cloudflare)
-  include_tasks: ../providers/cloudflare/migrate/tunnel_cleanup.yml
-  when: tunnel_provider == 'cloudflare'
-
-# Manage containers (provider-agnostic)
-- name: Include container management tasks
-  include_tasks: containers.yml
-
-# Clean up any existing tunnel for destination hostname (provider-specific)
-- name: Include destination tunnel cleanup tasks (Cloudflare)
-  include_tasks: ../providers/cloudflare/migrate/destination_tunnel_cleanup.yml
   when:
     - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
     - outline_install_success | default(false) | bool
-    - tunnel_provider == 'cloudflare'
 
-# Setup tunnel (provider-specific)
-- name: Include tunnel tasks (Cloudflare)
-  include_tasks: ../providers/cloudflare/tunnel.yml
-  when: 
-    - inventory_hostname == destination_hostname
-    - outline_install_success | default(false) | bool
-    - tunnel_provider == 'cloudflare'
+# ============================================================================
+# Transfer configuration (component-specific)
+# ============================================================================
+- name: Include configuration transfer tasks (Outline)
+  include_tasks: transfer_config.yml
+  when: migrate_component == 'outline'
 
-# Setup DNS records (provider-specific)
+- name: Include configuration transfer tasks (Remnawave)
+  include_tasks: transfer_remnawave.yml
+  when: migrate_component == 'remnawave'
+
+# ============================================================================
+# Container management (component-specific)
+# ============================================================================
+- name: Include container management tasks (Outline)
+  include_tasks: containers.yml
+  when: migrate_component == 'outline'
+
+- name: Include container management tasks (Remnawave)
+  include_tasks: remnawave_containers.yml
+  when: migrate_component == 'remnawave'
+
+# ============================================================================
+# DNS update (provider-agnostic, both components)
+# ============================================================================
 - name: Include DNS record management tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/migrate/dns_records.yml
   when: dns_provider == 'cloudflare'
 
-# Update KV store entries (provider-specific)
-- name: Include KV store management tasks (Cloudflare)
-  include_tasks: ../providers/cloudflare/migrate/kv_store.yml
-  when: kv_provider == 'cloudflare'
+# ============================================================================
+# Control-plane update (FCP) — re-register the destination Outline server
+# ============================================================================
+# The destination has a new hostname, so its Caddy-proxied apiUrl changed.
+# Re-register with FCP (idempotent by slug). NOTE: the slug is hostname-derived,
+# so the destination registers as a new backendServers row; the stale source row
+# should be removed in the FCP admin CMS (or by a future delete-by-slug step).
+# Remnawave migrate does NOT touch FCP — FCP holds only the panel (unchanged
+# when a node moves); the panel-side node address is PATCHed via update_node below.
+- name: Re-register destination Outline server with FCP
+  include_tasks: ../providers/fcp/register_server.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - fcp_enabled | default(false) | bool
+
+# ============================================================================
+# Panel-side address update (Remnawave + register_node only)
+# ============================================================================
+- name: Read node UUID on destination
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.node_uuid"
+  register: dest_node_uuid_raw
+  become: yes
+  failed_when: false
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
+- name: Set node UUID fact on destination
+  set_fact:
+    remnawave_node_uuid: "{{ dest_node_uuid_raw.content | b64decode | trim }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - dest_node_uuid_raw.content is defined
+    - (dest_node_uuid_raw.content | b64decode | trim) | length > 0
+
+- name: Update Panel-side node address (Remnawave)
+  include_tasks: ../providers/remnawave/update_node.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - remnawave_panel_register_node | default(false) | bool
+    - remnawave_node_uuid is defined
+    - remnawave_node_uuid | length > 0
+
+- name: Warn if Panel address requires manual update (Remnawave)
+  debug:
+    msg: |
+      ⚠️  Manual step required:
+      The Remnawave node was migrated to {{ dns_hostname }} but the Panel API
+      was not used to update the address. Open the Panel UI → Nodes → find the
+      entry for {{ source_kv_hostname }}.* and update its 'Address' to '{{ dns_hostname }}'.
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - >-
+      not (remnawave_panel_register_node | default(false) | bool)
+      or remnawave_node_uuid is not defined
+      or remnawave_node_uuid | length == 0
+
+# ============================================================================
+# Caddy + Fastly + Host parity on the destination (Remnawave + Caddy)
+# ============================================================================
+# Migrate transfers only the install dir, so /etc/caddy/Caddyfile is NOT carried
+# over — re-install/render it on the destination. Then, if the node is
+# Fastly-fronted, rotate the Fastly service + Remnawave Hosts to the new hostname
+# (the edge domain is hostname-derived). FCP is untouched (panel-level).
+- name: Derive destination CDN provider (Remnawave migrate)
+  set_fact:
+    effective_cdn_provider: "{{ domain_providers[base_domain].cdn_provider | default('none') }}"
+    effective_fastly_domain_mode: "{{ domain_providers[base_domain].fastly_domain_mode | default('shared') }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - base_domain in domain_providers
+
+- name: Re-install/render Caddy on the destination (restores dropped Caddyfile)
+  include_tasks: ../setup/caddy.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - remnawave_caddy_enabled | default(false) | bool
+
+- name: Set Fastly facts for the destination rotation (Remnawave)
+  set_fact:
+    fastly_service_id_dir: "{{ remnawave_node_install_dir }}"
+    fastly_token: "{{ domain_providers[base_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
+    old_random_hostname: "{{ source_kv_hostname }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+
+- name: Clean up OLD Remnawave Hosts (source hostname)
+  include_tasks: ../providers/remnawave/cleanup_hosts.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - remnawave_panel_register_node | default(false) | bool
+
+- name: Delete OLD Fastly service (from transferred service-id file)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+
+- name: Create NEW Fastly service on the destination
+  include_tasks: ../providers/fastly/service.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - remnawave_caddy_enabled | default(false) | bool
+
+- name: Fastly TLS subscription (custom mode, destination)
+  include_tasks: ../providers/fastly/tls.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Fastly edge CNAME (custom mode, destination)
+  include_tasks: ../providers/fastly/dns.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - dns_provider == 'cloudflare'
+
+- name: Create NEW Remnawave Hosts on the destination
+  include_tasks: ../providers/remnawave/create_hosts.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - remnawave_panel_register_node | default(false) | bool

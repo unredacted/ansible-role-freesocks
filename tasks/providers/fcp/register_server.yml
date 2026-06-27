@@ -1,0 +1,146 @@
+---
+# tasks/providers/fcp/register_server.yml
+#
+# Register (or update) this Outline server in the FreeSocks Control Plane (FCP).
+#
+# FCP stores each server's management credential and dials OUT to it, so we send
+# the Caddy-proxied management apiUrl (valid public TLS — FCP's Outline client
+# uses a plain fetch() with no self-signed-cert handling, so the raw Outline
+# Manager URL on its self-signed port would be rejected).
+#
+# Idempotent by `slug`: GET the list, PATCH if the slug already exists, else POST
+# a new backendServers row. Auth is an fsv1_ service token with the
+# admin:servers:write scope.
+#
+# Remnawave panels are registered separately via register_remnawave_panel.yml
+# (FCP stores the panel, not individual nodes).
+
+- name: Validate FCP registration prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - fcp_server_slug is defined and fcp_server_slug | length > 0
+    fail_msg: >-
+      FCP registration requires fcp_api_url, fcp_api_token (an fsv1_ token with
+      the admin:servers:write scope), and fcp_server_slug to be set.
+
+# ---------------------------------------------------------------------------
+# Build the Outline management apiUrl (Caddy-proxied; valid TLS)
+# ---------------------------------------------------------------------------
+- name: Extract Outline API secret from the management apiUrl
+  set_fact:
+    _fcp_api_secret: "{{ outline_api_info.apiUrl | regex_search('/([^/]+)$') | regex_replace('/', '') }}"
+  when: outline_api_info is defined and outline_api_info.apiUrl is defined
+
+- name: Build FCP Outline apiUrl (Caddy-proxied, valid TLS)
+  set_fact:
+    _fcp_outline_api_url: "https://{{ dns_hostname }}{{ outline_api_proxy_path | default('') }}/{{ _fcp_api_secret }}"
+  when: _fcp_api_secret is defined and _fcp_api_secret | length > 0
+
+- name: Fail if the Outline apiUrl could not be determined
+  fail:
+    msg: >-
+      Could not build the Outline management apiUrl for FCP registration
+      (outline_api_info.apiUrl missing or malformed). FCP needs a valid-TLS,
+      Caddy-proxied URL — ensure outline_api_proxy_path is configured so the
+      management API is reachable at https://{{ dns_hostname | default('<host>') }}{{ outline_api_proxy_path | default('/api') }}/<secret>.
+  when: _fcp_outline_api_url is not defined
+
+# ---------------------------------------------------------------------------
+# Choose the WSS edge domain (Fastly edge if fronted, else the origin host)
+# ---------------------------------------------------------------------------
+- name: Set FCP websocketDomain (Fastly-fronted)
+  set_fact:
+    _fcp_ws_domain: "{{ fastly_websocket_domain }}"
+  when:
+    - outline_wss_enabled | default(false) | bool
+    - effective_cdn_provider | default('none') == 'fastly'
+    - fastly_websocket_domain is defined and fastly_websocket_domain | length > 0
+
+- name: Set FCP websocketDomain (origin, no CDN)
+  set_fact:
+    _fcp_ws_domain: "{{ dns_hostname }}"
+  when:
+    - outline_wss_enabled | default(false) | bool
+    - _fcp_ws_domain is not defined
+
+# ---------------------------------------------------------------------------
+# Resolve slug -> id (GET the list) and build the request body
+# ---------------------------------------------------------------------------
+- name: List existing FCP backend servers
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: fcp_servers_list
+
+- name: Find existing FCP entry by slug
+  set_fact:
+    _fcp_existing_id: "{{ (fcp_servers_list.json.response | default([]) | selectattr('slug', 'equalto', fcp_server_slug) | map(attribute='id') | first) | default('') }}"
+
+# websocketDomain is added conditionally (not via omit) so the JSON never leaks
+# Ansible's omit sentinel. On PATCH, only provided fields change — so omitting
+# websocketDomain (e.g. a Fastly host in update mode with no local
+# fastly_websocket_domain) preserves FCP's existing value.
+- name: Build base FCP backend-server body (Outline)
+  set_fact:
+    _fcp_body:
+      backend: "outline"
+      name: "{{ fcp_server_name | default(fcp_server_slug) }}"
+      slug: "{{ fcp_server_slug }}"
+      apiUrl: "{{ _fcp_outline_api_url }}"
+      websocketEnabled: "{{ outline_wss_enabled | default(false) | bool }}"
+
+- name: Add websocketDomain to FCP body (when known)
+  set_fact:
+    _fcp_body: "{{ _fcp_body | combine({'websocketDomain': _fcp_ws_domain}) }}"
+  when: _fcp_ws_domain is defined and _fcp_ws_domain | length > 0
+
+# ---------------------------------------------------------------------------
+# Create or update
+# ---------------------------------------------------------------------------
+- name: Create FCP backend server (Outline)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: "{{ _fcp_body }}"
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true
+  register: fcp_create_result
+  when: _fcp_existing_id | length == 0
+
+- name: Update FCP backend server (Outline, PATCH by id)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/{{ _fcp_existing_id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: "{{ _fcp_body }}"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: fcp_update_result
+  when: _fcp_existing_id | length > 0
+
+- name: Display FCP registration result
+  debug:
+    msg: >-
+      FCP backend server '{{ fcp_server_slug }}' (Outline)
+      {{ 'updated' if (_fcp_existing_id | length > 0) else 'created' }}
+      at {{ fcp_api_url }} — apiUrl host {{ dns_hostname }}.

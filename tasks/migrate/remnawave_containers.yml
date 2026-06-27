@@ -1,0 +1,41 @@
+---
+# tasks/migrate/remnawave_containers.yml - Container management during
+# Remnawave migration.
+
+# Source: tear down the old container.
+- name: Stop and remove remnanode container on source
+  community.docker.docker_compose_v2:
+    project_src: "{{ remnawave_node_install_dir }}.migrated"
+    state: absent
+  become: yes
+  when: inventory_hostname == source_hostname
+  failed_when: false   # If the path is gone (e.g. previous failed run), don't block.
+
+# Destination: pull image (in case it was never seen here) and bring up.
+- name: Pull image on destination
+  community.docker.docker_image:
+    name: "{{ remnawave_node_image }}"
+    source: pull
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Bring up remnanode on destination
+  community.docker.docker_compose_v2:
+    project_src: "{{ remnawave_node_install_dir }}"
+    state: present
+  become: yes
+  when: inventory_hostname == destination_hostname
+
+- name: Wait for NODE_PORT on destination
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ remnawave_node_port }}"
+    timeout: 60
+    delay: 2
+  when: inventory_hostname == destination_hostname
+
+- name: Set Remnawave migrate-success facts on destination
+  set_fact:
+    remnawave_install_success: true
+    component_install_success: true
+  when: inventory_hostname == destination_hostname

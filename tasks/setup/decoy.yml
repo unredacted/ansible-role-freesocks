@@ -1,0 +1,23 @@
+---
+# tasks/setup/decoy.yml
+#
+# Create the decoy/camouflage web root and a plausible static landing page.
+# Caddy serves this on every non-transport path (see remnanode-caddyfile.j2),
+# so a probe of https://<host>/ sees an innocuous "maintenance" site rather than
+# a bare proxy or an error. Idempotent — safe to include from deploy, change,
+# and migrate. The page embeds the (per-node) random_hostname so it is not
+# byte-identical across nodes.
+
+- name: Create decoy web root
+  file:
+    path: "{{ remnawave_decoy_root }}"
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Render decoy index page
+  template:
+    src: decoy-index.html.j2
+    dest: "{{ remnawave_decoy_root }}/index.html"
+    mode: '0644'
+  become: yes

@@ -1,0 +1,45 @@
+---
+# tasks/providers/remnawave/cleanup_hosts.yml
+#
+# Delete the Remnawave Hosts that belonged to the OLD hostname during a
+# hostname rotation (change) or migration. Hosts are matched by their remark
+# prefix ("{old_random_hostname}-"); the NEW Hosts are (re)created by
+# create_hosts.yml under the new hostname. Tolerates 404 (already gone).
+#
+# Requires: old_random_hostname (the pre-rotation / source random part).
+
+- name: List existing Remnawave Hosts (for cleanup)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_cleanup_hosts_list
+  when: old_random_hostname is defined and old_random_hostname | length > 0
+
+- name: Select OLD Host UUIDs by remark prefix
+  set_fact:
+    _old_host_uuids: "{{ remnawave_cleanup_hosts_list.json.response | default([]) | selectattr('remark', 'match', old_random_hostname ~ '-') | map(attribute='uuid') | list }}"
+  when:
+    - old_random_hostname is defined and old_random_hostname | length > 0
+    - remnawave_cleanup_hosts_list.json is defined
+
+- name: Delete OLD Remnawave Hosts
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts/{{ item }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 204, 404]
+  delegate_to: localhost
+  no_log: true
+  loop: "{{ _old_host_uuids | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: _old_host_uuids | default([]) | length > 0

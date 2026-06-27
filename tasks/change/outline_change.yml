@@ -1,0 +1,465 @@
+---
+# tasks/change/change.yml - Change hostname for blocked servers
+# This operation updates DNS, Caddy, and KV store without reinstalling Outline.
+# Used when DNS filtering blocks the current hostname.
+#
+# REQUIRED VARIABLES (via --extra-vars):
+#   change_target_domain: The domain to generate a new hostname for (must exist in domain_providers)
+#
+# REQUIRED CONFIGURATION:
+#   domain_providers: A mapping of domains to their provider configuration
+#
+# Example:
+#   ansible-playbook playbook.yml \
+#     --extra-vars "operation_mode=change environment_mode=prod" \
+#     --extra-vars "change_target_domain=example.app"
+
+# ============================================================================
+# Set per-domain Cloudflare credentials
+# ============================================================================
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[change_target_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
+
+# Set Fastly credentials if CDN provider is Fastly
+- name: Set Fastly credentials for change mode
+  set_fact:
+    fastly_token: "{{ domain_providers[change_target_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Debug change mode credentials
+  debug:
+    msg:
+      - "Target domain: {{ change_target_domain }}"
+
+# ============================================================================
+# STEP 0: Validation (moved to main.yml)
+# ============================================================================
+# Validation and provider setup is now performed in tasks/main.yml
+# before this file is included.
+
+
+# ============================================================================
+# STEP 1: Read existing Outline API info from access.txt
+# ============================================================================
+- name: Check if access.txt exists
+  stat:
+    path: /opt/outline/access.txt
+  register: access_txt_file
+
+- name: Fail if access.txt not found
+  fail:
+    msg: "Cannot find /opt/outline/access.txt - this server may not have Outline installed"
+  when: not access_txt_file.stat.exists
+
+- name: Read access.txt
+  slurp:
+    src: /opt/outline/access.txt
+  register: access_txt_raw
+
+- name: Parse access.txt content
+  set_fact:
+    access_txt_decoded: "{{ access_txt_raw.content | b64decode }}"
+
+- name: Debug access.txt content
+  debug:
+    msg: "access.txt content: {{ access_txt_decoded }}"
+
+# access.txt format is key:value pairs, one per line:
+# certSha256:XXXX
+# apiUrl:https://hostname:port/secret
+- name: Extract API URL from access.txt
+  set_fact:
+    api_url_line: "{{ access_txt_decoded | regex_search('apiUrl:(.+)', '\\1') | first }}"
+
+- name: Fail if API URL not found
+  fail:
+    msg: |
+      Could not find apiUrl in access.txt. File content:
+      {{ access_txt_decoded }}
+  when: api_url_line is not defined or api_url_line == ''
+
+- name: Build outline_api_info object
+  set_fact:
+    outline_api_info:
+      apiUrl: "{{ api_url_line }}"
+      certSha256: "{{ access_txt_decoded | regex_search('certSha256:(.+)', '\\1') | first | default('') }}"
+
+- name: Extract API random string
+  set_fact:
+    api_random_string: "{{ outline_api_info.apiUrl | regex_search('/([^/]+)$') | regex_replace('/', '') }}"
+
+- name: Display current configuration
+  debug:
+    msg:
+      - "Current API URL: {{ outline_api_info.apiUrl }}"
+      - "API Secret: {{ api_random_string }}"
+
+- name: Check if shadowbox_server_config.json exists
+  stat:
+    path: /opt/outline/persisted-state/shadowbox_server_config.json
+  register: shadowbox_config_file
+
+- name: Read shadowbox_server_config.json
+  slurp:
+    src: /opt/outline/persisted-state/shadowbox_server_config.json
+  register: shadowbox_config_raw
+  when: shadowbox_config_file.stat.exists
+
+- name: Parse shadowbox_server_config.json
+  set_fact:
+    shadowbox_config: "{{ shadowbox_config_raw.content | b64decode | from_json }}"
+  when: shadowbox_config_file.stat.exists
+
+- name: Extract hostname from API URL (access.txt)
+  set_fact:
+    access_txt_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^:/]+)', '\\1') | first }}"
+
+- name: Determine effective current hostname
+  set_fact:
+    # Prefer the Caddy domain if it exists in the config (handle partial failures)
+    # Otherwise fallback to the hostname in access.txt
+    current_api_hostname: "{{ shadowbox_config.caddyWebServer.domain | default(access_txt_hostname) }}"
+
+- name: Construct working API URL (forcing port 443)
+  set_fact:
+    current_working_api_url: "https://{{ current_api_hostname }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string }}"
+
+- name: Debug working API URL
+  debug:
+    msg: "Working API URL: {{ current_working_api_url }}"
+
+# ============================================================================
+# STEP 2: Get current hostname from server config
+# ============================================================================
+- name: Get current server config
+  uri:
+    url: "{{ current_working_api_url }}/server"
+    method: GET
+    validate_certs: yes
+  register: current_server_config
+
+- name: Extract current hostname and domain
+  set_fact:
+    old_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') }}"
+    # Extract just the random part (before the first dot)
+    old_random_hostname: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('\\..*$', '') }}"
+    # Extract the old domain (everything after the first dot)
+    old_domain: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('^[^.]+\\.', '') }}"
+
+- name: Display current hostname
+  debug:
+    msg:
+      - "Current hostname: {{ old_hostname }}"
+      - "Current random part: {{ old_random_hostname }}"
+      - "Current domain: {{ old_domain }}"
+      - "Changing to new domain: {{ change_target_domain }}"
+
+# ============================================================================
+# STEP 3: Generate new random hostname for target domain
+# ============================================================================
+- name: Install wamerican package for word list
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+  when: custom_hostname is not defined
+
+- name: Get random words from system dictionary
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n {{ hostname_word_count }}'
+  register: random_words
+  when: custom_hostname is not defined
+
+- name: Set new hostnames for target domain (generated)
+  set_fact:
+    random_hostname: "{{ random_words.stdout_lines | join('-') }}"
+    dns_hostname: "{{ random_words.stdout_lines | join('-') }}.{{ change_target_domain }}"
+    kv_hostname: "{{ random_words.stdout_lines | join('-') }}"
+    # Override base_domain for this operation to use the target domain
+    base_domain: "{{ change_target_domain }}"
+    # Override api_domain and prom_domain for KV store operations
+    api_domain: "{{ change_target_domain }}"
+    prom_domain: "{{ change_target_domain }}"
+    # Override zone ID for DNS and tunnel operations
+    cloudflare_zone_id: "{{ effective_zone_id }}"
+  when: custom_hostname is not defined
+
+- name: Set new hostnames for target domain (custom)
+  set_fact:
+    random_hostname: "{{ custom_hostname }}"
+    dns_hostname: "{{ custom_hostname }}.{{ change_target_domain }}"
+    kv_hostname: "{{ custom_hostname }}"
+    # Override base_domain for this operation to use the target domain
+    base_domain: "{{ change_target_domain }}"
+    # Override api_domain and prom_domain for KV store operations
+    api_domain: "{{ change_target_domain }}"
+    prom_domain: "{{ change_target_domain }}"
+    # Override zone ID for DNS and tunnel operations
+    cloudflare_zone_id: "{{ effective_zone_id }}"
+  when: custom_hostname is defined
+
+- name: Display new hostname configuration
+  debug:
+    msg:
+      - "New random hostname: {{ random_hostname }}"
+      - "New full DNS hostname: {{ dns_hostname }}"
+      - "New KV hostname: {{ kv_hostname }}"
+
+# ============================================================================
+# STEP 4: Delete any existing DNS records for the new hostname (prevent conflicts)
+# ============================================================================
+- name: Get existing DNS records for new hostname (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ effective_zone_id }}/dns_records?name={{ dns_hostname }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+      
+    status_code: 200
+  delegate_to: localhost
+  register: existing_dns_records
+  when: effective_dns_provider == 'cloudflare'
+
+- name: Delete existing DNS records for new hostname (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ effective_zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+      
+    status_code: 200
+  delegate_to: localhost
+  loop: "{{ existing_dns_records.json.result | default([]) }}"
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - existing_dns_records.json.result | default([]) | length > 0
+
+- name: Display cleaned up existing records
+  debug:
+    msg: "Deleted {{ existing_dns_records.json.result | default([]) | length }} existing DNS records for {{ dns_hostname }}"
+  when: effective_dns_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 5: Create new DNS records (provider-specific)
+# ============================================================================
+# Clean up old Fastly service before creating new one
+- name: Include Fastly cleanup tasks
+  include_tasks: ../providers/fastly/cleanup.yml
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+# Override dns_proxied when Fastly is CDN (avoid double-CDN)
+- name: Override dns_proxied for Fastly CDN (change mode)
+  set_fact:
+    dns_proxied: false
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+# Origin DNS records are ALWAYS needed (Caddy TLS, health checks, Fastly backend)
+- name: Include DNS tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/dns.yml
+  when:
+    - effective_dns_provider == 'cloudflare'
+
+# Fastly CDN service creation + WebSocket enablement
+- name: Include Fastly CDN service tasks (change mode)
+  include_tasks: ../providers/fastly/service.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - outline_wss_enabled | default(false) | bool
+
+# Fastly TLS subscription (custom domain mode only)
+- name: Include Fastly TLS tasks (change mode, custom domain)
+  include_tasks: ../providers/fastly/tls.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+# DNS CNAME to Fastly edge (custom domain mode only)
+- name: Include Fastly DNS tasks (change mode, custom domain)
+  include_tasks: ../providers/fastly/dns.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - effective_dns_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 7: Update server hostname (internal)
+# ============================================================================
+# We update the internal hostname FIRST so that if the subsequent Caddy update
+# fails or disrupts connectivity, the server internally knows its new identity.
+- name: Update server hostname
+  uri:
+    url: "{{ current_working_api_url }}/server/hostname-for-access-keys"
+    method: PUT
+    body_format: json
+    body:
+      hostname: "{{ dns_hostname }}"
+    validate_certs: yes
+    status_code: 204
+  register: hostname_update_result
+
+- name: Display hostname update result
+  debug:
+    msg: "Server hostname updated to: {{ dns_hostname }}"
+
+# ============================================================================
+# STEP 8: Update Caddy domain via Outline API
+# ============================================================================
+- name: Set effective Caddy domain
+  set_fact:
+    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname, true) }}"
+
+- name: Update Caddy web server domain
+  uri:
+    url: "{{ current_working_api_url }}/server/web-server"
+    method: PUT
+    body_format: json
+    body:
+      enabled: true
+      autoHttps: "{{ outline_caddy_auto_https }}"
+      email: "{{ outline_caddy_email }}"
+      domain: "{{ effective_caddy_domain }}"
+      apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
+    validate_certs: yes
+    status_code: 204
+  register: caddy_update_result
+
+- name: Display Caddy update result
+  debug:
+    msg: "Caddy domain updated to: {{ effective_caddy_domain }}"
+
+# ============================================================================
+# STEP 9: Update local configuration files
+# ============================================================================
+- name: Update hostname in shadowbox_server_config.json
+  ansible.builtin.shell: |
+    jq '.hostname = "{{ dns_hostname }}" | .caddyWebServer.domain = "{{ effective_caddy_domain }}"' /opt/outline/persisted-state/shadowbox_server_config.json > /tmp/shadowbox_server_config.json.tmp && \
+    mv /tmp/shadowbox_server_config.json.tmp /opt/outline/persisted-state/shadowbox_server_config.json
+  become: yes
+
+- name: Update hostname in access.txt
+  ansible.builtin.replace:
+    path: /opt/outline/access.txt
+    regexp: '{{ old_hostname | regex_escape }}'
+    replace: '{{ dns_hostname }}'
+  become: yes
+  when: old_hostname != ''
+
+- name: Update hostname in Caddy config
+  ansible.builtin.replace:
+    path: /opt/outline/persisted-state/outline-caddy/config.yaml
+    regexp: '{{ old_hostname | regex_escape }}'
+    replace: '{{ dns_hostname }}'
+  become: yes
+  when: old_hostname != ''
+
+- name: Display local files updated
+  debug:
+    msg: "Local config files updated with new hostname: {{ dns_hostname }}"
+
+# ============================================================================
+# STEP 10: Restart container to apply changes
+# ============================================================================
+- name: Stop shadowbox container
+  docker_container:
+    name: shadowbox
+    state: stopped
+  become: yes
+
+- name: Start shadowbox container
+  ansible.builtin.shell: /bin/bash /opt/outline/persisted-state/start_container.sh
+  become: yes
+
+- name: Build new API URL for health check
+  set_fact:
+    # Construct proper URL: https://hostname/api/secret (no port, uses Caddy proxy path)
+    new_api_url: "https://{{ dns_hostname }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string }}"
+
+- name: Debug new API URL
+  debug:
+    msg:
+      - "Old API URL: {{ outline_api_info.apiUrl }}"
+      - "New API URL: {{ new_api_url }}"
+
+- name: Wait for container to be healthy
+  uri:
+    url: "{{ new_api_url }}/server"
+    method: GET
+    validate_certs: yes
+    status_code: 200
+  register: health_check
+  retries: 10
+  delay: 5
+  until: health_check.status == 200
+
+- name: Display container restart complete
+  debug:
+    msg: "Container restarted and API accessible at: {{ new_api_url }}"
+
+# ============================================================================
+# STEP 11: Re-register rotated server with FCP
+# ============================================================================
+# Re-register the rotated server with FCP so it learns the new apiUrl.
+# FCP stores the management apiUrl and dials out; register_server.yml builds
+# the Caddy-proxied URL from the new dns_hostname. Idempotent by slug.
+- name: Re-register Outline server with FCP (hostname rotated)
+  include_tasks: ../providers/fcp/register_server.yml
+  when: fcp_enabled | default(false) | bool
+
+# ============================================================================
+# STEP 12: Clean up old DNS records (optional)
+# ============================================================================
+- name: Delete old DNS A records (Cloudflare)
+  block:
+    - name: Get existing DNS records
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records?name={{ old_hostname }}"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ cf_token }}"
+          
+        status_code: 200
+      delegate_to: localhost
+      register: old_dns_records
+
+    - name: Delete old DNS records
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ cf_token }}"
+          
+        status_code: 200
+      delegate_to: localhost
+      loop: "{{ old_dns_records.json.result }}"
+      when: old_dns_records.json.result | length > 0
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - change_delete_old_dns | default(true) | bool
+    - old_hostname != ''
+    - old_hostname != dns_hostname   # never delete the records we just wrote
+
+# ============================================================================
+# COMPLETE
+# ============================================================================
+- name: Display change completion summary
+  debug:
+    msg:
+      - "✨ Hostname Change Complete ✨"
+      - ""
+      - "🔄 Migration Summary"
+      - "--------------------"
+      - "❌ Old Hostname: {{ old_hostname }}"
+      - "✅ New Hostname: {{ dns_hostname }}"
+      - ""
+      - "📝 Configuration"
+      - "------------------"
+      - "🌐 Caddy Domain: {{ effective_caddy_domain }}"
+      - "🔑 FCP Slug:     {{ fcp_server_slug | default(random_hostname) }}"
+      - ""
+      - "🚀 Status: Server is accessible at the new hostname."
+      - "🗑️  Cleanup: Old DNS records have been {{ 'deleted' if (change_delete_old_dns | default(true)) else 'preserved' }}."

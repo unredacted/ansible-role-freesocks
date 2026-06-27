@@ -1,0 +1,85 @@
+---
+# tasks/providers/remnawave/create_hosts.yml
+#
+# Create one Remnawave Host per enabled CDN transport. Hosts are what produce
+# the client subscription line — without them, a registered node's keys never
+# reach subscriptions. Each Host binds a Config Profile inbound to a
+# client-facing endpoint (the Fastly edge domain when fronted).
+#
+# Idempotent: GET /api/hosts first, then POST only for transports whose `remark`
+# is absent (also tolerate 409). Verified against Remnawave panel API v2.7.4 —
+# the create body nests the inbound under
+# `inbound: {configProfileUuid, configProfileInboundUuid}` and requires an
+# integer `port`; the Host inherits its transport (ws/xhttp) from the inbound.
+
+- name: Validate Host-creation prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid | length > 0
+      - fastly_websocket_domain is defined and fastly_websocket_domain | length > 0
+    fail_msg: >-
+      Host creation requires remnawave_panel_api_token,
+      remnawave_panel_config_profile_uuid, and a CDN edge domain
+      (fastly_websocket_domain). Ensure register_node and the Fastly service
+      ran first.
+  no_log: true
+
+- name: List existing Remnawave Hosts
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_hosts_list
+
+- name: Compute existing Host remarks
+  set_fact:
+    _existing_host_remarks: "{{ remnawave_hosts_list.json.response | default([]) | map(attribute='remark') | list }}"
+
+- name: Create a Remnawave Host per enabled CDN transport
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      inbound:
+        configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
+        configProfileInboundUuid: "{{ item.inbound_uuid }}"
+      remark: "{{ random_hostname }}-{{ item.name }}"
+      address: "{{ fastly_websocket_domain }}"
+      port: 443
+      path: "{{ item.path }}"
+      sni: "{{ fastly_websocket_domain }}"
+      host: "{{ fastly_websocket_domain }}"
+      alpn: "{{ item.alpn | default('http/1.1') }}"
+      fingerprint: "{{ item.fingerprint | default('chrome') }}"
+      securityLayer: "TLS"
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_host_results
+  loop: "{{ remnawave_cdn_transports }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - item.enabled | default(true) | bool
+    - item.inbound_uuid | default('') | length > 0
+    - (random_hostname ~ '-' ~ item.name) not in _existing_host_remarks
+
+- name: Summarize Host creation
+  debug:
+    msg: >-
+      Remnawave Hosts ensured for enabled transports
+      [{{ remnawave_cdn_transports | selectattr('enabled') | map(attribute='name') | join(', ') }}]
+      at edge {{ fastly_websocket_domain }} (remark prefix '{{ random_hostname }}-').

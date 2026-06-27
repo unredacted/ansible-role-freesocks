@@ -45,7 +45,6 @@
         domain_providers:
           {{ slipstream_base_domain }}:
             dns_provider: cloudflare
-            tunnel_provider: none
             zone_id: "your-zone-id"
   when:
     - slipstream_base_domain is defined

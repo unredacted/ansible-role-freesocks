@@ -1,0 +1,43 @@
+---
+# tasks/providers/remnawave/update_node.yml
+# Update an existing node entry on the panel via PATCH {{ panel_url }}/api/nodes.
+#
+# Note: PATCH is on the collection root, not /api/nodes/{uuid}. The body
+# carries the uuid plus any fields to change.
+#
+# Used by change mode (rotate hostname → PATCH address) and migrate mode
+# (move node to new IP → PATCH address).
+
+- name: Validate update prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token is defined
+      - remnawave_panel_api_token | length > 0
+      - remnawave_node_uuid is defined
+      - remnawave_node_uuid | length > 0
+    fail_msg: |
+      Node update requires remnawave_panel_api_token (vault) and a known
+      remnawave_node_uuid (read from /opt/remnanode/.node_uuid in update/
+      change/migrate flows).
+
+- name: PATCH node on Panel
+  uri:
+    url: "{{ remnawave_panel_url }}/api/nodes"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      uuid: "{{ remnawave_node_uuid }}"
+      address: "{{ dns_hostname }}"
+      port: "{{ remnawave_node_port | int }}"
+    status_code: 200
+    return_content: yes
+  register: remnawave_update_response
+  delegate_to: localhost
+  no_log: true   # request carries the panel API bearer token
+
+- name: Log node update
+  debug:
+    msg: "Updated node uuid={{ remnawave_node_uuid }} address={{ dns_hostname }} port={{ remnawave_node_port }}"

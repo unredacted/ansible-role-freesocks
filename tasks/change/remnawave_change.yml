@@ -1,0 +1,292 @@
+---
+# tasks/change/remnawave_change.yml - Hostname rotation for Remnawave nodes.
+#
+# Steps:
+#   1. Read OLD hostname from {{ remnawave_node_install_dir }}/.hostname
+#      (and OLD UUID from .node_uuid if present).
+#   2. Generate NEW hostname (dictionary words or custom_hostname).
+#   3. Create NEW DNS records pointing to this host.
+#   4. Re-template /opt/remnanode/.hostname (and Caddyfile if Caddy is enabled).
+#   5. Update Panel-side `address` via PATCH /api/nodes when register_node is on.
+#      Otherwise emit a clear manual-step warning. (The panel feeds FCP; the role
+#      does not touch FCP for Remnawave node rotation.)
+#   6. Optionally delete OLD DNS records.
+#
+# Container restart is normally NOT required — Remnawave has no internal
+# hostname state. However, if Caddy is enabled we reload the Caddyfile
+# (handler picks it up) so the new hostname's cert is provisioned.
+
+# ============================================================================
+# STEP 0: per-domain credentials
+# ============================================================================
+- name: Set domain-specific Cloudflare credentials
+  set_fact:
+    cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_account_id: "{{ domain_providers[change_target_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
+
+# ============================================================================
+# STEP 1: Read existing state
+# ============================================================================
+- name: Stat OLD hostname file
+  stat:
+    path: "{{ remnawave_node_install_dir }}/.hostname"
+  register: old_hostname_file_stat
+  become: yes
+
+- name: Fail if .hostname missing and no old_dns_hostname override given
+  fail:
+    msg: >-
+      {{ remnawave_node_install_dir }}/.hostname not found. This Remnawave host
+      predates hostname persistence or was installed manually. Re-supply the
+      current FQDN via --extra-vars old_dns_hostname=<fqdn>, or re-deploy.
+  when:
+    - not old_hostname_file_stat.stat.exists
+    - old_dns_hostname is not defined
+
+- name: Read OLD hostname from disk
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.hostname"
+  register: old_hostname_raw
+  become: yes
+  when: old_hostname_file_stat.stat.exists
+
+- name: Set OLD hostname facts (from disk)
+  set_fact:
+    old_dns_hostname: "{{ old_hostname_raw.content | b64decode | trim }}"
+    old_random_hostname: "{{ (old_hostname_raw.content | b64decode | trim).split('.')[0] }}"
+    old_base_domain: "{{ (old_hostname_raw.content | b64decode | trim).split('.')[1:] | join('.') }}"
+  when: old_hostname_file_stat.stat.exists
+
+- name: Set OLD hostname facts (from old_dns_hostname override)
+  set_fact:
+    old_random_hostname: "{{ old_dns_hostname.split('.')[0] }}"
+    old_base_domain: "{{ old_dns_hostname.split('.')[1:] | join('.') }}"
+  when:
+    - not old_hostname_file_stat.stat.exists
+    - old_dns_hostname is defined
+
+- name: Read OLD node UUID (if present)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.node_uuid"
+  register: old_uuid_raw
+  become: yes
+  failed_when: false
+
+- name: Set OLD node UUID fact
+  set_fact:
+    remnawave_node_uuid: "{{ old_uuid_raw.content | b64decode | trim }}"
+  when:
+    - old_uuid_raw.content is defined
+    - (old_uuid_raw.content | b64decode | trim) | length > 0
+
+- name: Debug existing state
+  debug:
+    msg:
+      - "Old hostname: {{ old_dns_hostname }}"
+      - "Old random part: {{ old_random_hostname }}"
+      - "Old base domain: {{ old_base_domain }}"
+      - "Old node UUID: {{ remnawave_node_uuid | default('(none — register_node was not used at deploy)') }}"
+
+# ============================================================================
+# STEP 2: Generate NEW hostname
+# ============================================================================
+- name: Install wamerican package for word list
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+  when: custom_hostname is not defined
+
+- name: Get random words from system dictionary
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n {{ hostname_word_count }}'
+  register: random_words
+  when: custom_hostname is not defined
+
+- name: Set NEW hostname facts (random)
+  set_fact:
+    random_hostname: "{{ random_words.stdout_lines | join('-') }}"
+    dns_hostname: "{{ random_words.stdout_lines | join('-') }}.{{ change_target_domain }}"
+    kv_hostname: "{{ random_words.stdout_lines | join('-') }}"
+  when: custom_hostname is not defined
+
+- name: Set NEW hostname facts (custom)
+  set_fact:
+    random_hostname: "{{ custom_hostname }}"
+    dns_hostname: "{{ custom_hostname }}.{{ change_target_domain }}"
+    kv_hostname: "{{ custom_hostname }}"
+  when: custom_hostname is defined
+
+- name: Override base_domain to NEW target
+  set_fact:
+    base_domain: "{{ change_target_domain }}"
+    api_domain: "{{ change_target_domain }}"
+    prom_domain: "{{ change_target_domain }}"
+
+- name: Debug NEW hostname
+  debug:
+    msg:
+      - "New hostname: {{ dns_hostname }}"
+      - "New random part: {{ random_hostname }}"
+
+# ============================================================================
+# STEP 3: Create NEW DNS records
+# ============================================================================
+- name: Override dns_proxied for Fastly CDN (avoid double-CDN)
+  set_fact:
+    dns_proxied: false
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Include DNS tasks (Cloudflare)
+  include_tasks: ../providers/cloudflare/dns.yml
+  when: effective_dns_provider == 'cloudflare'
+
+# ============================================================================
+# STEP 4: Update local hostname file + Caddyfile
+# ============================================================================
+- name: Update persisted hostname file
+  copy:
+    content: "{{ dns_hostname }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.hostname"
+    mode: '0640'
+  become: yes
+
+- name: Ensure decoy site exists before re-render
+  include_tasks: ../setup/decoy.yml
+  when: remnawave_caddy_enabled | default(false) | bool
+
+- name: Re-render Caddyfile with new hostname
+  template:
+    src: remnanode-caddyfile.j2
+    dest: /etc/caddy/Caddyfile
+    mode: '0644'
+    validate: "caddy validate --config %s --adapter caddyfile"
+  become: yes
+  notify: reload caddy
+  when: remnawave_caddy_enabled | default(false) | bool
+
+- name: Flush handlers (reload Caddy now)
+  meta: flush_handlers
+
+# ============================================================================
+# STEP 4b: Fastly service rotation + Host re-pointing (Fastly-fronted only)
+# ============================================================================
+# The rotated hostname changes the Fastly edge domain, so the old Fastly service
+# and the old Hosts are stale. Delete the old Host entries + old Fastly service,
+# create a fresh service for the new hostname, then create new Hosts pointing at
+# the new edge. Mirrors the Outline change-mode Fastly block.
+- name: Set Fastly service-id persistence dir (Remnawave)
+  set_fact:
+    fastly_service_id_dir: "{{ remnawave_node_install_dir }}"
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set Fastly credentials for change mode
+  set_fact:
+    fastly_token: "{{ domain_providers[change_target_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Clean up OLD Remnawave Hosts on the panel
+  include_tasks: ../providers/remnawave/cleanup_hosts.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - remnawave_panel_register_node | default(false) | bool
+
+- name: Delete OLD Fastly service
+  include_tasks: ../providers/fastly/cleanup.yml
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Create NEW Fastly service for the rotated hostname
+  include_tasks: ../providers/fastly/service.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - remnawave_caddy_enabled | default(false) | bool
+
+- name: Fastly TLS subscription (custom domain mode)
+  include_tasks: ../providers/fastly/tls.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Fastly edge CNAME (custom domain mode)
+  include_tasks: ../providers/fastly/dns.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - effective_dns_provider == 'cloudflare'
+
+- name: Create NEW Remnawave Hosts for the rotated hostname
+  include_tasks: ../providers/remnawave/create_hosts.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - remnawave_panel_register_node | default(false) | bool
+
+# ============================================================================
+# STEP 5: Update Panel-side address
+# ============================================================================
+- name: Update node address on Panel
+  include_tasks: ../providers/remnawave/update_node.yml
+  when:
+    - remnawave_panel_register_node | default(false) | bool
+    - remnawave_node_uuid is defined
+    - remnawave_node_uuid | length > 0
+
+- name: Warn that Panel must be updated manually
+  debug:
+    msg: |
+      ⚠️  Manual step required:
+      remnawave_panel_register_node is false (or no .node_uuid was found).
+      Open the Panel UI → Nodes → find the entry for {{ old_dns_hostname }}
+      and update its 'Address' field to '{{ dns_hostname }}'.
+      The role cannot do this automatically without Panel API access.
+  when: >-
+    not (remnawave_panel_register_node | default(false) | bool)
+    or remnawave_node_uuid is not defined
+    or remnawave_node_uuid | length == 0
+
+# ============================================================================
+# STEP 6: Optional cleanup of old DNS records
+# ============================================================================
+# Server-side ?name= filter (mirrors outline_change.yml) returns only records
+# for the exact old hostname — Remnawave creates no -api/-prom subdomains
+# (no tunnel), so exact-name is complete and avoids client-side regex matching.
+# Note: Remnawave hostname rotation does NOT touch FCP. FCP holds only the panel
+# (baseUrl+apiToken), which is unchanged; the node's NEW address is pushed to the
+# panel via the update_node PATCH in STEP 5, and the panel feeds FCP.
+- name: Get OLD-domain DNS records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records?name={{ old_dns_hostname }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  register: old_dns_records
+  when:
+    - change_delete_old_dns | default(true) | bool
+    - old_base_domain in domain_providers
+    - old_dns_hostname != dns_hostname
+
+- name: Delete OLD DNS records for {{ old_dns_hostname }}
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  loop: "{{ old_dns_records.json.result | default([]) }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.type }})"
+  when:
+    - change_delete_old_dns | default(true) | bool
+    - old_base_domain in domain_providers
+    - old_dns_records is defined
+    - old_dns_records.json is defined
+    - old_dns_hostname != dns_hostname
+
+- name: Display change summary
+  debug:
+    msg: |
+      Hostname rotation complete!
+
+      Old: {{ old_dns_hostname }}
+      New: {{ dns_hostname }}

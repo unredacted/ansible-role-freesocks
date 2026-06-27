@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ (random_hostname | default('site')) | replace('-', ' ') | title }}</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+           background: #f7f7f9; color: #333; margin: 0; }
+    .wrap { max-width: 640px; margin: 12vh auto; padding: 2rem; text-align: center; }
+    h1 { font-weight: 600; font-size: 1.7rem; margin: 0 0 .5rem; }
+    p { color: #666; line-height: 1.6; }
+    .accent { color: #4a90d9; }
+    footer { margin-top: 2.5rem; font-size: .8rem; color: #aaa; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>We&rsquo;ll be back soon<span class="accent">.</span></h1>
+    <p>This site is undergoing scheduled maintenance and will be available again
+       shortly. Thank you for your patience.</p>
+    <footer>Ref: {{ random_hostname | default('site') }}</footer>
+  </div>
+</body>
+</html>

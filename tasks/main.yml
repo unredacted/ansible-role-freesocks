@@ -42,7 +42,7 @@
 # ============================================================================
 # VALIDATION: Provider Configuration
 # ============================================================================
-# Note: For change, deploy, and update modes, dns_provider and tunnel_provider are derived from domain_providers
+# Note: For change, deploy, and update modes, dns_provider is derived from domain_providers
 - name: Fail if dns_provider is not specified
   fail:
     msg: "dns_provider must be explicitly set (e.g., 'cloudflare')"
@@ -58,21 +58,6 @@
     - dns_provider is defined
     - dns_provider not in ['cloudflare']
 
-- name: Fail if tunnel_provider is not specified
-  fail:
-    msg: "tunnel_provider must be explicitly set (e.g., 'cloudflare' or 'none')"
-  when:
-    - operation_mode not in ['change', 'deploy', 'update']
-    - tunnel_provider is not defined or tunnel_provider == ""
-
-- name: Fail if tunnel_provider is invalid
-  fail:
-    msg: "tunnel_provider must be 'cloudflare' or 'none', got: {{ tunnel_provider }}"
-  when:
-    - operation_mode not in ['change', 'deploy', 'update']
-    - tunnel_provider is defined
-    - tunnel_provider not in ['cloudflare', 'none']
-
 - name: Fail if cdn_provider is invalid (when explicitly set)
   fail:
     msg: "cdn_provider must be 'cloudflare', 'fastly', or 'none', got: {{ cdn_provider }}"
@@ -80,16 +65,6 @@
     - operation_mode not in ['change', 'deploy', 'update']
     - cdn_provider is defined
     - cdn_provider not in ['cloudflare', 'fastly', 'none']
-
-- name: Fail if kv_provider is not specified
-  fail:
-    msg: "kv_provider must be explicitly set (e.g., 'cloudflare')"
-  when: kv_provider is not defined or kv_provider == ""
-
-- name: Fail if kv_provider is invalid
-  fail:
-    msg: "kv_provider must be 'cloudflare', got: {{ kv_provider }}"
-  when: kv_provider not in ['cloudflare']
 
 # ============================================================================
 # VALIDATION: Deploy Mode (New)
@@ -127,7 +102,6 @@
   set_fact:
     target_domain_config: "{{ domain_providers[deploy_target_domain] }}"
     effective_dns_provider: "{{ domain_providers[deploy_target_domain].dns_provider }}"
-    effective_tunnel_provider: "{{ domain_providers[deploy_target_domain].tunnel_provider | default('none') }}"
     effective_cdn_provider: "{{ domain_providers[deploy_target_domain].cdn_provider | default('none') }}"
     effective_fastly_domain_mode: "{{ domain_providers[deploy_target_domain].fastly_domain_mode | default('shared') }}"
     effective_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
@@ -147,22 +121,6 @@
     - operation_mode == 'deploy'
     - effective_cdn_provider | default('none') == 'fastly'
     - domain_providers[deploy_target_domain].fastly_api_token | default(fastly_api_token | default('')) == ''
-
-# ============================================================================
-# KV NAMESPACE SETUP (provider-specific)
-# ============================================================================
-- name: Set effective KV namespaces based on environment mode (Cloudflare)
-  set_fact:
-    cloudflare_api_kv_namespace: "{{ cloudflare_api_kv_namespace_dev if environment_mode == 'dev' else cloudflare_api_kv_namespace_prod }}"
-    cloudflare_prom_kv_namespace: "{{ cloudflare_prom_kv_namespace_dev if environment_mode == 'dev' else cloudflare_prom_kv_namespace_prod }}"
-  when: kv_provider == 'cloudflare'
-
-- name: Fail if Cloudflare KV namespaces are not configured
-  fail:
-    msg: "KV namespaces must be configured. Set cloudflare_api_kv_namespace_{{ environment_mode }} and cloudflare_prom_kv_namespace_{{ environment_mode }}"
-  when: 
-    - kv_provider == 'cloudflare'
-    - cloudflare_api_kv_namespace is not defined or cloudflare_api_kv_namespace == "" or cloudflare_prom_kv_namespace is not defined or cloudflare_prom_kv_namespace == ""
 
 # ============================================================================
 # VALIDATION & SETUP: Change Mode
@@ -199,7 +157,6 @@
   set_fact:
     target_domain_config: "{{ domain_providers[change_target_domain] }}"
     effective_dns_provider: "{{ domain_providers[change_target_domain].dns_provider }}"
-    effective_tunnel_provider: "{{ domain_providers[change_target_domain].tunnel_provider | default('none') }}"
     effective_cdn_provider: "{{ domain_providers[change_target_domain].cdn_provider | default('none') }}"
     effective_fastly_domain_mode: "{{ domain_providers[change_target_domain].fastly_domain_mode | default('shared') }}"
     effective_zone_id: "{{ domain_providers[change_target_domain].zone_id }}"
@@ -211,11 +168,7 @@
       - "Operation Mode: {{ operation_mode }}"
       - "Environment Mode: {{ environment_mode }}"
       - "DNS Provider: {{ effective_dns_provider | default(dns_provider) | default('pending') }}"
-      - "Tunnel Provider: {{ effective_tunnel_provider | default(tunnel_provider) | default('pending') }}"
       - "CDN Provider: {{ effective_cdn_provider | default('none') }}"
-      - "KV Provider: {{ kv_provider }}"
-      - "API KV Namespace: {{ cloudflare_api_kv_namespace | default('N/A') }}"
-      - "Prom KV Namespace: {{ cloudflare_prom_kv_namespace | default('N/A') }}"
       - "Deploy Target Domain: {{ deploy_target_domain | default('N/A') }}"
   when: operation_mode != 'update'  # Update mode sets these later
 
@@ -230,32 +183,75 @@
       fail:
         msg: |
           No components selected for deployment!
-          Set at least one of: outline_enabled=true, slipstream_enabled=true
+          Set at least one of: outline_enabled=true, remnawave_enabled=true, slipstream_enabled=true
       when:
         - not (outline_enabled | default(true) | bool)
+        - not (remnawave_enabled | default(false) | bool)
         - not (slipstream_enabled | default(false) | bool)
+
+    - name: Fail if both outline_enabled and remnawave_enabled are true
+      fail:
+        msg: |
+          outline_enabled and remnawave_enabled are mutually exclusive — a host runs
+          one VPN backend or the other, not both. Disable one before deploying.
+      when:
+        - outline_enabled | default(true) | bool
+        - remnawave_enabled | default(false) | bool
 
     - name: Validate slipstream configuration
       fail:
         msg: |
           Invalid slipstream configuration: slipstream_mode=shadowsocks requires outline_enabled=true.
+          With remnawave_enabled=true, use slipstream_mode=raw (microsocks-backed) instead.
           Either set outline_enabled=true or use slipstream_mode=raw.
       when:
         - slipstream_enabled | default(false) | bool
         - slipstream_mode | default('shadowsocks') == 'shadowsocks'
         - not (outline_enabled | default(true) | bool)
 
-    # Check for existing installation
+    # Check for existing installation (cross-check requested vs detected component)
     - name: Check if /opt/outline already exists
       stat:
         path: /opt/outline
       register: outline_path
+
+    - name: Check if /opt/remnanode already exists
+      stat:
+        path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+      register: remnanode_path
 
     - name: Fail if /opt/outline already exists when deploying Outline
       fail:
         msg: "Cannot deploy Outline: /opt/outline already exists. Please remove it first or use migration mode."
       when:
         - outline_enabled | default(true) | bool
+        - outline_path.stat.exists
+
+    - name: Fail if Remnawave already deployed when deploying Remnawave
+      fail:
+        msg: |
+          Cannot deploy Remnawave: {{ remnawave_node_install_dir }}/docker-compose.yml already exists.
+          Use update mode or set force_reinstall_remnawave=true to recreate the container.
+      when:
+        - remnawave_enabled | default(false) | bool
+        - remnanode_path.stat.exists
+
+    - name: Fail if deploying Outline on a host with Remnawave installed
+      fail:
+        msg: |
+          Cannot deploy Outline: {{ remnawave_node_install_dir }} contains a Remnawave node installation.
+          Outline and Remnawave are mutually exclusive per host.
+      when:
+        - outline_enabled | default(true) | bool
+        - remnanode_path.stat.exists
+
+    - name: Fail if deploying Remnawave on a host with Outline installed
+      fail:
+        msg: |
+          Cannot deploy Remnawave: /opt/outline contains an Outline installation.
+          Outline and Remnawave are mutually exclusive per host.
+      when:
+        - remnawave_enabled | default(false) | bool
         - outline_path.stat.exists
 
     # Generate hostname
@@ -302,37 +298,14 @@
           - "KV Hostname: {{ kv_hostname }}"
           - "Components:"
           - "  - Outline: {{ outline_enabled | default(true) | bool }}"
+          - "  - Remnawave: {{ remnawave_enabled | default(false) | bool }}"
           - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
           - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
 
-    # Provider-specific installation (tunnel setup)
-    - name: Include Cloudflare installation tasks
-      include_tasks: providers/cloudflare/install.yml
-      when: effective_tunnel_provider == 'cloudflare'
-
-    # Base installation (common packages)
-    - name: Include base installation tasks
-      include_tasks: setup/install.yml
-
-    # =========================================================================
-    # COMPONENT: Outline Shadowsocks Server
-    # =========================================================================
-    - name: Install Outline server component
-      block:
-        - name: Include Outline server tasks
-          include_tasks: setup/outline.yml
-
-        - name: Debug Outline installation success
-          debug:
-            msg: "Outline installation success: {{ outline_install_success }}"
-      when: outline_enabled | default(true) | bool
-
-    - name: Set outline_install_success for non-Outline deployments
-      set_fact:
-        outline_install_success: true
-      when: not (outline_enabled | default(true) | bool)
-
-    # Provider-specific DNS setup
+    # Provider-specific DNS setup — MUST run before component install.
+    # The Outline installer's post-install self-check curls the API hostname.
+    # If DNS records don't exist yet, the target's resolver caches the failure
+    # (EAI_NODATA / negative cache) and downstream API health checks fail.
     # Origin DNS records are ALWAYS needed, even with Fastly CDN, because:
     #   1. Caddy needs to resolve the hostname for Let's Encrypt certificate issuance
     #   2. API health checks need DNS resolution
@@ -347,16 +320,60 @@
 
     - name: Include DNS tasks (Cloudflare)
       include_tasks: providers/cloudflare/dns.yml
-      when: 
-        - outline_install_success | bool
+      when:
         - effective_dns_provider == 'cloudflare'
 
-    # Provider-specific tunnel setup
-    - name: Include tunnel tasks (Cloudflare)
-      include_tasks: providers/cloudflare/tunnel.yml
-      when: 
-        - outline_install_success | bool
-        - effective_tunnel_provider == 'cloudflare'
+    # Base installation (common packages)
+    - name: Include base installation tasks
+      include_tasks: setup/install.yml
+
+    # Docker engine — Remnawave needs it standalone; Outline's installer handles
+    # its own Docker but running this first makes the dependency explicit and
+    # is idempotent against the installer.
+    - name: Install Docker
+      include_tasks: setup/docker.yml
+      when:
+        - remnawave_enabled | default(false) | bool
+
+    # =========================================================================
+    # COMPONENT: Outline Shadowsocks Server
+    # =========================================================================
+    - name: Install Outline server component
+      block:
+        - name: Include Outline server tasks
+          include_tasks: setup/outline.yml
+
+        - name: Debug Outline installation success
+          debug:
+            msg: "Outline installation success: {{ outline_install_success }}"
+      when: outline_enabled | default(true) | bool
+
+    # =========================================================================
+    # COMPONENT: Remnawave Node
+    # =========================================================================
+    - name: Install Remnawave node component
+      include_tasks: setup/remnawave.yml
+      when: remnawave_enabled | default(false) | bool
+
+    # Unified component-install gate. Set after either install path runs.
+    # Outline path sets outline_install_success in setup/outline.yml.
+    # Remnawave path sets component_install_success in setup/remnawave.yml.
+    # Slipstream-only deployments (no Outline, no Remnawave) need both facts
+    # set so downstream gates pass.
+    - name: Set component_install_success after Outline path
+      set_fact:
+        component_install_success: true
+      when:
+        - outline_enabled | default(true) | bool
+        - outline_install_success | default(false) | bool
+
+    - name: Set facts for slipstream-only deployments
+      set_fact:
+        outline_install_success: true
+        component_install_success: true
+      when:
+        - not (outline_enabled | default(true) | bool)
+        - not (remnawave_enabled | default(false) | bool)
 
     # =========================================================================
     # COMPONENT: WebSocket (requires Outline)
@@ -364,26 +381,58 @@
     - name: Include WebSocket configuration tasks
       include_tasks: setup/websocket.yml
       when:
-        - outline_install_success | bool
+        - component_install_success | bool
         - outline_enabled | default(true) | bool
         - outline_wss_enabled | default(false) | bool
+
+    # Outline management API proxy (valid TLS) for FCP when WSS is NOT enabling
+    # it. FCP requires a publicly-trusted cert on the apiUrl; setup/websocket.yml
+    # already configures this proxy when WSS is on, so this only covers no-WSS.
+    - name: Configure Outline Caddy API proxy for FCP (no WSS)
+      include_tasks: setup/outline_api_proxy.yml
+      when:
+        - component_install_success | bool
+        - outline_enabled | default(true) | bool
+        - fcp_enabled | default(false) | bool
+        - not (outline_wss_enabled | default(false) | bool)
+
+    # =========================================================================
+    # COMPONENT: Standalone Caddy (Remnawave TLS terminator + WS proxy)
+    # =========================================================================
+    - name: Include Caddy configuration tasks (Remnawave)
+      include_tasks: setup/caddy.yml
+      when:
+        - component_install_success | bool
+        - remnawave_enabled | default(false) | bool
+        - remnawave_caddy_enabled | default(false) | bool
 
     # =========================================================================
     # CDN PROVIDER: Fastly (WSS fronting via Fastly CDN)
     # =========================================================================
-    # Fastly service creation + WebSocket enablement
+    # Fastly service creation + WebSocket enablement.
+    # Outline uses outline_wss_enabled (WSS via Caddy embedded in shadowbox).
+    # Remnawave uses remnawave_caddy_enabled (standalone Caddy on the host)
+    # — Stage 3 adds the standalone Caddy support.
+    - name: Set Fastly service-id persistence dir (component-aware)
+      set_fact:
+        fastly_service_id_dir: "{{ '/opt/outline' if (outline_enabled | default(true) | bool) else remnawave_node_install_dir }}"
+      when:
+        - effective_cdn_provider | default('none') == 'fastly'
+
     - name: Include Fastly CDN service tasks
       include_tasks: providers/fastly/service.yml
       when:
-        - outline_install_success | bool
+        - component_install_success | bool
         - effective_cdn_provider | default('none') == 'fastly'
-        - outline_wss_enabled | default(false) | bool
+        - >-
+          (outline_enabled | default(true) | bool and outline_wss_enabled | default(false) | bool)
+          or (remnawave_enabled | default(false) | bool and remnawave_caddy_enabled | default(false) | bool)
 
     # Fastly TLS subscription (custom domain mode only)
     - name: Include Fastly TLS tasks (custom domain mode)
       include_tasks: providers/fastly/tls.yml
       when:
-        - outline_install_success | bool
+        - component_install_success | bool
         - effective_cdn_provider | default('none') == 'fastly'
         - effective_fastly_domain_mode | default('shared') == 'custom'
 
@@ -391,10 +440,24 @@
     - name: Include Fastly DNS tasks (custom domain mode)
       include_tasks: providers/fastly/dns.yml
       when:
-        - outline_install_success | bool
+        - component_install_success | bool
         - effective_cdn_provider | default('none') == 'fastly'
         - effective_fastly_domain_mode | default('shared') == 'custom'
         - effective_dns_provider == 'cloudflare'
+
+    # =========================================================================
+    # COMPONENT: Remnawave Hosts (per-transport, panel-side)
+    # =========================================================================
+    # Create one Remnawave Host per enabled CDN transport so issued keys reach
+    # subscriptions. Needs fastly_websocket_domain (Fastly block above) and the
+    # node registered on the panel. Fronted (Fastly) deploys only.
+    - name: Create Remnawave Hosts per transport
+      include_tasks: providers/remnawave/create_hosts.yml
+      when:
+        - component_install_success | bool
+        - remnawave_enabled | default(false) | bool
+        - remnawave_panel_register_node | default(false) | bool
+        - effective_cdn_provider | default('none') == 'fastly'
 
     # =========================================================================
     # COMPONENT: slipstream DNS Tunnel
@@ -402,26 +465,45 @@
     - name: Install slipstream DNS tunnel component
       include_tasks: setup/slipstream.yml
       when:
-        - outline_install_success | bool
+        - component_install_success | bool
         - slipstream_enabled | default(false) | bool
 
-    # Provider-specific KV store setup
-    - name: Include KV store tasks (Cloudflare)
-      include_tasks: providers/cloudflare/kv.yml
-      when: 
-        - outline_install_success | bool
-        - kv_provider == 'cloudflare'
+    # =========================================================================
+    # CONTROL PLANE: Register server with FreeSocks Control Plane (FCP)
+    # =========================================================================
+    # FCP stores each server's management credential and dials out to it. For
+    # Outline, each server is one backendServers row (apiUrl). For Remnawave,
+    # FCP holds only the panel (baseUrl+apiToken); per-node config reaches users
+    # via the panel (register_node + Hosts), so node deploys don't register with
+    # FCP unless fcp_register_remnawave_panel is set for an additional panel.
+    - name: Register Outline server with FCP
+      include_tasks: providers/fcp/register_server.yml
+      when:
+        - component_install_success | bool
+        - fcp_enabled | default(false) | bool
+        - outline_enabled | default(true) | bool
+
+    - name: Register Remnawave panel with FCP (optional)
+      include_tasks: providers/fcp/register_remnawave_panel.yml
+      when:
+        - component_install_success | bool
+        - fcp_enabled | default(false) | bool
+        - remnawave_enabled | default(false) | bool
+        - fcp_register_remnawave_panel | default(false) | bool
 
     - name: Display deployment summary
       debug:
         msg: |
           Deployment complete!
-          
+
           Hostname: {{ dns_hostname }}
-          
+
           Components deployed:
           {% if outline_enabled | default(true) | bool %}
             ✓ Outline Shadowsocks server
+          {% endif %}
+          {% if remnawave_enabled | default(false) | bool %}
+            ✓ Remnawave node ({{ remnawave_node_image }})
           {% endif %}
           {% if outline_wss_enabled | default(false) | bool %}
             ✓ WebSocket transport (WSS)
@@ -434,36 +516,38 @@
 # ============================================================================
 # MIGRATE MODE
 # ============================================================================
-- name: Migrate existing Outline server
+- name: Migrate existing server (Outline or Remnawave)
   block:
     - name: Verify required migration variables
       fail:
         msg: "Migration requires source_hostname, source_kv_hostname, destination_hostname, and destination_kv_hostname to be set"
       when: >
-        source_hostname is not defined or 
-        source_kv_hostname is not defined or 
-        destination_hostname is not defined or 
+        source_hostname is not defined or
+        source_kv_hostname is not defined or
+        destination_hostname is not defined or
         destination_kv_hostname is not defined
 
-    - name: Check if /opt/outline already exists
+    - name: Check if destination has existing Outline install
       stat:
         path: /opt/outline
       register: outline_path
       when: inventory_hostname == destination_hostname
 
-    - name: Fail if /opt/outline already exists
-      fail:
-        msg: "Cannot migrate: /opt/outline already exists on the destination server. Please remove it first."
-      when: 
-        - inventory_hostname == destination_hostname
-        - outline_path.stat.exists | default(false)
+    - name: Check if destination has existing Remnawave install
+      stat:
+        path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+      register: remnanode_path
+      when: inventory_hostname == destination_hostname
 
-    # Provider-specific installation
-    - name: Include Cloudflare installation tasks
-      include_tasks: providers/cloudflare/install.yml
-      when: 
+    - name: Fail if destination already has a VPN backend installed
+      fail:
+        msg: |
+          Cannot migrate: destination host {{ destination_hostname }} already has a
+          VPN backend installed (Outline at /opt/outline or Remnawave at
+          {{ remnawave_node_install_dir }}). Migration target must be a clean host.
+      when:
         - inventory_hostname == destination_hostname
-        - tunnel_provider == 'cloudflare'
+        - outline_path.stat.exists or remnanode_path.stat.exists
 
     - name: Include base installation tasks
       include_tasks: setup/install.yml
@@ -483,10 +567,19 @@
         path: /opt/outline
       register: outline_path
 
-    - name: Fail if /opt/outline does not exist
+    - name: Check if {{ remnawave_node_install_dir }} exists
+      stat:
+        path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+      register: remnanode_path
+
+    - name: Fail if no VPN backend is installed
       fail:
-        msg: "Cannot change hostname: /opt/outline does not exist. This server may not have Outline installed."
-      when: not outline_path.stat.exists
+        msg: |
+          Cannot change hostname: neither /opt/outline nor {{ remnawave_node_install_dir }}
+          exists on this server. Change mode requires an existing deployment.
+      when:
+        - not outline_path.stat.exists
+        - not remnanode_path.stat.exists
 
     - name: Include change tasks
       include_tasks: change/change.yml
@@ -496,7 +589,7 @@
 # UPDATE MODE
 # ============================================================================
 # Add components (slipstream, WSS) to an existing server
-# Does NOT reinstall Outline, only adds new components and updates KV
+# Does NOT reinstall Outline, only adds new components and re-registers with FCP
 
 # Set providers from domain_providers for update mode
 # Use slipstream_base_domain if slipstream is enabled, otherwise use base_domain
@@ -508,7 +601,6 @@
 - name: Set providers from domain_providers (update mode)
   set_fact:
     dns_provider: "{{ domain_providers[update_base_domain].dns_provider | default('cloudflare') }}"
-    tunnel_provider: "{{ domain_providers[update_base_domain].tunnel_provider | default('none') }}"
     base_domain: "{{ update_base_domain }}"
   when:
     - operation_mode == 'update'
@@ -522,31 +614,61 @@
         path: /opt/outline
       register: outline_path
 
+    - name: Check if Remnawave is installed
+      stat:
+        path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+      register: remnanode_path
+
+    - name: Determine detected component
+      set_fact:
+        update_component: >-
+          {{ 'outline' if outline_path.stat.exists
+             else ('remnawave' if remnanode_path.stat.exists
+                   else 'none') }}
+
     - name: Set outline_install_success based on existing installation
       set_fact:
         outline_install_success: "{{ outline_path.stat.exists }}"
 
-    - name: Fail if Outline not found for update mode
+    - name: Fail if no VPN backend is installed
       fail:
         msg: |
-          Update mode requires an existing Outline installation!
-          
-          Update mode is for adding components to existing servers.
-          If you want to deploy slipstream raw mode without Outline, 
-          use deploy mode instead:
-          
-            operation_mode=deploy outline_enabled=false slipstream_enabled=true slipstream_mode=raw
-      when: not outline_path.stat.exists
+          Update mode requires an existing Outline OR Remnawave installation.
 
-    - name: Fail if Outline not found but slipstream shadowsocks mode requested
+          Update mode is for adding components or re-syncing state on existing
+          servers. To deploy a new server, use operation_mode=deploy instead.
+      when: update_component == 'none'
+
+    - name: Fail if Outline requested on a Remnawave host
       fail:
         msg: |
-          Cannot add slipstream in shadowsocks mode: Outline is not installed.
-          Either install Outline first or use slipstream_mode=raw.
+          Cannot run update mode with outline_enabled=true on a Remnawave host
+          ({{ remnawave_node_install_dir }} detected). Set outline_enabled=false
+          and remnawave_enabled=true to update the Remnawave deployment.
+      when:
+        - update_component == 'remnawave'
+        - outline_enabled | default(true) | bool
+        - not (remnawave_enabled | default(false) | bool)
+
+    - name: Fail if Remnawave requested on an Outline host
+      fail:
+        msg: |
+          Cannot run update mode with remnawave_enabled=true on an Outline host
+          (/opt/outline detected). Mutual exclusion: a host runs one backend or
+          the other, not both.
+      when:
+        - update_component == 'outline'
+        - remnawave_enabled | default(false) | bool
+
+    - name: Fail if slipstream shadowsocks mode requested on a Remnawave host
+      fail:
+        msg: |
+          Cannot add slipstream in shadowsocks mode on a Remnawave host:
+          shadowsocks mode requires Outline. Use slipstream_mode=raw instead.
       when:
         - slipstream_enabled | default(false) | bool
         - slipstream_mode | default('shadowsocks') == 'shadowsocks'
-        - not outline_path.stat.exists
+        - update_component != 'outline'
 
     - name: Read existing Outline API info
       slurp:
@@ -561,20 +683,20 @@
 
     - name: Extract API URL from access.txt
       set_fact:
-        outline_api_url: "{{ outline_access_decoded | regex_search('apiUrl:(.+)', '\\1') | first }}"
+        outline_api_url: "{{ outline_access_decoded | regex_search('apiUrl:(.+)', '\\1') | first | trim }}"
       when: outline_path.stat.exists
 
     - name: Build outline_api_info object
       set_fact:
         outline_api_info:
           apiUrl: "{{ outline_api_url }}"
-          certSha256: "{{ outline_access_decoded | regex_search('certSha256:(.+)', '\\1') | first | default('') }}"
+          certSha256: "{{ outline_access_decoded | regex_search('certSha256:(.+)', '\\1') | first | default('') | trim }}"
       when: outline_path.stat.exists
 
     - name: Extract hostname from existing API URL
       set_fact:
-        random_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^.]+)', '\\1') | first }}"
-        dns_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^/]+)', '\\1') | first | regex_replace(':[0-9]+$', '') }}"
+        random_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^.]+)', '\\1') | first | trim }}"
+        dns_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^/]+)', '\\1') | first | trim | regex_replace(':[0-9]+$', '') }}"
       when: outline_path.stat.exists
 
     # =========================================================================
@@ -669,168 +791,62 @@
       when: will_install_slipstream | bool
 
     # =========================================================================
-    # Update KV store with new component config
-    # ONLY if something new was actually installed
+    # Re-register the server with FCP after adding components (Outline path)
     # =========================================================================
-    - name: Update KV with new configuration
-      block:
-        # IMPORTANT: KV namespaces are on the MAIN Cloudflare account, not on
-        # per-domain accounts (like slipstream's yandex-ns.com). Never use
-        # domain_providers credentials for KV - always use global credentials.
-        - name: Set Cloudflare credentials for KV operations
-          set_fact:
-            cf_token: "{{ kv_cloudflare_api_token | default(cloudflare_api_token) }}"
-            cf_account_id: "{{ kv_cloudflare_account_id | default(cloudflare_account_id) }}"
+    # FCP stores the management apiUrl (+ WSS fields) and dials out. Re-register
+    # so a newly added WSS transport is reflected. Idempotent by slug (PATCH).
+    # effective_cdn_provider isn't set in update mode — derive it from the
+    # detected host's domain so register_server.yml picks the right websocketDomain.
+    - name: Derive WSS base domain (update mode)
+      set_fact:
+        _wss_base_domain: "{{ dns_hostname.split('.')[1:] | join('.') }}"
+      when: dns_hostname is defined
 
-        # For update mode, we need to READ existing KV data and MERGE new config
-        - name: Read existing KV data from Cloudflare
-          uri:
-            url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ random_hostname }}"
-            method: GET
-            headers:
-              Authorization: "Bearer {{ cf_token }}"
-            return_content: yes
-            status_code: [200, 404]  # 404 if key doesn't exist yet
-          register: existing_kv_data
-          delegate_to: localhost
-
-        - name: Debug existing KV response
-          debug:
-            msg:
-              - "KV Read Status: {{ existing_kv_data.status }}"
-              - "KV Content Length: {{ existing_kv_data.content | default('') | length }}"
-              - "KV Content (first 200 chars): {{ existing_kv_data.content | default('') | truncate(200) }}"
-
-
-        - name: Parse existing KV data (JSON format)
-          set_fact:
-            api_endpoint_data: "{{ existing_kv_data.content | from_json }}"
-          when:
-            - existing_kv_data.status == 200
-            - existing_kv_data.content | default('') | length > 0
-            - existing_kv_data.content | default('') | trim | first == '{'  # Must start with { to be JSON
-
-        # Handle legacy format: plain URL string (e.g., "https://hostname.domain.com/api/secret")
-        # Convert to new JSON format for backwards compatibility
-        - name: Migrate legacy KV format (plain URL to JSON)
-          set_fact:
-            api_endpoint_data:
-              apiUrl: "{{ existing_kv_data.content | trim }}"
-          when:
-            - existing_kv_data.status == 200
-            - existing_kv_data.content | default('') | length > 0
-            - existing_kv_data.content | default('') | trim | first != '{'  # Not JSON, assume legacy URL
-            - api_endpoint_data is not defined
-
-        - name: Debug migrated KV data
-          debug:
-            msg: "KV data (migrated from legacy): {{ api_endpoint_data }}"
-          when:
-            - api_endpoint_data is defined
-            - existing_kv_data.content | default('') | trim | first != '{'
-
-        - name: Fail if KV entry doesn't exist
-          fail:
-            msg: |
-              Cannot update KV for hostname '{{ random_hostname }}' - entry not found!
-              
-              This server may not have been deployed with KV storage, or the KV entry was deleted.
-              
-              To fix this:
-              1. Re-deploy the server with operation_mode=deploy
-              2. Or manually create the KV entry in Cloudflare
-          when:
-            - existing_kv_data.status == 404 or (existing_kv_data.content | default('') | length == 0)
-
-        - name: Add websocketDomain to existing data
-          set_fact:
-            api_endpoint_data: "{{ api_endpoint_data | combine({'websocketDomain': dns_hostname}) }}"
-          when:
-            - api_endpoint_data is defined
-            - wss_newly_installed | default(false) | bool
-
-        # NOTE: Build slipstreamConfig in steps to avoid Ansible's omit sentinel
-        # leaking __omit_place_holder__ strings into the JSON output.
-        - name: Build base slipstreamConfig for update
-          set_fact:
-            _slipstream_kv_config:
-              enabled: true
-              mode: "{{ slipstream_mode | default('shadowsocks') }}"
-              domain: "{{ slipstream_domain }}"
-              resolver: "{{ slipstream_resolver }}"
-              certPem: "{{ slipstream_cert_pem | default('') }}"
-          when:
-            - api_endpoint_data is defined
-            - slipstream_newly_installed | default(false) | bool
-            - slipstream_cert_pem is defined
-
-        - name: Add resolverBackup to slipstreamConfig for update
-          set_fact:
-            _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'resolverBackup': slipstream_resolver_backup}) }}"
-          when:
-            - _slipstream_kv_config is defined
-            - slipstream_resolver_backup is defined
-            - slipstream_resolver_backup != ''
-
-        - name: Add socksPort to slipstreamConfig for update (raw mode only)
-          set_fact:
-            _slipstream_kv_config: "{{ _slipstream_kv_config | combine({'socksPort': slipstream_socks_port | default(1080) | int}) }}"
-          when:
-            - _slipstream_kv_config is defined
-            - slipstream_mode == 'raw'
-
-        - name: Merge slipstreamConfig into existing data
-          set_fact:
-            api_endpoint_data: "{{ api_endpoint_data | combine({'slipstreamConfig': _slipstream_kv_config}) }}"
-          when:
-            - api_endpoint_data is defined
-            - _slipstream_kv_config is defined
-
-        - name: Update Cloudflare KV store with merged data
-          uri:
-            url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ random_hostname }}"
-            method: PUT
-            headers:
-              Authorization: "Bearer {{ cf_token }}"
-              Content-Type: "application/json"
-            body: "{{ api_endpoint_data | to_json }}"
-            body_format: raw
-            status_code: 200
-          delegate_to: localhost
-          when:
-            - api_endpoint_data is defined
-
-        - name: Display update summary (components added)
-          debug:
-            msg: |
-              Update complete!
-              
-              Server: {{ dns_hostname | default('unknown') }}
-              
-              Components added:
-              {% if wss_newly_installed | default(false) | bool %}
-                ✓ WebSocket transport (WSS)
-              {% endif %}
-              {% if slipstream_newly_installed | default(false) | bool %}
-                ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
-              {% endif %}
-              
-              KV store updated with new configuration.
+    - name: Derive effective CDN provider (update mode)
+      set_fact:
+        effective_cdn_provider: "{{ domain_providers[_wss_base_domain].cdn_provider | default('none') }}"
       when:
-        - kv_provider == 'cloudflare'
-        - random_hostname is defined
+        - _wss_base_domain is defined
+        - _wss_base_domain in domain_providers
+
+    - name: Re-register Outline server with FCP (components changed)
+      include_tasks: providers/fcp/register_server.yml
+      when:
+        - fcp_enabled | default(false) | bool
+        - outline_path.stat.exists
+        - will_install_anything | bool
+
+    - name: Display update summary (components added)
+      debug:
+        msg: |
+          Update complete!
+
+          Server: {{ dns_hostname | default('unknown') }}
+
+          Components added:
+          {% if wss_newly_installed | default(false) | bool %}
+            ✓ WebSocket transport (WSS)
+          {% endif %}
+          {% if slipstream_newly_installed | default(false) | bool %}
+            ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
+          {% endif %}
+          {% if fcp_enabled | default(false) | bool %}
+            ✓ FCP registration re-synced
+          {% endif %}
+      when:
+        - outline_path.stat.exists
         - will_install_anything | bool
 
     # =========================================================================
-    # Nothing to update - show status and exit cleanly
+    # Nothing to update on Outline host - show status and exit cleanly
     # =========================================================================
-    - name: Display no-op summary
+    - name: Display no-op summary (Outline path)
       debug:
         msg: |
           No update needed!
-          
+
           Server: {{ dns_hostname | default('unknown') }}
-          
+
           All requested components are already installed:
           {% if wss_already_installed | default(false) %}
             ✓ WebSocket: already installed
@@ -838,8 +854,27 @@
           {% if slipstream_already_installed | default(false) %}
             ✓ slipstream: already installed
           {% endif %}
-          
+
           No changes were made.
-      when: not (will_install_anything | bool)
+      when:
+        - update_component == 'outline'
+        - not (will_install_anything | bool)
+
+    # =========================================================================
+    # Remnawave update branch (re-template / recreate, re-register with FCP)
+    # =========================================================================
+    - name: Run Remnawave update tasks
+      include_tasks: update/remnawave_update.yml
+      when: update_component == 'remnawave'
+
+    # Optional slipstream-raw add-on for Remnawave hosts (must come AFTER the
+    # remnawave_update.yml include so dns_hostname / random_hostname are set).
+    - name: Add slipstream DNS tunnel (raw mode only on Remnawave hosts)
+      include_tasks: setup/slipstream.yml
+      when:
+        - update_component == 'remnawave'
+        - slipstream_enabled | default(false) | bool
+        - not (slipstream_already_installed | default(false))
+        - slipstream_mode | default('shadowsocks') == 'raw'
   when: operation_mode == 'update'
 

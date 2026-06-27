@@ -1,0 +1,77 @@
+---
+# tasks/setup/outline_api_proxy.yml
+#
+# Configure Caddy (embedded in the Outline shadowbox) to serve the management
+# API over a valid Let's Encrypt cert at
+#   https://{{ effective_caddy_domain }}{{ outline_api_proxy_path }}/<secret>
+# WITHOUT enabling the WebSocket transport.
+#
+# This is required when an Outline server is registered with FCP but WSS is not
+# in use: FCP dials the management API with a plain fetch() that rejects
+# self-signed certs, so it must reach the Caddy-proxied URL (valid TLS), not
+# Outline's raw self-signed Manager port.
+#
+# When outline_wss_enabled=true, setup/websocket.yml already issues this same
+# /server/web-server PUT (alongside the WSS listeners), so this file is only
+# included for the no-WSS + FCP case.
+
+- name: Require an ACME email for the API proxy cert
+  assert:
+    that:
+      - outline_caddy_email is defined and outline_caddy_email | length > 0
+    fail_msg: >-
+      outline_caddy_email must be set so Caddy can register a Let's Encrypt
+      cert for the FCP-reachable management API proxy
+      (https://{{ effective_caddy_domain | default(dns_hostname) }}{{ outline_api_proxy_path | default('/api') }}/<secret>).
+  when: outline_caddy_auto_https | default(true) | bool
+
+- name: Resolve effective Caddy domain
+  set_fact:
+    effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname, true) }}"
+  when: effective_caddy_domain is not defined
+
+- name: Wait for Outline API to be available
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server"
+    method: GET
+    validate_certs: no
+  register: api_check
+  retries: 10
+  delay: 5
+  until: api_check.status == 200
+
+- name: Enable Caddy web server + API proxy (auto HTTPS, no WSS)
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/web-server"
+    method: PUT
+    body_format: json
+    body:
+      enabled: true
+      autoHttps: "{{ outline_caddy_auto_https }}"
+      email: "{{ outline_caddy_email }}"
+      domain: "{{ effective_caddy_domain }}"
+      apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
+    validate_certs: no
+    status_code: 204
+  when: outline_caddy_auto_https | default(true) | bool
+
+- name: Enable Caddy web server + API proxy (no auto HTTPS, no WSS)
+  uri:
+    url: "{{ outline_api_info.apiUrl }}/server/web-server"
+    method: PUT
+    body_format: json
+    body:
+      enabled: true
+      autoHttps: false
+      domain: "{{ effective_caddy_domain }}"
+      apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
+    validate_certs: no
+    status_code: 204
+  when: not (outline_caddy_auto_https | default(true) | bool)
+
+- name: Display API proxy configuration
+  debug:
+    msg: |
+      Outline management API proxy configured (no WSS):
+        https://{{ effective_caddy_domain }}{{ outline_api_proxy_path | default('') }}/<secret>
+      Caddy is serving a valid TLS cert on port 443 so FCP can reach the API.

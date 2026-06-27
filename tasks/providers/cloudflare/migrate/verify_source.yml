@@ -1,40 +1,18 @@
 ---
-# tasks/migrate/verify_source.yml - Source server verification tasks
-
-# Set per-domain Cloudflare credentials (allows multi-account support)
-- name: Set domain-specific Cloudflare credentials
-  set_fact:
-    cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
-    cf_account_id: "{{ domain_providers[base_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
-
-# Check source server status
-- name: Verify source server exists
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_api_kv_namespace }}/values/{{ source_kv_hostname }}"
-    method: GET
-    headers:
-      Authorization: "Bearer {{ cf_token }}"
-      
-    status_code: [200, 404]
-  delegate_to: localhost
-  register: source_server
-  failed_when: false
-  run_once: true
-
-- name: Get source server Prometheus endpoint
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/accounts/{{ cf_account_id }}/storage/kv/namespaces/{{ cloudflare_prom_kv_namespace }}/values/{{ source_kv_hostname }}"
-    method: GET
-    headers:
-      Authorization: "Bearer {{ cf_token }}"
-      
-    status_code: [200, 404]
-  delegate_to: localhost
-  register: source_prom
-  failed_when: false
-  run_once: true
+# tasks/providers/cloudflare/migrate/verify_source.yml - Source server preparation
+#
+# Source existence is established by on-disk backend detection in
+# tasks/migrate/migrate.yml (it stats /opt/outline vs the Remnawave install dir
+# and sets migrate_component). This file now only stops the source Outline
+# containers before the configuration transfer.
+#
+# (KV-based source verification was removed when the control plane moved off
+# Cloudflare KV to the FreeSocks Control Plane (FCP). FCP stores each server's
+# management credential and dials out — there is no per-server KV entry to read.)
 
 # Stop source server containers
+# Outline path only — Remnawave's source container is torn down by
+# tasks/migrate/remnawave_containers.yml using docker_compose_v2.
 - name: Stop Outline containers on source server
   docker_container:
     name: "{{ item }}"
@@ -43,4 +21,6 @@
     - watchtower
     - shadowbox
   become: yes
-  when: inventory_hostname == source_hostname
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component | default('outline') == 'outline'
