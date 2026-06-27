@@ -10,7 +10,8 @@
 #
 # Idempotent by `slug`: GET the list, PATCH if the slug already exists, else POST
 # a new backendServers row. Auth is an fsv1_ service token with the
-# admin:servers:write scope.
+# admin:servers:read + admin:servers:write scopes (read for the GET list,
+# write for the POST/PATCH).
 #
 # Remnawave panels are registered separately via register_remnawave_panel.yml
 # (FCP stores the panel, not individual nodes).
@@ -23,7 +24,7 @@
       - fcp_server_slug is defined and fcp_server_slug | length > 0
     fail_msg: >-
       FCP registration requires fcp_api_url, fcp_api_token (an fsv1_ token with
-      the admin:servers:write scope), and fcp_server_slug to be set.
+      the admin:servers:read + admin:servers:write scopes), and fcp_server_slug to be set.
 
 # ---------------------------------------------------------------------------
 # Build the Outline management apiUrl (Caddy-proxied; valid TLS)
@@ -83,7 +84,7 @@
 
 - name: Find existing FCP entry by slug
   set_fact:
-    _fcp_existing_id: "{{ (fcp_servers_list.json.response | default([]) | selectattr('slug', 'equalto', fcp_server_slug) | map(attribute='id') | first) | default('') }}"
+    _fcp_existing_id: "{{ (fcp_servers_list.json.servers | default([]) | selectattr('slug', 'equalto', fcp_server_slug) | map(attribute='id') | first) | default('') }}"
 
 # websocketDomain is added conditionally (not via omit) so the JSON never leaks
 # Ansible's omit sentinel. On PATCH, only provided fields change — so omitting

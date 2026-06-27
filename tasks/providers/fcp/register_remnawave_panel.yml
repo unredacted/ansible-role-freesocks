@@ -38,7 +38,7 @@
 
 - name: Find existing FCP panel entry by slug
   set_fact:
-    _fcp_panel_id: "{{ (fcp_panel_list.json.response | default([]) | selectattr('slug', 'equalto', fcp_remnawave_panel_slug) | map(attribute='id') | first) | default('') }}"
+    _fcp_panel_id: "{{ (fcp_panel_list.json.servers | default([]) | selectattr('slug', 'equalto', fcp_remnawave_panel_slug) | map(attribute='id') | first) | default('') }}"
 
 - name: Build FCP panel body (Remnawave)
   set_fact:
