@@ -46,6 +46,24 @@
     effective_wss_udp_path: "{{ outline_wss_udp_path }}"
   when: not (outline_wss_random_paths | default(true))
 
+# FCP issues Outline WSS keys with FIXED client paths /tcp and /udp and has no
+# per-server path field. So when registering with FCP, the server's listener
+# paths MUST be /tcp + /udp, or issued keys point at paths Caddy isn't serving.
+# Override here (winning over randomization). Path obfuscation adds ~nothing
+# behind a real-cert TLS endpoint. (Long-term fix: make the path configurable in FCP.)
+- name: Force /tcp + /udp WSS paths for FCP-managed Outline
+  set_fact:
+    effective_wss_tcp_path: "/tcp"
+    effective_wss_udp_path: "/udp"
+  when: fcp_enabled | default(false) | bool
+
+- name: Note WSS path override for FCP
+  debug:
+    msg: >-
+      fcp_enabled=true → WSS listener paths forced to /tcp + /udp to match FCP's
+      fixed client paths (path randomization disabled for this Outline server).
+  when: fcp_enabled | default(false) | bool
+
 - name: Wait for Outline API to be available
   uri:
     url: "{{ outline_api_info.apiUrl }}/server"

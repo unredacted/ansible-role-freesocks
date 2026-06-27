@@ -1,0 +1,73 @@
+---
+# tasks/providers/remnawave/create_reality_host.yml
+#
+# Create the Remnawave Host for a VLESS+Vision+REALITY node (direct, no Caddy).
+# Reality params (publicKey/shortIds/flow) live on the PANEL inbound; the Host
+# only references that inbound and sets address/port/sni. The panel derives the
+# client subscription (pbk/sid/flow) from the inbound. Idempotent: GET-first by
+# remark, tolerate 409.
+#
+# securityLayer is DEFAULT — the v2.7.4 Host schema has no REALITY enum value;
+# the Reality security comes from the inbound. VERIFY on a live panel that the
+# generated vless:// subscription line carries security=reality + pbk/sid/flow.
+
+- name: Validate Reality Host prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid | length > 0
+      - remnawave_reality_inbound_uuid | default('') | length > 0
+      - remnawave_reality_sni | default('') | length > 0
+      - dns_hostname is defined and dns_hostname | length > 0
+    fail_msg: >-
+      Reality Host creation requires remnawave_panel_api_token,
+      remnawave_panel_config_profile_uuid, remnawave_reality_inbound_uuid,
+      remnawave_reality_sni, and dns_hostname.
+  no_log: true
+
+- name: List existing Remnawave Hosts (Reality)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_reality_hosts_list
+
+- name: Create the Reality Host
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      inbound:
+        configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
+        configProfileInboundUuid: "{{ remnawave_reality_inbound_uuid }}"
+      remark: "{{ random_hostname }}-reality"
+      address: "{{ remnawave_reality_address | default(dns_hostname, true) }}"
+      port: "{{ remnawave_reality_port | default(443) | int }}"
+      sni: "{{ remnawave_reality_sni }}"
+      fingerprint: "{{ remnawave_reality_fingerprint | default('chrome') }}"
+      securityLayer: "DEFAULT"
+      overrideSniFromAddress: false
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_reality_host_result
+  when: (random_hostname ~ '-reality') not in (remnawave_reality_hosts_list.json.response | default([]) | map(attribute='remark') | list)
+
+- name: Summarize Reality Host creation
+  debug:
+    msg: >-
+      Reality Host ensured: {{ random_hostname }}-reality ->
+      {{ remnawave_reality_address | default(dns_hostname, true) }}:{{ remnawave_reality_port | default(443) }}
+      (sni {{ remnawave_reality_sni }}).

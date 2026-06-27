@@ -134,7 +134,7 @@ Registration uses FCP's admin REST API and is **idempotent by a unique `slug`**:
 - `POST /api/v1/admin/backend-servers` — create a server record
 - `PATCH /api/v1/admin/backend-servers/{id}` — update an existing record (used by change/migrate/update)
 
-Requests are authenticated with an `fsv1_` service token that carries the `admin:servers:write` scope.
+Requests are authenticated with an `fsv1_` service token that carries **both** the `admin:servers:read` and `admin:servers:write` scopes (read for the slug-idempotency list, write for create/update — a write-only token 401s on the GET-list step).
 
 ```yaml
 # Enable FCP registration (default: false)
@@ -143,7 +143,7 @@ fcp_enabled: true
 # FCP admin API base URL
 fcp_api_url: "https://fcp.example.org"
 
-# fsv1_ service token with the admin:servers:write scope (store in vault!)
+# fsv1_ service token with admin:servers:read + admin:servers:write scopes (store in vault!)
 fcp_api_token: "fsv1_..."
 
 # Display name for this server in FCP (optional)
@@ -165,7 +165,11 @@ fcp_remnawave_panel_slug: "remnawave-primary"
 
   > Because FCP requires a valid-TLS `apiUrl`, an Outline server registered with FCP needs the **Caddy API proxy**. That proxy is configured automatically when `outline_wss_enabled=true`, or via the no-WSS path that runs when `fcp_enabled=true`.
 
+  > **Fixed WSS paths:** With WSS + FCP, the role forces the WSS listener paths to `/tcp` + `/udp` to match FCP's fixed client paths (see [WebSocket (WSS) Support](#websocket-wss-support)).
+
 - **Remnawave** — FCP stores only the **panel** (`baseUrl` + `apiToken`), **not** individual nodes. Per-node config reaches users through the panel's subscription output. The role still registers the node and creates Hosts on the panel (separate, unchanged behavior). Registering the panel with FCP is opt-in via `fcp_register_remnawave_panel: true` (with `fcp_remnawave_panel_slug`).
+
+**Migrate cleans up the source row.** When an Outline server is migrated to a new host, the destination is registered (PATCH/POST) under its own slug and the role then **deletes the source server's FCP `backendServers` row** (by the source slug, `source_kv_hostname`) via `tasks/providers/fcp/delete_server.yml`. This leaves no orphaned row behind. The delete is idempotent (resolves slug → id and no-ops if absent) and is skipped when source and destination slugs are identical.
 
 ### WebSocket (WSS) Support
 
@@ -205,6 +209,15 @@ prom_hostname_suffix: ""
 
 > **Important:** When using WSS, set `outline_keys_port` to a non-443 port (e.g., 853) 
 > so that Caddy can use port 443 for HTTPS/WebSocket traffic.
+
+> **FCP-managed Outline forces `/tcp` + `/udp`:** FCP issues Outline WSS keys with
+> **fixed** client paths (`/tcp` and `/udp`) and has no per-server path field. So when
+> both `fcp_enabled=true` and `outline_wss_enabled=true`, the role overrides the WSS
+> listener paths to `/tcp` + `/udp` and disables path randomization (logged at run
+> time) — otherwise issued keys would point at random paths Caddy isn't serving.
+> `outline_wss_random_paths` / `outline_wss_tcp_path` / `outline_wss_udp_path` only
+> take effect on a non-FCP Outline deploy. (A configurable path field is a possible
+> future FCP enhancement.)
 
 ### slipstream DNS Tunnel Support
 
@@ -380,6 +393,16 @@ remnawave_cdn_transports:
 
 # Decoy/camouflage site served by Caddy on every non-transport path
 remnawave_decoy_root: "/var/www/decoy"
+
+# Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN). See the
+# "Reality transport" section below. Mutually exclusive with remnawave_caddy_enabled
+# and incompatible with Fastly; keys live on the panel inbound (role creates the Host).
+remnawave_reality_enabled: false
+remnawave_reality_inbound_uuid: ""   # configProfileInboundUuid of the Reality inbound
+remnawave_reality_sni: ""            # a serverName from the inbound (the borrowed domain)
+remnawave_reality_address: ""        # client-facing address; defaults to dns_hostname
+remnawave_reality_port: 443
+remnawave_reality_fingerprint: "chrome"
 ```
 
 #### Two workflows
@@ -438,9 +461,7 @@ remnawave_decoy_root: "/var/www/decoy"
 
 **Multi-transport Caddy + decoy site.** Caddy path-routes each enabled transport to its loopback inbound — `ws` via an exact-path `handle`, `xhttp` via a `path/*` prefix `handle` with response buffering disabled (`flush_interval -1`) — and serves a plausible static "maintenance" page (rooted at `remnawave_decoy_root`) on all other paths. A probe of `https://<host>/` therefore sees an innocuous site rather than a bare proxy or error.
 
-**Automatic Host creation.** On a Fastly-fronted Remnawave deploy with node registration enabled, the role creates **one Remnawave Host per enabled transport** (`POST /api/hosts`, idempotent: it lists existing Hosts first and matches by `remark`). Hosts are what put a node's keys into client subscriptions — without them, a registered node never appears in subscription output. The Host points `address`/`sni`/`host` at the Fastly edge domain on port 443 with `securityLayer: TLS`. Hosts are gated on `remnawave_enabled` + `remnawave_panel_register_node` + a `cdn_provider: fastly` domain; `remnawave_panel_active_inbounds` is **derived** from the enabled transports' `inbound_uuid`s, and hostname rotation / migration deletes the old node's Hosts (matched by remark prefix) before creating new ones.
-
-> **Known limitation:** Host creation currently requires Fastly fronting (the Host address is the Fastly edge domain). A non-Fastly Remnawave + Caddy deploy does **not** auto-create Hosts yet.
+**Automatic Host creation (Fastly and direct).** On a Remnawave deploy with node registration enabled, the role creates **one Remnawave Host per enabled transport** (`POST /api/hosts`, idempotent: it lists existing Hosts first and matches by `remark`). Hosts are what put a node's keys into client subscriptions — without them, a registered node never appears in subscription output. The Host's `address`/`sni`/`host` is the **Fastly edge domain when fronted, otherwise the origin `dns_hostname`** (`fastly_websocket_domain | default(dns_hostname)`) — Caddy already terminates a real Let's Encrypt cert on that origin and path-routes to the inbounds, so a direct (non-Fastly) node is a complete, directly-reachable endpoint (e.g. `wss://<dns_hostname>/ws`). Port is 443 with `securityLayer: TLS`. Hosts are gated on `remnawave_enabled` + `remnawave_panel_register_node` + `remnawave_caddy_enabled` + a `cdn_provider` of `fastly` **or** `none`; `remnawave_panel_active_inbounds` is **derived** from the enabled transports' `inbound_uuid`s, and hostname rotation / migration deletes the old node's Hosts (matched by remark prefix) before creating new ones.
 
 **Phase 0 — one-time manual panel prerequisite.** Before deploying, the operator must add two raw-Xray inbounds to the panel's Config Profile:
 
@@ -450,6 +471,44 @@ remnawave_decoy_root: "/var/www/decoy"
 Then record each inbound's UUID (from `GET /api/config-profiles/inbounds`) into the matching `remnawave_cdn_transports[].inbound_uuid`.
 
 **XHTTP is experimental and ships disabled.** VLESS+XHTTP (packet-up) over Fastly has no proven track record — the closest documented analogue (CloudFront) fails on `X-Padding` integrity. The Caddy route, Fastly VCL, and Host entry are all built, but the `xhttp` transport ships `enabled: false` and must stay off until a manual proof-of-concept passes on a live throwaway node — validating streamed `do_stream`-on-`pass`, survival of >60s idle (Fastly's clustering timeout), a >20MB download, `X-Padding` integrity (no `invalid x_padding` in Xray logs), and a working ALPN. Only flip `enabled: true` for `xhttp` after that gate passes.
+
+#### Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN)
+
+Reality is a separate **direct** node mode (not part of `remnawave_cdn_transports`). Xray terminates TLS itself by borrowing a real site's handshake, so it binds `:443` directly with no Caddy and no CDN. Enable it with:
+
+```yaml
+remnawave_enabled: true
+outline_enabled: false
+
+remnawave_caddy_enabled: false           # MUST stay off — Reality binds :443 itself
+remnawave_reality_enabled: true
+remnawave_reality_inbound_uuid: "<configProfileInboundUuid of the Reality inbound>"
+remnawave_reality_sni: "www.some-real-site.com"   # a serverName from the inbound (borrowed domain)
+# remnawave_reality_address: ""          # client-facing address; defaults to dns_hostname
+# remnawave_reality_port: 443
+# remnawave_reality_fingerprint: chrome
+
+remnawave_panel_register_node: true       # role creates the Reality Host
+remnawave_panel_url: "https://panel.example.com"
+remnawave_panel_api_token: "<vault>"
+remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
+```
+
+**Constraints (asserted by the role).** Reality is **mutually exclusive with `remnawave_caddy_enabled`** (both would bind `:443`) and **incompatible with Fastly**. The role asserts these and forces `dns_proxied: false` (a Reality endpoint must be reached directly).
+
+**Keys live on the panel, not the role.** The Reality `publicKey` / `shortIds` / `privateKey` / `flow` are configured on the **panel inbound** (raw Xray config). The role only creates the Remnawave Host (`tasks/providers/remnawave/create_reality_host.yml`): remark `<hostname>-reality`, `address`/`sni` from `remnawave_reality_address` (default `dns_hostname`) / `remnawave_reality_sni`, `securityLayer: DEFAULT` — the panel derives `pbk`/`sid`/`flow` from the inbound. The Reality inbound's UUID is also added to the derived `remnawave_panel_active_inbounds` when enabled. Reality is wired into deploy / change / migrate (gated on `remnawave_reality_enabled` + `remnawave_panel_register_node`).
+
+**Phase 0 (Reality) — one-time manual panel prerequisite.** Add a Reality inbound to the Config Profile — raw Xray: `vless`, `listen 0.0.0.0:443`, `security reality`, `realitySettings { dest, serverNames, privateKey, shortIds }`, `flow xtls-rprx-vision` — generate the x25519 keypair (panel UI / `GenerateX25519` endpoint / `xray x25519`), then record the inbound UUID (from `GET /api/config-profiles/inbounds`) into `remnawave_reality_inbound_uuid` and one serverName into `remnawave_reality_sni`.
+
+#### Choosing a transport
+
+| Transport | Setup | Strength | Best for |
+|-----------|-------|----------|----------|
+| **VLESS+WS+TLS** (via Caddy, real LE cert) | `remnawave_caddy_enabled` + `ws` transport | Rides ordinary HTTPS — traverses forced proxies; TLS inspection sees normal HTTPS (blocking it means blocking all HTTPS) | **Business / school networks** (forced proxies, TLS inspection) |
+| **VLESS+XHTTP+TLS** (via Caddy/Fastly) | `xhttp` transport (experimental, gated) | Stealthier HTTP-based evolution of WS | Same restrictive networks, once the Fastly PoC passes |
+| **VLESS+Vision+REALITY** (direct) | `remnawave_reality_enabled` | Fastest; best against active probing (raw TCP, mimics a real site's TLS) | **Open networks** |
+
+The tradeoff in one line: **WS+TLS via Caddy** is the choice for restrictive **business/school** networks because it looks like — and rides — normal HTTPS, so it gets through forced HTTP proxies and TLS inspection. **Reality** is the **fastest** option and the strongest against active probing, but it does **not** traverse forced HTTP proxies / TLS inspection, so it is for **open** networks, not the business/school case. XHTTP+TLS is a stealthier evolution of the WS approach but remains experimental (Fastly PoC-gated — see above).
 
 #### Notes
 
@@ -811,15 +870,17 @@ tasks/
     │   └── migrate/         # Migration-specific DNS tasks
     ├── fastly/              # Fastly CDN service / TLS / DNS / cleanup
     ├── remnawave/
-    │   ├── keygen.yml          # GET /api/keygen → SECRET_KEY
-    │   ├── register_node.yml   # POST /api/nodes (captures UUID)
-    │   ├── update_node.yml     # PATCH /api/nodes
-    │   ├── delete_node.yml     # DELETE /api/nodes/{uuid}
-    │   ├── create_hosts.yml    # POST /api/hosts per enabled transport
-    │   └── cleanup_hosts.yml   # DELETE old Hosts (by remark prefix)
+    │   ├── keygen.yml             # GET /api/keygen → SECRET_KEY
+    │   ├── register_node.yml      # POST /api/nodes (captures UUID)
+    │   ├── update_node.yml        # PATCH /api/nodes
+    │   ├── delete_node.yml        # DELETE /api/nodes/{uuid}
+    │   ├── create_hosts.yml       # POST /api/hosts per enabled CDN transport
+    │   ├── create_reality_host.yml # POST /api/hosts for the Reality node
+    │   └── cleanup_hosts.yml      # DELETE old Hosts (by remark prefix)
     └── fcp/                 # FreeSocks Control Plane registration (REST API)
         ├── register_server.yml          # Outline backendServers row
-        └── register_remnawave_panel.yml # Remnawave panel record
+        ├── register_remnawave_panel.yml # Remnawave panel record
+        └── delete_server.yml            # DELETE a backendServers row by slug (migrate)
 
 templates/
 ├── slipstream-server.service.j2     # slipstream systemd service
@@ -830,6 +891,30 @@ templates/
 ```
 
 > The `cloudflare/` provider no longer contains `install.yml` (cloudflared), `tunnel.yml`, or `kv.yml` — Cloudflare Tunnel and KV have been removed.
+
+## Testing
+
+The role ships offline, self-asserting tests under `tests/` (they run with `connection: local`, render templates, and exercise the role's filter expressions — no real hosts or API calls):
+
+- **`tests/test_caddyfile_render.yml`** — renders the Remnawave Caddyfile template and asserts its structure (transport routes + decoy fallback).
+- **`tests/test_fcp_and_hosts.yml`** — exercises FCP slug→id resolution and the Remnawave Host request-body shaping.
+
+Run them all with the helper script, or individually:
+
+```bash
+# Run every tests/test_*.yml
+tests/run.sh
+
+# Or run a single test
+ansible-playbook tests/test_caddyfile_render.yml
+ansible-playbook tests/test_fcp_and_hosts.yml
+```
+
+A syntax check of the example playbook is also useful:
+
+```bash
+ansible-playbook --syntax-check example-playbook.yml
+```
 
 ## License
 

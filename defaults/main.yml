@@ -197,7 +197,8 @@ envoy_mappings: {} # Define your envoy mappings as shown in the example above
 # FCP (the control plane) stores each server's management credential and dials
 # out to it. The role registers servers with FCP's admin API
 # (POST/PATCH /api/v1/admin/backend-servers) using an fsv1_ service token that
-# holds the admin:servers:write scope. Registration is idempotent by `slug`.
+# holds the admin:servers:read + admin:servers:write scopes (read for the
+# slug-idempotency list, write for create/update). Registration is idempotent by `slug`.
 #
 #   - Outline: each server is one backendServers row — apiUrl is the
 #     Caddy-proxied management URL (valid TLS; FCP requires it), plus
@@ -207,7 +208,7 @@ envoy_mappings: {} # Define your envoy mappings as shown in the example above
 #     Registering an additional panel is opt-in via fcp_register_remnawave_panel.
 fcp_enabled: false                  # master switch for control-plane registration
 fcp_api_url: ""                     # e.g. https://control-plane.example.org
-fcp_api_token: ""                   # vault: fsv1_ token with admin:servers:write
+fcp_api_token: ""                   # vault: fsv1_ token: admin:servers:read + admin:servers:write
 fcp_server_name: "{{ random_hostname | default('') }}"   # human-friendly name in FCP
 fcp_server_slug: "{{ random_hostname | default('') }}"   # unique, immutable key in FCP
 fcp_register_remnawave_panel: false # register the Remnawave panel as a backendServers row
@@ -322,6 +323,30 @@ remnawave_cdn_transports:
 
 # Decoy/camouflage site served by Caddy on every non-transport path.
 remnawave_decoy_root: "/var/www/decoy"
+
+# ============================================================================
+# Remnawave Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN)
+# ============================================================================
+# The fastest, best-against-active-probing transport, for OPEN networks (it
+# mimics a real site's TLS). It does NOT traverse forced HTTP proxies / TLS
+# inspection, so it is NOT the business/school choice — use the WS transport
+# (via Caddy) there. Reality terminates TLS inside Xray (borrowing a real site's
+# handshake), so Xray binds :443 directly: it is MUTUALLY EXCLUSIVE with
+# remnawave_caddy_enabled and incompatible with Fastly. Reality keys
+# (publicKey/shortIds/privateKey) live on the PANEL inbound (raw Xray config);
+# the role only creates the Host.
+#
+# Phase 0 (Reality): add a Reality inbound to the Config Profile — vless,
+# listen 0.0.0.0:443, security reality, realitySettings {dest, serverNames,
+# privateKey, shortIds}, flow xtls-rprx-vision — generate the x25519 keypair
+# (panel UI / GenerateX25519 endpoint / `xray x25519`), then record the inbound
+# UUID + one serverName below.
+remnawave_reality_enabled: false
+remnawave_reality_inbound_uuid: ""   # configProfileInboundUuid of the Reality inbound
+remnawave_reality_sni: ""            # a serverName from the inbound (the borrowed domain)
+remnawave_reality_address: ""        # client-facing address; defaults to dns_hostname
+remnawave_reality_port: 443
+remnawave_reality_fingerprint: "chrome"
 
 # ============================================================================
 # slipstream DNS Tunnel Configuration

@@ -1,0 +1,93 @@
+---
+# tests/test_caddyfile_render.yml
+#
+# Self-asserting render test for templates/remnanode-caddyfile.j2: confirms the
+# data-driven multi-transport Caddyfile emits a ws `handle` block, an xhttp
+# prefix `handle` with flush_interval, a decoy fallback, omits disabled
+# transports, and never uses handle_path. Optionally runs `caddy validate` when
+# the caddy binary is present.
+#
+# Run: ansible-playbook tests/test_caddyfile_render.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    remnawave_caddy_email: "admin@example.com"
+    dns_hostname: "apple-banana-cherry.example.com"
+    remnawave_caddy_listen_port: 443
+    remnawave_decoy_root: "/var/www/decoy"
+    remnawave_cdn_transports:
+      - { name: ws, network: ws, path: "/ws", internal_port: 8443, enabled: true }
+      - { name: xhttp, network: xhttp, path: "/xh", internal_port: 8444, enabled: true }
+    _rendered: "{{ playbook_dir }}/.caddyfile.rendered"
+    _wsonly: "{{ playbook_dir }}/.caddyfile.wsonly"
+  tasks:
+    - block:
+        - name: Render Caddyfile (ws + xhttp enabled)
+          template:
+            src: "{{ playbook_dir }}/../templates/remnanode-caddyfile.j2"
+            dest: "{{ _rendered }}"
+          changed_when: false
+
+        - name: Read rendered Caddyfile
+          set_fact:
+            _caddy: "{{ lookup('file', _rendered) }}"
+
+        - name: Assert multi-transport + decoy structure
+          assert:
+            that:
+              - "'@ws path /ws' in _caddy"
+              - "'handle @ws' in _caddy"
+              - "'reverse_proxy 127.0.0.1:8443' in _caddy"
+              - "'handle /xh/*' in _caddy"
+              - "'reverse_proxy 127.0.0.1:8444' in _caddy"
+              - "'flush_interval -1' in _caddy"
+              - "'root * /var/www/decoy' in _caddy"
+              - "'file_server' in _caddy"
+              - "'handle_path' not in _caddy"
+            success_msg: "ws+xhttp render OK (handle blocks, flush_interval, decoy; no handle_path)."
+
+        - name: Render Caddyfile (ws only; xhttp disabled)
+          template:
+            src: "{{ playbook_dir }}/../templates/remnanode-caddyfile.j2"
+            dest: "{{ _wsonly }}"
+          vars:
+            remnawave_cdn_transports:
+              - { name: ws, network: ws, path: "/ws", internal_port: 8443, enabled: true }
+              - { name: xhttp, network: xhttp, path: "/xh", internal_port: 8444, enabled: false }
+          changed_when: false
+
+        - name: Read ws-only render
+          set_fact:
+            _wsonly_content: "{{ lookup('file', _wsonly) }}"
+
+        - name: Assert disabled xhttp is omitted
+          assert:
+            that:
+              - "'handle @ws' in _wsonly_content"
+              - "'8444' not in _wsonly_content"
+              - "'/xh/*' not in _wsonly_content"
+            success_msg: "Disabled transports are correctly omitted."
+
+        - name: Check for caddy binary
+          command: which caddy
+          register: _caddy_bin
+          changed_when: false
+          failed_when: false
+
+        - name: Validate rendered Caddyfile with caddy (if present)
+          command: "caddy validate --config {{ _rendered }} --adapter caddyfile"
+          changed_when: false
+          when: _caddy_bin.rc == 0
+
+        - name: All Caddyfile render tests passed
+          debug:
+            msg: "Caddyfile render tests passed{{ ' (+ caddy validate)' if _caddy_bin.rc == 0 else ' (caddy not installed; validate skipped)' }}."
+      always:
+        - name: Clean up rendered files
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ _rendered }}"
+            - "{{ _wsonly }}"

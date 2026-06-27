@@ -143,6 +143,18 @@
     - migrate_component == 'outline'
     - fcp_enabled | default(false) | bool
 
+# Remove the stale SOURCE row (registered under the source slug). The slug is
+# source_kv_hostname (NOT fcp_server_slug, which now resolves to the destination).
+- name: Delete the stale SOURCE Outline server row from FCP
+  include_tasks: ../providers/fcp/delete_server.yml
+  vars:
+    fcp_delete_slug: "{{ source_kv_hostname }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - fcp_enabled | default(false) | bool
+    - source_kv_hostname != destination_kv_hostname
+
 # ============================================================================
 # Panel-side address update (Remnawave + register_node only)
 # ============================================================================
@@ -227,8 +239,8 @@
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - effective_cdn_provider | default('none') == 'fastly'
     - remnawave_panel_register_node | default(false) | bool
+    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
 
 - name: Delete OLD Fastly service (from transferred service-id file)
   include_tasks: ../providers/fastly/cleanup.yml
@@ -267,5 +279,14 @@
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - effective_cdn_provider | default('none') == 'fastly'
     - remnawave_panel_register_node | default(false) | bool
+    - remnawave_caddy_enabled | default(false) | bool
+    - effective_cdn_provider | default('none') in ['fastly', 'none']
+
+- name: Create NEW Reality Host on the destination
+  include_tasks: ../providers/remnawave/create_reality_host.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - remnawave_panel_register_node | default(false) | bool
+    - remnawave_reality_enabled | default(false) | bool

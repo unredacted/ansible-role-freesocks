@@ -4,7 +4,8 @@
 # Create one Remnawave Host per enabled CDN transport. Hosts are what produce
 # the client subscription line — without them, a registered node's keys never
 # reach subscriptions. Each Host binds a Config Profile inbound to a
-# client-facing endpoint (the Fastly edge domain when fronted).
+# client-facing endpoint (the Fastly edge domain when fronted, else the origin
+# dns_hostname for direct/non-Fastly deploys — Caddy terminates a real cert there).
 #
 # Idempotent: GET /api/hosts first, then POST only for transports whose `remark`
 # is absent (also tolerate 409). Verified against Remnawave panel API v2.7.4 —
@@ -17,13 +18,18 @@
     that:
       - remnawave_panel_api_token | length > 0
       - remnawave_panel_config_profile_uuid | length > 0
-      - fastly_websocket_domain is defined and fastly_websocket_domain | length > 0
+      - dns_hostname is defined and dns_hostname | length > 0
     fail_msg: >-
       Host creation requires remnawave_panel_api_token,
-      remnawave_panel_config_profile_uuid, and a CDN edge domain
-      (fastly_websocket_domain). Ensure register_node and the Fastly service
-      ran first.
+      remnawave_panel_config_profile_uuid, and a resolvable host (dns_hostname).
+      The Host address is the Fastly edge domain when fronted, else dns_hostname.
   no_log: true
+
+# Fastly-fronted deploys advertise the Fastly edge domain; direct (non-Fastly)
+# deploys advertise the origin dns_hostname (Caddy terminates a real LE cert there).
+- name: Resolve the client-facing Host address
+  set_fact:
+    _remnawave_host_address: "{{ fastly_websocket_domain | default(dns_hostname, true) }}"
 
 - name: List existing Remnawave Hosts
   uri:
@@ -56,11 +62,11 @@
         configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
         configProfileInboundUuid: "{{ item.inbound_uuid }}"
       remark: "{{ random_hostname }}-{{ item.name }}"
-      address: "{{ fastly_websocket_domain }}"
+      address: "{{ _remnawave_host_address }}"
       port: 443
       path: "{{ item.path }}"
-      sni: "{{ fastly_websocket_domain }}"
-      host: "{{ fastly_websocket_domain }}"
+      sni: "{{ _remnawave_host_address }}"
+      host: "{{ _remnawave_host_address }}"
       alpn: "{{ item.alpn | default('http/1.1') }}"
       fingerprint: "{{ item.fingerprint | default('chrome') }}"
       securityLayer: "TLS"
@@ -82,4 +88,4 @@
     msg: >-
       Remnawave Hosts ensured for enabled transports
       [{{ remnawave_cdn_transports | selectattr('enabled') | map(attribute='name') | join(', ') }}]
-      at edge {{ fastly_websocket_domain }} (remark prefix '{{ random_hostname }}-').
+      at {{ _remnawave_host_address }} (remark prefix '{{ random_hostname }}-').

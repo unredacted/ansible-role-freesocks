@@ -795,6 +795,172 @@
     - ansible-role-freesocks
 
 ###############################################################################
+# DEPLOY MODE: Remnawave node + WS transport, direct (no CDN)
+###############################################################################
+# Remnawave (Xray-core) node reached DIRECTLY (no Fastly): a standalone Caddy on
+# the host terminates a real Let's Encrypt cert on the origin hostname and
+# path-routes the WebSocket transport to the panel's loopback Xray inbound. The
+# node is a complete, directly-reachable endpoint, e.g. wss://<hostname>/ws — the
+# role registers the node on the panel AND creates one Remnawave Host per enabled
+# transport, advertising the origin dns_hostname (no Fastly edge domain).
+#
+# This is the business/school-friendly transport: VLESS+WS+TLS rides ordinary
+# HTTPS, so it traverses forced proxies and TLS inspection sees normal HTTPS.
+#
+# Phase 0 prerequisite (one-time, MANUAL in the panel): add a raw-Xray WS inbound
+# to the Config Profile (tag VLESS_WS_CDN, listen 127.0.0.1:8443, network ws,
+# security none, wsSettings.path /ws), then copy its UUID from
+# GET /api/config-profiles/inbounds into remnawave_cdn_transports[0].inbound_uuid.
+- name: "Deploy: Remnawave node + WS transport, direct (no CDN)"
+  hosts: remnawave_direct_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+
+    # Remnawave instead of Outline (mutually exclusive)
+    outline_enabled: false
+    remnawave_enabled: true
+
+    # Standalone Caddy on the host terminates TLS on the origin hostname and
+    # path-routes the WS transport to the loopback Xray inbound.
+    remnawave_caddy_enabled: true
+    remnawave_caddy_email: "admin@example.com"
+
+    # Panel connection + API (register_node needs the API token)
+    remnawave_panel_url: "https://panel.example.com"
+    remnawave_panel_api_token: "your-remnawave-panel-token"        # vault me
+    remnawave_panel_register_node: true
+    remnawave_panel_config_profile_uuid: "your-config-profile-uuid"
+    remnawave_panel_country_code: "US"
+    # SECRET_KEY: paste the panel-generated value into vault (default source)
+    remnawave_panel_secret_key: "your-panel-secret-key"            # vault me
+
+    # CDN transports: fill the WS inbound UUID (from Phase 0). The `path` is
+    # panel-global (must equal the inbound's wsSettings.path). XHTTP stays off.
+    remnawave_cdn_transports:
+      - name: ws
+        network: ws
+        path: "/ws"
+        internal_port: 8443
+        inbound_uuid: "your-ws-inbound-uuid"   # configProfileInboundUuid
+        alpn: "http/1.1"
+        fingerprint: chrome
+        enabled: true
+      - name: xhttp
+        network: xhttp
+        path: "/xh"
+        internal_port: 8444
+        inbound_uuid: ""
+        mode: "packet-up"
+        alpn: "h2,http/1.1"
+        fingerprint: chrome
+        enabled: false                          # Phase C gate — keep disabled
+
+    # No CDN — origin is reached directly (cdn_provider omitted == none).
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare            # DNS for origin hostname (Caddy TLS)
+        zone_id: "your-cloudflare-zone-id"
+        # cdn_provider: none                # (default) no Fastly fronting
+
+    # Cloudflare for DNS (origin A/AAAA records)
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+
+    # FreeSocks Control Plane: for Remnawave, FCP stores the PANEL (not nodes).
+    # Opt in to registering the panel record with fcp_register_remnawave_panel.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
+    fcp_register_remnawave_panel: true
+
+    envoy_mappings:
+      remnawave-direct-1:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
+# DEPLOY MODE: Remnawave node + Reality (direct, fastest)
+###############################################################################
+# Remnawave node using VLESS+Vision+REALITY — the fastest transport and the best
+# against active probing (raw TCP, mimics a real site's TLS), for OPEN networks.
+# It does NOT traverse forced HTTP proxies / TLS inspection, so it is NOT the
+# business/school pick (use the WS-via-Caddy play above for that).
+#
+# Reality is a distinct DIRECT mode: NO Caddy (Xray binds :443 itself via the
+# panel's Reality inbound), so it is mutually exclusive with remnawave_caddy_enabled
+# and incompatible with Fastly — the role asserts this and forces dns_proxied=false.
+# Reality keys (publicKey/shortIds/privateKey/flow) live on the PANEL inbound; the
+# role only creates the Host (remark <hostname>-reality, securityLayer DEFAULT).
+#
+# Phase 0 (Reality) prerequisite (one-time, MANUAL in the panel): add a Reality
+# inbound to the Config Profile — raw Xray: vless, listen 0.0.0.0:443,
+# security reality, realitySettings {dest, serverNames, privateKey, shortIds},
+# flow xtls-rprx-vision — generate the x25519 keypair (panel UI / GenerateX25519
+# endpoint / `xray x25519`), then record the inbound UUID + one serverName into
+# remnawave_reality_inbound_uuid / remnawave_reality_sni below.
+- name: "Deploy: Remnawave node + Reality (direct, fastest)"
+  hosts: remnawave_reality_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+
+    # Remnawave instead of Outline (mutually exclusive)
+    outline_enabled: false
+    remnawave_enabled: true
+
+    # Reality mode — NO Caddy (Xray binds :443 directly via the Reality inbound).
+    # remnawave_caddy_enabled MUST stay false (both would bind :443).
+    remnawave_caddy_enabled: false
+    remnawave_reality_enabled: true
+    remnawave_reality_inbound_uuid: "your-reality-inbound-uuid"   # from Phase 0
+    remnawave_reality_sni: "www.some-real-site.com"              # a serverName on the inbound
+    # remnawave_reality_address: ""        # defaults to dns_hostname
+    # remnawave_reality_port: 443
+    # remnawave_reality_fingerprint: chrome
+
+    # Panel connection + API (register_node needs the API token)
+    remnawave_panel_url: "https://panel.example.com"
+    remnawave_panel_api_token: "your-remnawave-panel-token"        # vault me
+    remnawave_panel_register_node: true
+    remnawave_panel_config_profile_uuid: "your-config-profile-uuid"
+    remnawave_panel_country_code: "US"
+    # SECRET_KEY: paste the panel-generated value into vault (default source)
+    remnawave_panel_secret_key: "your-panel-secret-key"            # vault me
+
+    # No CDN — Reality is incompatible with Fastly (cdn_provider omitted == none).
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare            # DNS for origin hostname
+        zone_id: "your-cloudflare-zone-id"
+        # cdn_provider: none                # (default) Reality cannot use Fastly
+
+    # Cloudflare for DNS (origin A/AAAA records)
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+
+    # FreeSocks Control Plane: for Remnawave, FCP stores the PANEL (not nodes).
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
+    fcp_register_remnawave_panel: true
+
+    envoy_mappings:
+      remnawave-reality-1:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
 # DEPLOY MODE: Outline + WSS via Fastly CDN (custom domain)
 ###############################################################################
 # Uses your own domain with Fastly TLS subscription (Let's Encrypt).

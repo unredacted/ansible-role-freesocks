@@ -58,16 +58,23 @@
   include_tasks: ../providers/remnawave/keygen.yml
   when: remnawave_secret_key_source == 'panel_api'
 
-# Derive the panel's active inbounds from the enabled CDN transports so node
-# registration and Host creation can't drift. Falls back to an explicitly-set
-# remnawave_panel_active_inbounds when no transport carries an inbound_uuid yet.
-- name: Derive active inbounds from enabled CDN transports
+# Derive the panel's active inbounds from the enabled CDN transports (+ the
+# Reality inbound when enabled) so node registration and Host creation can't
+# drift. Falls back to an explicitly-set remnawave_panel_active_inbounds when no
+# transport carries an inbound_uuid yet.
+- name: Derive active inbounds from enabled CDN transports (+ Reality)
   set_fact:
     remnawave_panel_active_inbounds: "{{ _derived_active_inbounds }}"
   vars:
-    _derived_active_inbounds: >-
+    _cdn_inbounds: >-
       {{ remnawave_cdn_transports | default([]) | selectattr('enabled') | map(attribute='inbound_uuid')
          | select('string') | reject('equalto', '') | list }}
+    _reality_inbounds: >-
+      {{ [remnawave_reality_inbound_uuid]
+         if (remnawave_reality_enabled | default(false) | bool
+              and (remnawave_reality_inbound_uuid | default('') | length > 0))
+         else [] }}
+    _derived_active_inbounds: "{{ _cdn_inbounds + _reality_inbounds }}"
   when: _derived_active_inbounds | length > 0
 
 # === Panel API: register node ===

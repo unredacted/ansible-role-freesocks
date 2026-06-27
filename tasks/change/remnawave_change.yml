@@ -187,8 +187,8 @@
 - name: Clean up OLD Remnawave Hosts on the panel
   include_tasks: ../providers/remnawave/cleanup_hosts.yml
   when:
-    - effective_cdn_provider | default('none') == 'fastly'
     - remnawave_panel_register_node | default(false) | bool
+    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
 
 - name: Delete OLD Fastly service
   include_tasks: ../providers/fastly/cleanup.yml
@@ -216,8 +216,15 @@
 - name: Create NEW Remnawave Hosts for the rotated hostname
   include_tasks: ../providers/remnawave/create_hosts.yml
   when:
-    - effective_cdn_provider | default('none') == 'fastly'
     - remnawave_panel_register_node | default(false) | bool
+    - remnawave_caddy_enabled | default(false) | bool
+    - effective_cdn_provider | default('none') in ['fastly', 'none']
+
+- name: Create NEW Reality Host for the rotated hostname
+  include_tasks: ../providers/remnawave/create_reality_host.yml
+  when:
+    - remnawave_panel_register_node | default(false) | bool
+    - remnawave_reality_enabled | default(false) | bool
 
 # ============================================================================
 # STEP 5: Update Panel-side address
