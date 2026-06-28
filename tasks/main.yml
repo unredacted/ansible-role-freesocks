@@ -209,6 +209,38 @@
         - slipstream_mode | default('shadowsocks') == 'shadowsocks'
         - not (outline_enabled | default(true) | bool)
 
+    # Reality transport validation (VLESS+Vision+Reality — direct, no Caddy)
+    - name: Validate Reality requires Remnawave + node registration
+      fail:
+        msg: |
+          remnawave_reality_enabled=true requires remnawave_enabled=true and
+          remnawave_panel_register_node=true (the role creates the Reality Host
+          via the panel API).
+      when:
+        - remnawave_reality_enabled | default(false) | bool
+        - not (remnawave_enabled | default(false) | bool and remnawave_panel_register_node | default(false) | bool)
+
+    - name: Validate Reality inbound UUID + SNI are set
+      fail:
+        msg: |
+          remnawave_reality_enabled=true requires remnawave_reality_inbound_uuid
+          (the Reality inbound from the Config Profile) and remnawave_reality_sni
+          (a serverName the inbound borrows). See Phase 0 (Reality).
+      when:
+        - remnawave_reality_enabled | default(false) | bool
+        - (remnawave_reality_inbound_uuid | default('') | length == 0) or (remnawave_reality_sni | default('') | length == 0)
+
+    - name: Validate Reality is mutually exclusive with Caddy and Fastly
+      fail:
+        msg: |
+          remnawave_reality_enabled=true cannot be combined with
+          remnawave_caddy_enabled=true (both bind :443) or with a Fastly CDN
+          (Reality has no Caddy origin to front). Disable Caddy and set the
+          domain's cdn_provider to none for a Reality node.
+      when:
+        - remnawave_reality_enabled | default(false) | bool
+        - (remnawave_caddy_enabled | default(false) | bool) or (effective_cdn_provider | default('none') == 'fastly')
+
     # Check for existing installation (cross-check requested vs detected component)
     - name: Check if /opt/outline already exists
       stat:
@@ -317,6 +349,12 @@
         dns_proxied: false
       when:
         - effective_cdn_provider | default('none') == 'fastly'
+
+    - name: Override dns_proxied for Reality (direct raw-TLS — no proxy)
+      set_fact:
+        dns_proxied: false
+      when:
+        - remnawave_reality_enabled | default(false) | bool
 
     - name: Include DNS tasks (Cloudflare)
       include_tasks: providers/cloudflare/dns.yml
@@ -457,7 +495,17 @@
         - component_install_success | bool
         - remnawave_enabled | default(false) | bool
         - remnawave_panel_register_node | default(false) | bool
-        - effective_cdn_provider | default('none') == 'fastly'
+        - remnawave_caddy_enabled | default(false) | bool
+        - effective_cdn_provider | default('none') in ['fastly', 'none']
+
+    # Reality node (direct, no Caddy/Fastly) — create the Reality Host.
+    - name: Create Remnawave Reality Host
+      include_tasks: providers/remnawave/create_reality_host.yml
+      when:
+        - component_install_success | bool
+        - remnawave_enabled | default(false) | bool
+        - remnawave_panel_register_node | default(false) | bool
+        - remnawave_reality_enabled | default(false) | bool
 
     # =========================================================================
     # COMPONENT: slipstream DNS Tunnel
@@ -490,6 +538,14 @@
         - fcp_enabled | default(false) | bool
         - remnawave_enabled | default(false) | bool
         - fcp_register_remnawave_panel | default(false) | bool
+
+    - name: Bind Remnawave squad to an FCP tier (optional)
+      include_tasks: providers/fcp/bind_squad.yml
+      when:
+        - component_install_success | bool
+        - fcp_enabled | default(false) | bool
+        - remnawave_enabled | default(false) | bool
+        - fcp_bind_squad | default(false) | bool
 
     - name: Display deployment summary
       debug:

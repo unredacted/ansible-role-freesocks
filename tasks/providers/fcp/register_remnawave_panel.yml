@@ -23,52 +23,21 @@
       fcp_remnawave_panel_slug, remnawave_panel_url, and remnawave_panel_api_token.
   no_log: true
 
-- name: List existing FCP backend servers
-  uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
-    method: GET
-    headers:
-      Authorization: "Bearer {{ fcp_api_token }}"
-      Accept: "application/json"
-    return_content: yes
-    status_code: [200]
-  delegate_to: localhost
-  no_log: true
-  register: fcp_panel_list
-
-- name: Find existing FCP panel entry by slug
-  set_fact:
-    _fcp_panel_id: "{{ (fcp_panel_list.json.response | default([]) | selectattr('slug', 'equalto', fcp_remnawave_panel_slug) | map(attribute='id') | first) | default('') }}"
-
+# Idempotent upsert by slug — a single PUT, no GET-list/resolution. `slug` is in
+# the URL path (authoritative); a blank apiToken on re-run keeps FCP's stored one.
 - name: Build FCP panel body (Remnawave)
   set_fact:
     _fcp_panel_body:
       backend: "remnawave"
       name: "{{ fcp_remnawave_panel_slug }}"
-      slug: "{{ fcp_remnawave_panel_slug }}"
       baseUrl: "{{ remnawave_panel_url }}"
       apiToken: "{{ remnawave_panel_api_token }}"
   no_log: true
 
-- name: Create FCP panel (Remnawave)
+- name: Upsert FCP panel (Remnawave, idempotent by slug)
   uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
-    method: POST
-    headers:
-      Authorization: "Bearer {{ fcp_api_token }}"
-      Content-Type: "application/json"
-      Accept: "application/json"
-    body_format: json
-    body: "{{ _fcp_panel_body }}"
-    status_code: [200, 201]
-  delegate_to: localhost
-  no_log: true
-  when: _fcp_panel_id | length == 0
-
-- name: Update FCP panel (Remnawave, PATCH by id)
-  uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/{{ _fcp_panel_id }}"
-    method: PATCH
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/by-slug/{{ fcp_remnawave_panel_slug | urlencode }}"
+    method: PUT
     headers:
       Authorization: "Bearer {{ fcp_api_token }}"
       Content-Type: "application/json"
@@ -78,11 +47,38 @@
     status_code: [200]
   delegate_to: localhost
   no_log: true
-  when: _fcp_panel_id | length > 0
+  register: fcp_panel_upsert
 
 - name: Display FCP panel registration result
   debug:
     msg: >-
       FCP Remnawave panel '{{ fcp_remnawave_panel_slug }}'
-      {{ 'updated' if (_fcp_panel_id | length > 0) else 'created' }}
+      {{ 'created' if (fcp_panel_upsert.json.created | default(false)) else 'updated' }}
       at {{ fcp_api_url }} (panel {{ remnawave_panel_url }}).
+
+- name: Verify FCP can reach the Remnawave panel
+  when: fcp_verify_connectivity | default(true) | bool
+  block:
+    - name: Probe FCP -> panel connectivity (test-connection)
+      uri:
+        url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/test-connection"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ fcp_api_token }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+        body_format: json
+        body: "{{ _fcp_panel_body }}"
+        status_code: [200]
+      delegate_to: localhost
+      no_log: true
+      register: fcp_panel_testconn
+    - name: Assert FCP reached the panel
+      assert:
+        that:
+          - fcp_panel_testconn.json.ok | default(false) | bool
+        fail_msg: >-
+          FCP registered the Remnawave panel '{{ fcp_remnawave_panel_slug }}' but
+          could NOT reach it ({{ remnawave_panel_url }}). Check the panel URL +
+          API token. Set fcp_verify_connectivity=false to skip this gate.
+        success_msg: "FCP reached the Remnawave panel OK."
