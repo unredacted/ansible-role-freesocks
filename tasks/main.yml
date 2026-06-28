@@ -539,6 +539,14 @@
         - remnawave_enabled | default(false) | bool
         - fcp_register_remnawave_panel | default(false) | bool
 
+    - name: Bind Remnawave squad to an FCP tier (optional)
+      include_tasks: providers/fcp/bind_squad.yml
+      when:
+        - component_install_success | bool
+        - fcp_enabled | default(false) | bool
+        - remnawave_enabled | default(false) | bool
+        - fcp_bind_squad | default(false) | bool
+
     - name: Display deployment summary
       debug:
         msg: |

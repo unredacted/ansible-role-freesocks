@@ -217,6 +217,14 @@ fcp_server_slug: "{{ random_hostname | default('') }}"   # unique, immutable key
 fcp_register_remnawave_panel: false # register the Remnawave panel as a backendServers row
 fcp_remnawave_panel_slug: "remnawave-primary"
 fcp_verify_connectivity: true       # after registering, assert FCP can reach the backend (needs admin:servers:read)
+# Declarative squad->tier binding (opt-in). FCP issues a member's key into the
+# Remnawave squad named on their tier; this binds it without the manual CMS copy.
+# Requires the fsv1_ token to ALSO hold admin:tiers:write (wider than servers:*) —
+# mint it with that extra scope when enabling. The squad UUID comes from the
+# panel (Phase-0 provisioning); set it in vault/host_vars, not here.
+fcp_bind_squad: false               # bind remnawave_squad_uuid -> fcp_squad_tier_slug
+fcp_squad_tier_slug: "member"       # the FCP tier slug to bind the squad to
+# remnawave_squad_uuid: ""          # the Remnawave internal-squad UUID (vault/host_vars)
 
 # Additional required variables for migration mode:
 # source_hostname: "outline1-jfk"      # Hostname of the source server

@@ -161,6 +161,12 @@ fcp_register_remnawave_panel: false
 
 # Slug for the Remnawave panel record in FCP
 fcp_remnawave_panel_slug: "remnawave-primary"
+
+# Remnawave only: bind a squad to an FCP tier declaratively (default: false).
+# Needs the token to ALSO hold admin:tiers:write; squad UUID goes in vault.
+fcp_bind_squad: false
+fcp_squad_tier_slug: "member"        # the FCP tier to bind the squad to
+# remnawave_squad_uuid: "..."        # the Remnawave squad UUID (vault/host_vars)
 ```
 
 **What gets registered depends on the backend:**
@@ -173,7 +179,9 @@ fcp_remnawave_panel_slug: "remnawave-primary"
 
 - **Remnawave** — FCP stores only the **panel** (`baseUrl` + `apiToken`), **not** individual nodes. Per-node config reaches users through the panel's subscription output. The role still registers the node and creates Hosts on the panel (separate, unchanged behavior). Registering the panel with FCP is opt-in via `fcp_register_remnawave_panel: true` (with `fcp_remnawave_panel_slug`).
 
-**Migrate cleans up the source row.** When an Outline server is migrated to a new host, the destination is registered (PATCH/POST) under its own slug and the role then **deletes the source server's FCP `backendServers` row** (by the source slug, `source_kv_hostname`) via `tasks/providers/fcp/delete_server.yml`. This leaves no orphaned row behind. The delete is idempotent (resolves slug → id and no-ops if absent) and is skipped when source and destination slugs are identical.
+**Declarative squad → tier binding (opt-in).** FCP issues a member's key into the Remnawave **squad** named on their tier (`tiers.remnawaveSquadUuid`). Rather than hand-copying that UUID into the admin CMS, set `fcp_bind_squad: true` with `remnawave_squad_uuid` (from the panel, in vault) and `fcp_squad_tier_slug` (the tier, default `member`); the role then `PUT`s the squad onto that tier via FCP's idempotent **`tiers/by-slug/{slug}`** upsert. This needs the `fsv1_` token to **also** hold `admin:tiers:write` (wider than `admin:servers:*`) — mint it with that extra scope. The squad UUID is treated as sensitive (the request is `no_log`, and FCP audits a `squadBound` boolean, never the UUID).
+
+**Migrate cleans up the source row.** When an Outline server is migrated to a new host, the destination is registered under its own slug and the role then **deletes the source server's FCP `backendServers` row** (by the source slug, `source_kv_hostname`) via `tasks/providers/fcp/delete_server.yml` — a single idempotent `DELETE …/backend-servers/by-slug/{slug}` (no GET-list / id resolution; no-ops if absent). This leaves no orphaned row behind, and is skipped when source and destination slugs are identical.
 
 ### WebSocket (WSS) Support
 
@@ -901,7 +909,7 @@ templates/
 The role ships offline, self-asserting tests under `tests/` (they run with `connection: local`, render templates, and exercise the role's filter expressions — no real hosts or API calls):
 
 - **`tests/test_caddyfile_render.yml`** — renders the Remnawave Caddyfile template and asserts its structure (transport routes + decoy fallback).
-- **`tests/test_fcp_and_hosts.yml`** — exercises FCP slug→id resolution and the Remnawave Host request-body shaping.
+- **`tests/test_fcp_and_hosts.yml`** — exercises the FCP Outline `apiUrl` construction and the Remnawave Host request-body shaping (FCP is addressed by slug, so there is no id resolution to test).
 
 Run them all with the helper script, or individually:
 
