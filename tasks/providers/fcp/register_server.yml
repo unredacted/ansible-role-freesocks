@@ -67,35 +67,19 @@
     - _fcp_ws_domain is not defined
 
 # ---------------------------------------------------------------------------
-# Resolve slug -> id (GET the list) and build the request body
+# Build the request body, then idempotently upsert by slug (a single PUT — no
+# GET-list, no client-side slug->id resolution).
 # ---------------------------------------------------------------------------
-- name: List existing FCP backend servers
-  uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
-    method: GET
-    headers:
-      Authorization: "Bearer {{ fcp_api_token }}"
-      Accept: "application/json"
-    return_content: yes
-    status_code: [200]
-  delegate_to: localhost
-  no_log: true
-  register: fcp_servers_list
-
-- name: Find existing FCP entry by slug
-  set_fact:
-    _fcp_existing_id: "{{ (fcp_servers_list.json.servers | default([]) | selectattr('slug', 'equalto', fcp_server_slug) | map(attribute='id') | first) | default('') }}"
-
 # websocketDomain is added conditionally (not via omit) so the JSON never leaks
-# Ansible's omit sentinel. On PATCH, only provided fields change — so omitting
-# websocketDomain (e.g. a Fastly host in update mode with no local
-# fastly_websocket_domain) preserves FCP's existing value.
+# Ansible's omit sentinel. The upsert leaves an absent field unchanged (and a
+# blank secret keeps FCP's stored one), so omitting websocketDomain (e.g. a
+# Fastly host in update mode with no local fastly_websocket_domain) preserves
+# FCP's existing value. `slug` lives in the URL path, not the body.
 - name: Build base FCP backend-server body (Outline)
   set_fact:
     _fcp_body:
       backend: "outline"
       name: "{{ fcp_server_name | default(fcp_server_slug) }}"
-      slug: "{{ fcp_server_slug }}"
       apiUrl: "{{ _fcp_outline_api_url }}"
       websocketEnabled: "{{ outline_wss_enabled | default(false) | bool }}"
 
@@ -104,29 +88,13 @@
     _fcp_body: "{{ _fcp_body | combine({'websocketDomain': _fcp_ws_domain}) }}"
   when: _fcp_ws_domain is defined and _fcp_ws_domain | length > 0
 
-# ---------------------------------------------------------------------------
-# Create or update
-# ---------------------------------------------------------------------------
-- name: Create FCP backend server (Outline)
+# Idempotent upsert: the slug in the path is authoritative; FCP creates the row
+# or merges into the existing one (keep-secret-on-blank), returning {created}.
+# A write-only-then-read token both works here and on the test-connection probe.
+- name: Upsert FCP backend server (Outline, idempotent by slug)
   uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers"
-    method: POST
-    headers:
-      Authorization: "Bearer {{ fcp_api_token }}"
-      Content-Type: "application/json"
-      Accept: "application/json"
-    body_format: json
-    body: "{{ _fcp_body }}"
-    status_code: [200, 201]
-  delegate_to: localhost
-  no_log: true
-  register: fcp_create_result
-  when: _fcp_existing_id | length == 0
-
-- name: Update FCP backend server (Outline, PATCH by id)
-  uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/{{ _fcp_existing_id }}"
-    method: PATCH
+    url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/by-slug/{{ fcp_server_slug | urlencode }}"
+    method: PUT
     headers:
       Authorization: "Bearer {{ fcp_api_token }}"
       Content-Type: "application/json"
@@ -136,12 +104,44 @@
     status_code: [200]
   delegate_to: localhost
   no_log: true
-  register: fcp_update_result
-  when: _fcp_existing_id | length > 0
+  register: fcp_upsert_result
 
 - name: Display FCP registration result
   debug:
     msg: >-
       FCP backend server '{{ fcp_server_slug }}' (Outline)
-      {{ 'updated' if (_fcp_existing_id | length > 0) else 'created' }}
+      {{ 'created' if (fcp_upsert_result.json.created | default(false)) else 'updated' }}
       at {{ fcp_api_url }} — apiUrl host {{ dns_hostname }}.
+
+# ---------------------------------------------------------------------------
+# Verify FCP can actually reach the backend it just registered, so a mistyped /
+# unreachable apiUrl fails the play loudly instead of leaving a dead row that
+# only surfaces later at issuance. Gated by fcp_verify_connectivity (default
+# true); the probe needs the admin:servers:read scope.
+# ---------------------------------------------------------------------------
+- name: Verify FCP can reach the Outline backend
+  when: fcp_verify_connectivity | default(true) | bool
+  block:
+    - name: Probe FCP -> backend connectivity (test-connection)
+      uri:
+        url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/test-connection"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ fcp_api_token }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+        body_format: json
+        body: "{{ _fcp_body }}"
+        status_code: [200]
+      delegate_to: localhost
+      no_log: true
+      register: fcp_testconn
+    - name: Assert FCP reached the backend
+      assert:
+        that:
+          - fcp_testconn.json.ok | default(false) | bool
+        fail_msg: >-
+          FCP registered '{{ fcp_server_slug }}' but could NOT reach it (host
+          {{ dns_hostname }}). Check the Caddy management-API proxy + public TLS.
+          Set fcp_verify_connectivity=false to skip this gate.
+        success_msg: "FCP reached the Outline backend OK."

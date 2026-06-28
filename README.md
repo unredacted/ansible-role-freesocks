@@ -129,12 +129,16 @@ destination_hostname: ""
 
 The role publishes each server's connection details to the **FreeSocks Control Plane (FCP)** instead of writing to a key/value store. FCP is a self-hosted [Convex](https://www.convex.dev/) backend (previously Cloudflare Workers + KV); it no longer reads KV. Instead it stores each server's management credential and dials **out** to the server.
 
-Registration uses FCP's admin REST API and is **idempotent by a unique `slug`**:
+Registration is a single **idempotent upsert keyed by `slug`**:
 
-- `POST /api/v1/admin/backend-servers` — create a server record
-- `PATCH /api/v1/admin/backend-servers/{id}` — update an existing record (used by change/migrate/update)
+- `PUT /api/v1/admin/backend-servers/by-slug/{slug}` — creates the server record, or merges into the existing one (keep-secret-on-blank), returning `{created}`. No GET-list or client-side id resolution, so a re-run never clashes.
+- After registering, the role optionally probes `POST …/backend-servers/test-connection` so a mistyped or unreachable backend fails the play loudly instead of leaving a dead row (gated by `fcp_verify_connectivity`, default `true`).
 
-Requests are authenticated with an `fsv1_` service token that carries **both** the `admin:servers:read` and `admin:servers:write` scopes (read for the slug-idempotency list, write for create/update — a write-only token 401s on the GET-list step).
+Requests use an `fsv1_` service token with `admin:servers:write` (plus `admin:servers:read` for the test-connection probe). Mint it headlessly on the FCP host:
+
+    bunx convex run adminApi:mintAutomationToken '{"scopes":["admin:servers:read","admin:servers:write"]}'
+
+This returns a scoped token attributed to a synthetic, credential-less `automation` admin (it can never sign in) — or create one in the FCP admin CMS → API Tokens.
 
 ```yaml
 # Enable FCP registration (default: false)

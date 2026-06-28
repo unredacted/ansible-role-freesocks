@@ -195,10 +195,13 @@ envoy_mappings: {} # Define your envoy mappings as shown in the example above
 # FreeSocks Control Plane (FCP) Registration
 # ============================================================================
 # FCP (the control plane) stores each server's management credential and dials
-# out to it. The role registers servers with FCP's admin API
-# (POST/PATCH /api/v1/admin/backend-servers) using an fsv1_ service token that
-# holds the admin:servers:read + admin:servers:write scopes (read for the
-# slug-idempotency list, write for create/update). Registration is idempotent by `slug`.
+# out to it. The role registers servers with FCP's admin API via a single
+# idempotent PUT /api/v1/admin/backend-servers/by-slug/{slug}, using an fsv1_
+# service token that holds admin:servers:write (plus admin:servers:read for the
+# optional post-register test-connection probe — see fcp_verify_connectivity).
+# Mint the token headlessly on the FCP host with:
+#   bunx convex run adminApi:mintAutomationToken \
+#     '{"scopes":["admin:servers:read","admin:servers:write"]}'
 #
 #   - Outline: each server is one backendServers row — apiUrl is the
 #     Caddy-proxied management URL (valid TLS; FCP requires it), plus
@@ -213,6 +216,7 @@ fcp_server_name: "{{ random_hostname | default('') }}"   # human-friendly name i
 fcp_server_slug: "{{ random_hostname | default('') }}"   # unique, immutable key in FCP
 fcp_register_remnawave_panel: false # register the Remnawave panel as a backendServers row
 fcp_remnawave_panel_slug: "remnawave-primary"
+fcp_verify_connectivity: true       # after registering, assert FCP can reach the backend (needs admin:servers:read)
 
 # Additional required variables for migration mode:
 # source_hostname: "outline1-jfk"      # Hostname of the source server
