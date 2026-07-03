@@ -486,3 +486,79 @@ fastly_backend_connect_timeout: 5000
 # first_byte_timeout: Time in ms to wait for the first byte from origin (default: 15000)
 # Covers TLS handshake + WebSocket upgrade response
 fastly_backend_first_byte_timeout: 30000
+
+# ============================================================================
+# Panel bootstrap (operation_mode=bootstrap) — one-time, panel-only, host-agnostic
+# ============================================================================
+# `operation_mode=bootstrap` creates the panel objects a working key needs and
+# is IDEMPOTENT (GET-before-POST). It replaces the manual "Phase 0" panel setup:
+#   1. x25519 keypair (Reality)                → gen_x25519.yml
+#   2. a Config Profile + WS/XHTTP/Reality inbounds → create_config_profile.yml
+#   3. a fronted squad (WS+XHTTP) + a Reality squad → create_squad.yml
+#   4. bind those squads to FCP connection profiles → providers/fcp/bind_profiles.yml
+# It touches NO host (delegate_to: localhost throughout). Run once per panel, e.g.:
+#   ansible-playbook playbook.yml -e operation_mode=bootstrap \
+#     -e remnawave_panel_url=https://panel.example.com -e fcp_enabled=true ...
+# It PRINTS the created Config Profile / inbound UUIDs — copy them into your
+# node-deploy vars (remnawave_panel_config_profile_uuid,
+# remnawave_cdn_transports[].inbound_uuid, remnawave_reality_inbound_uuid).
+#
+# NOTE: the fsv1_ token used for bind_profiles must hold admin:settings:write
+# (wider than the admin:servers:* the node-registration path needs); mint it with
+# that scope when bootstrapping:
+#   bunx convex run adminApi:mintAutomationToken \
+#     '{"scopes":["admin:settings:write","admin:servers:read","admin:servers:write"]}'
+
+# Master switch is operation_mode=bootstrap; these tune what it creates.
+remnawave_bootstrap_config_profile_name: "FreeSocks-CDN"
+remnawave_bootstrap_reality: true                     # also create the Reality inbound + squad
+remnawave_bootstrap_fronted_squad_name: "FreeSocks-Fronted"
+remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
+
+# Panel x25519 keypair endpoint (Reality). VERIFY on your panel /docs: v2.8 uses
+# GET /api/system/tools/x25519/generate; the response is parsed tolerant of both
+# a flat {privateKey,publicKey} and a {keypairs:[{privateKey,...}]} shape.
+remnawave_x25519_endpoint: "/api/system/tools/x25519/generate"
+
+# Reality inbound params (the borrowed-site TLS handshake it mimics). dest +
+# serverNames must be a real, reachable TLS site; shortIds [""] = accept-all.
+remnawave_bootstrap_reality_dest: "www.microsoft.com:443"
+remnawave_bootstrap_reality_server_names: ["www.microsoft.com"]
+remnawave_bootstrap_reality_short_ids: [""]
+# Reality stream network: v2.8 renamed the raw-TCP carrier "tcp" -> "raw". VERIFY
+# against your panel; flip to "tcp" on older panels.
+remnawave_bootstrap_reality_network: "raw"
+
+# The WS/XHTTP inbounds (raw Xray) the bootstrap POSTs into the Config Profile.
+# tags MUST match what create_config_profile reads back + what create_squad binds
+# (VLESS_WS_CDN / VLESS_XHTTP_CDN); ports/paths MUST match remnawave_cdn_transports.
+remnawave_bootstrap_cdn_inbounds:
+  - tag: "VLESS_WS_CDN"
+    listen: "127.0.0.1"
+    port: 8443
+    protocol: "vless"
+    settings: { clients: [], decryption: "none" }
+    streamSettings:
+      network: "ws"
+      security: "none"
+      wsSettings: { path: "/ws" }
+    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+  - tag: "VLESS_XHTTP_CDN"
+    listen: "127.0.0.1"
+    port: 8444
+    protocol: "vless"
+    settings: { clients: [], decryption: "none" }
+    streamSettings:
+      network: "xhttp"
+      security: "none"
+      xhttpSettings:
+        path: "/xh"
+        mode: "packet-up"
+        scMaxEachPostBytes: 1000000
+        scMaxBufferedPosts: 30
+        scMinPostsIntervalMs: 30
+        xPaddingBytes: "100-1000"
+    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+
+# FCP default connection profile bind_profiles sets ('evade' = Stay connected).
+fcp_default_connection_profile: "evade"

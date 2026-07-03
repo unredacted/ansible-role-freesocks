@@ -18,26 +18,31 @@
 # ============================================================================
 - name: Fail if operation mode is not specified
   fail:
-    msg: "Operation mode must be explicitly set to 'deploy', 'migrate', 'change', or 'update'"
+    msg: "Operation mode must be explicitly set to 'deploy', 'migrate', 'change', 'update', or 'bootstrap'"
   when: operation_mode is not defined or operation_mode == ""
 
 - name: Fail if operation mode is invalid
   fail:
-    msg: "Operation mode must be 'deploy', 'migrate', 'change', or 'update', got: {{ operation_mode }}"
-  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate', 'change', 'update']
+    msg: "Operation mode must be 'deploy', 'migrate', 'change', 'update', or 'bootstrap', got: {{ operation_mode }}"
+  when: operation_mode is defined and operation_mode not in ['deploy', 'migrate', 'change', 'update', 'bootstrap']
 
 # ============================================================================
 # VALIDATION: Environment Mode
 # ============================================================================
+# Bootstrap is panel-only (host-agnostic), so it doesn't need an environment mode.
 - name: Fail if environment mode is not specified
   fail:
     msg: "Environment mode must be explicitly set to either 'prod' or 'dev' via --extra-vars"
-  when: environment_mode is not defined or environment_mode == ""
+  when:
+    - operation_mode | default('') != 'bootstrap'
+    - environment_mode is not defined or environment_mode == ""
 
 - name: Fail if environment mode is invalid
   fail:
     msg: "Environment mode must be either 'prod' or 'dev', got: {{ environment_mode }}"
-  when: environment_mode is defined and environment_mode not in ['prod', 'dev']
+  when:
+    - operation_mode | default('') != 'bootstrap'
+    - environment_mode is defined and environment_mode not in ['prod', 'dev']
 
 # ============================================================================
 # VALIDATION: Provider Configuration
@@ -47,14 +52,14 @@
   fail:
     msg: "dns_provider must be explicitly set (e.g., 'cloudflare')"
   when:
-    - operation_mode not in ['change', 'deploy', 'update']
+    - operation_mode not in ['change', 'deploy', 'update', 'bootstrap']
     - dns_provider is not defined or dns_provider == ""
 
 - name: Fail if dns_provider is invalid
   fail:
     msg: "dns_provider must be 'cloudflare', got: {{ dns_provider }}"
   when:
-    - operation_mode not in ['change', 'deploy', 'update']
+    - operation_mode not in ['change', 'deploy', 'update', 'bootstrap']
     - dns_provider is defined
     - dns_provider not in ['cloudflare']
 
@@ -62,7 +67,7 @@
   fail:
     msg: "cdn_provider must be 'cloudflare', 'fastly', or 'none', got: {{ cdn_provider }}"
   when:
-    - operation_mode not in ['change', 'deploy', 'update']
+    - operation_mode not in ['change', 'deploy', 'update', 'bootstrap']
     - cdn_provider is defined
     - cdn_provider not in ['cloudflare', 'fastly', 'none']
 
@@ -945,4 +950,69 @@
         - not (slipstream_already_installed | default(false))
         - slipstream_mode | default('shadowsocks') == 'raw'
   when: operation_mode == 'update'
+
+# ============================================================================
+# BOOTSTRAP MODE (panel-only, host-agnostic, run once per panel)
+# ============================================================================
+# Create the Remnawave panel objects a working key needs — a Config Profile with
+# WS/XHTTP/Reality inbounds, an x25519 keypair for Reality, a fronted squad
+# (WS+XHTTP) and a Reality squad — then bind the two squads to FCP's connection
+# profiles (the member "Stay connected" / "Maximize privacy" chooser). Fully
+# idempotent (GET-before-POST); touches NO host (delegate_to: localhost). This
+# replaces the manual "Phase 0" panel setup. Run once, e.g.:
+#   ansible-playbook playbook.yml -e operation_mode=bootstrap \
+#     -e remnawave_panel_url=https://panel.example.com -e fcp_enabled=true \
+#     --ask-vault-pass
+# It PRINTS the created Config Profile + inbound UUIDs — copy them into your
+# node-deploy vars (see defaults/main.yml "Panel bootstrap").
+- name: Bootstrap the Remnawave panel (config profile + inbounds + squads) and FCP profiles
+  block:
+    - name: Validate bootstrap prerequisites
+      assert:
+        that:
+          - remnawave_panel_url is defined and remnawave_panel_url | length > 0
+          - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
+        fail_msg: >-
+          Bootstrap requires remnawave_panel_url and remnawave_panel_api_token (a
+          panel API token with config-profile, internal-squad, and system-tools scopes).
+      no_log: true
+
+    - name: Generate the Reality x25519 keypair (panel API)
+      include_tasks: providers/remnawave/gen_x25519.yml
+      when: remnawave_bootstrap_reality | default(true) | bool
+
+    - name: Ensure the Config Profile + inbounds exist (capture their UUIDs)
+      include_tasks: providers/remnawave/create_config_profile.yml
+
+    - name: Ensure the connection-profile squads exist (capture their UUIDs)
+      include_tasks: providers/remnawave/create_squad.yml
+
+    - name: Bind the squads to FCP connection profiles
+      include_tasks: providers/fcp/bind_profiles.yml
+      when: fcp_enabled | default(false) | bool
+
+    - name: Bootstrap summary
+      debug:
+        msg: |
+          Panel bootstrap complete.
+
+          Config Profile: {{ remnawave_bootstrap_config_profile_name }}
+            uuid: {{ remnawave_panel_config_profile_uuid | default('(unresolved)') }}
+
+          Inbounds (copy into your node-deploy vars):
+            remnawave_cdn_transports[ws].inbound_uuid:    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}
+            remnawave_cdn_transports[xhttp].inbound_uuid: {{ remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('(none)') }}
+            remnawave_reality_inbound_uuid:               {{ remnawave_reality_inbound_uuid | default('(disabled)') }}
+
+          Squads:
+            fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ remnawave_fronted_squad_uuid | default('(none)') }}
+            reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ remnawave_reality_squad_uuid | default('(disabled)') }}
+
+          {% if fcp_enabled | default(false) | bool %}
+          FCP connection profiles bound (evade -> fronted, privacy -> reality).
+          {% else %}
+          FCP binding skipped (fcp_enabled=false) — set the squad UUIDs in the FCP
+          admin CMS (Settings -> Connection profiles) or re-run with fcp_enabled=true.
+          {% endif %}
+  when: operation_mode == 'bootstrap'
 
