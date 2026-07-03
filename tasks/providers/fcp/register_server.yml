@@ -123,6 +123,14 @@
 - name: Verify FCP can reach the Outline backend
   when: fcp_verify_connectivity | default(true) | bool
   block:
+    # FCP's test-connection validator declares only { backend, baseUrl, apiToken,
+    # apiUrl, websocketEnabled, websocketDomain } — NOT `name`. Convex arg
+    # validators are strict (an undeclared field is rejected), and the route
+    # forwards the body unfiltered, so reusing the upsert body (which carries
+    # `name`) 500s the probe. Send the same body minus `name`.
+    - name: Build the FCP test-connection body (drop `name`; the probe validator omits it)
+      set_fact:
+        _fcp_testconn_body: "{{ _fcp_body | dict2items | rejectattr('key', 'equalto', 'name') | items2dict }}"
     - name: Probe FCP -> backend connectivity (test-connection)
       uri:
         url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/test-connection"
@@ -132,7 +140,7 @@
           Content-Type: "application/json"
           Accept: "application/json"
         body_format: json
-        body: "{{ _fcp_body }}"
+        body: "{{ _fcp_testconn_body }}"
         status_code: [200]
       delegate_to: localhost
       no_log: true

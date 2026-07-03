@@ -59,6 +59,11 @@
 - name: Verify FCP can reach the Remnawave panel
   when: fcp_verify_connectivity | default(true) | bool
   block:
+    # FCP's test-connection validator omits `name` (Convex rejects undeclared
+    # fields), so reuse the panel body minus `name`.
+    - name: Build the FCP panel test-connection body (drop `name`)
+      set_fact:
+        _fcp_panel_testconn_body: "{{ _fcp_panel_body | dict2items | rejectattr('key', 'equalto', 'name') | items2dict }}"
     - name: Probe FCP -> panel connectivity (test-connection)
       uri:
         url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/test-connection"
@@ -68,7 +73,7 @@
           Content-Type: "application/json"
           Accept: "application/json"
         body_format: json
-        body: "{{ _fcp_panel_body }}"
+        body: "{{ _fcp_panel_testconn_body }}"
         status_code: [200]
       delegate_to: localhost
       no_log: true
