@@ -26,6 +26,8 @@
 
 - name: Rename source Remnawave directory (keep for rollback)
   command: "mv {{ remnawave_node_install_dir }} {{ remnawave_node_install_dir }}.migrated"
+  args:
+    creates: "{{ remnawave_node_install_dir }}.migrated"  # idempotent: skip if already renamed
   become: yes
   when: inventory_hostname == source_hostname
 

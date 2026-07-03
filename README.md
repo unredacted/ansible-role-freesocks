@@ -27,6 +27,119 @@ Features:
   `ansible-galaxy collection install -r requirements.yml`
 - Provider-specific requirements (see Provider Configuration)
 
+## Quick start: brand-new deployment
+
+This role provisions and fronts **one** proxy node and registers it with FCP. A first
+deploy touches three systems **in order** — do the prerequisites before running the
+role, or the run fails (or, if you skip Remnawave Phase 0, silently issues dead keys).
+
+### 0. Prerequisites (do these first)
+
+**Control plane (FCP)** — stand it up (see the FCP repo's deploy runbook), then:
+
+- Seed tiers/settings and confirm the `member` tier exists.
+- Mint a headless automation token on the FCP host and store the printed `fsv1_…`
+  value in your vault as `fcp_api_token`:
+  ```sh
+  bunx convex run adminApi:mintAutomationToken \
+    '{"name":"ansible","scopes":["admin:servers:read","admin:servers:write"]}'
+  # add "admin:tiers:write" to the scopes too if you will use fcp_bind_squad
+  ```
+
+**Remnawave panel** (Remnawave nodes only — Phase 0, once per panel):
+
+- Create a Config Profile with your transport inbound(s) (WS and/or Reality); record
+  each inbound's `configProfileInboundUuid` and the Config Profile UUID.
+- Create the internal squad your FCP tier issues into; record its UUID.
+- Create a panel API token.
+- **Skipping Phase 0 leaves the node with no Hosts and no working keys — silently.**
+
+**DNS** — a Cloudflare zone for your domain + a scoped API token (`Zone:DNS:Edit`).
+
+**Target host** — a clean **Debian 12** box reachable over SSH as root (or a sudo user
+with `--become`), with ports **80 and 443 free** (Caddy uses HTTP-01 on 80, TLS on 443).
+
+**Controller** — ansible-core ≥ 2.15 and the collections:
+
+```sh
+ansible-galaxy collection install -r requirements.yml
+```
+
+### 1. Configure secrets + domains
+
+Put every secret in an **Ansible Vault** — for a fronted Remnawave node that is
+`cloudflare_api_token`, `fcp_api_token`, `remnawave_panel_api_token` (and/or
+`remnawave_panel_secret_key`), `fastly_api_token` (only if `cdn_provider: fastly`), and
+`remnawave_squad_uuid` (only if binding a squad).
+
+> ⚠️ The role's vault-decryption guard only checks `cloudflare_api_token`. It will **not**
+> catch a Remnawave/FCP secret left as a `your-…` placeholder — those fail later at
+> runtime (a node that can't reach its panel, or a 401 from FCP). Confirm every secret is
+> filled/vaulted before running.
+
+Define your domain → provider map (in `group_vars` or the playbook):
+
+```yaml
+domain_providers:
+  example.com:
+    dns_provider: cloudflare
+    cdn_provider: fastly # or 'none' for a Reality / unfronted node
+    fastly_domain_mode: shared
+    zone_id: "<cloudflare-zone-id>"
+```
+
+### 2. Deploy
+
+Write a `playbook.yml` that applies the role to your host. A **fronted Remnawave node**:
+
+```yaml
+- hosts: new_node
+  become: true
+  vars_files: [vault.yml] # cloudflare_api_token, fcp_api_token, remnawave_panel_api_token, …
+  vars:
+    domain_providers: { } # as above (or in group_vars)
+    outline_enabled: false
+    remnawave_enabled: true
+    remnawave_panel_url: "https://panel.example.org"
+    remnawave_secret_key_source: "panel_api" # fetch SECRET_KEY from the panel
+    remnawave_caddy_enabled: true
+    remnawave_caddy_email: "admin@example.org"
+    remnawave_panel_register_node: true
+    remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
+    remnawave_cdn_transports:
+      - { name: ws, network: ws, path: "/ws", internal_port: 8443, inbound_uuid: "<ws-inbound-uuid>", alpn: "http/1.1", fingerprint: chrome, enabled: true }
+    fcp_enabled: true
+    fcp_api_url: "https://control-plane.example.org"
+    fcp_register_remnawave_panel: true # register the panel row (once)
+    fcp_bind_squad: true # bind the squad to a tier (needs admin:tiers:write)
+    remnawave_squad_uuid: "<squad-uuid>"
+  roles:
+    - ansible-role-freesocks
+```
+
+The operation mode is passed at run time; `--ask-vault-pass` decrypts the vault:
+
+```sh
+ansible-playbook -i inventory playbook.yml --ask-vault-pass \
+  --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com"
+```
+
+A minimal **Outline** node is simpler — Outline is the default backend and WSS/FCP are
+opt-in; a play that leaves `outline_enabled: true` and sets `fcp_enabled: true` plus the
+FCP + Cloudflare vars deploys an Outline server with the same run command.
+
+`example-playbook.yml` has ready-to-adapt plays for every component combination; the
+sections below document each variable.
+
+### 3. Verify it worked
+
+- **FCP admin dashboard** → the backend row for this host appears and reads healthy (the
+  deploy already hard-asserts FCP could reach it unless `fcp_verify_connectivity=false`).
+- **Remnawave panel** → the node is listed + online, with one Host per enabled transport.
+- **Decoy** → `curl -sI https://<hostname>/` returns the camouflage site (HTTP 200) on any
+  non-transport path.
+- Issue a test key from FCP and confirm it connects.
+
 ## Provider Configuration
 
 The role uses a pluggable provider architecture for DNS and CDN. Server endpoint data is published to the FreeSocks Control Plane (FCP) rather than to a key/value store (see [FreeSocks Control Plane Registration](#freesocks-control-plane-registration)).

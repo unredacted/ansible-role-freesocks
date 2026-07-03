@@ -1,9 +1,11 @@
 galaxy_info:
   author: lunarthegrey
-  description: An Ansible role to help with the deployment of new FreeSocks Outline VPN servers
+  description: Deploys and CDN-fronts FreeSocks proxy nodes (Remnawave/Xray, optional Outline) and registers them with the FreeSocks Control Plane
   company: Unredacted Inc
   license: GPL-3.0-only
-  min_ansible_version: 2.1
+  # Needs community.docker >=3.4.0 (docker_compose_v2) + modern Jinja filters,
+  # both of which require ansible-core 2.15+.
+  min_ansible_version: "2.15"
   platforms:
     - name: Debian
       versions:

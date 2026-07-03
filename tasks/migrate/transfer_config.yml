@@ -8,6 +8,7 @@
     dest: /tmp/outline.tar.gz
     format: gz
   become: yes
+  no_log: true   # /opt/outline/access.txt carries the Outline management secret
   when: inventory_hostname == source_hostname
   register: archive_created
 
@@ -22,6 +23,8 @@
 
 - name: Rename source Outline directory
   command: mv /opt/outline /opt/outline.migrated
+  args:
+    creates: /opt/outline.migrated  # idempotent: skip if a prior run already renamed it
   become: yes
   when: inventory_hostname == source_hostname
 

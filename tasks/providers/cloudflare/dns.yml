@@ -75,6 +75,7 @@
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv4 is defined
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: dns_a_records_result
 
 - name: Debug DNS A records results
@@ -104,6 +105,7 @@
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv6 is defined
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: dns_aaaa_records_result
 
 - name: Debug DNS AAAA records results
@@ -134,6 +136,7 @@
   when:
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined
     - ansible_facts['default_ipv4']['address'] is defined
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: fallback_dns_a_record_result
 
 - name: Debug fallback DNS A record result
@@ -161,6 +164,7 @@
   when:
     - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined
     - ansible_facts['default_ipv6']['address'] is defined
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: fallback_dns_aaaa_record_result
 
 - name: Debug fallback DNS AAAA record result

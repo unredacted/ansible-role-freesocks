@@ -27,6 +27,16 @@
     state: present
   become: yes
 
+# Own the keyrings dir here rather than depend on setup/docker.yml having created
+# it (the deploy graph happens to run docker.yml first for Remnawave, but this
+# task must not rely on that ordering).
+- name: Ensure /etc/apt/keyrings exists
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
 - name: Download Caddy apt signing key
   get_url:
     url: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"

@@ -131,9 +131,9 @@
 # Control-plane update (FCP) — re-register the destination Outline server
 # ============================================================================
 # The destination has a new hostname, so its Caddy-proxied apiUrl changed.
-# Re-register with FCP (idempotent by slug). NOTE: the slug is hostname-derived,
-# so the destination registers as a new backendServers row; the stale source row
-# should be removed in the FCP admin CMS (or by a future delete-by-slug step).
+# Re-register with FCP (idempotent by slug). The slug is hostname-derived, so the
+# destination registers as a new backendServers row; the stale source row is then
+# removed by the by-slug DELETE below (delete_server.yml, source_kv_hostname).
 # Remnawave migrate does NOT touch FCP — FCP holds only the panel (unchanged
 # when a node moves); the panel-side node address is PATCHed via update_node below.
 - name: Re-register destination Outline server with FCP

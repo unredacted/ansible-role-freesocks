@@ -39,7 +39,7 @@ outline_enabled: true # Default: deploy Outline SS server
 # ============================================================================
 # Force reinstall of components even if already detected as installed.
 # Useful for:
-#   - Recovery from partial installations (e.g., slipstream installed but KV not updated)
+#   - Recovery from partial installations (e.g., slipstream binary installed but its DNS/config incomplete)
 #   - Updating component configuration after changes
 #   - Regenerating certificates/configs
 #
@@ -165,29 +165,29 @@ hostname_extension: ""
 #       - 2001:db8::3
 
 # Environment mode: 'prod' or 'dev'
-# - prod: Uses production KV namespaces for live deployments
-# - dev: Uses development KV namespaces for testing
-# This must be explicitly set via --extra-vars to prevent accidental deployments
+# Required by the role's mode validation and set explicitly via --extra-vars. It
+# no longer selects KV namespaces (KV was removed in the FCP migration), so today
+# it is effectively cosmetic — keep passing 'prod' for live deployments.
 # environment_mode: prod
 
 # Provider Configuration
-# These must be explicitly set via --extra-vars
 
 # dns_provider: 'cloudflare'
 #   - cloudflare: Manage DNS via Cloudflare API
 #   Future: fastly, route53, etc.
 
-# Required variables that must be set by the user:
-# cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-# cloudflare_api_token: "your-api-token"  # API Token (not Global API Key)
-# cloudflare_zone_id: "your-zone-id"
-# cloudflare_account_id: "your-account-id"
-# base_domain: "example.com"
-# api_domain: "api.example.com"
-# prom_domain: "prom.example.com"
+# Cloudflare API base URL. A stable public endpoint, defaulted so a fresh deploy
+# does NOT need to set it (override only for a Cloudflare API gateway/mirror).
+cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
 
-# Zone IDs are looked up from domain_providers based on base_domain, api_domain, and prom_domain
-# No need to set zone_id separately - it's derived from domain_providers[domain].zone_id
+# Secrets you MUST provide (vault-encrypted) when dns_provider is cloudflare:
+#   cloudflare_api_token  - a scoped API Token (NOT the Global API Key) with
+#                           Zone:DNS:Edit on the target zone(s). A deploy-mode
+#                           preflight asserts this is set.
+#   cloudflare_account_id - only needed by Fastly TLS (custom domain mode).
+# Per-zone IDs are NOT a global var: they come from
+# domain_providers[<domain>].zone_id. base_domain/api_domain/prom_domain are
+# derived from domain_providers in deploy mode (no need to set them by hand).
 
 envoy_mappings: {} # Define your envoy mappings as shown in the example above
 
@@ -205,7 +205,7 @@ envoy_mappings: {} # Define your envoy mappings as shown in the example above
 #
 #   - Outline: each server is one backendServers row — apiUrl is the
 #     Caddy-proxied management URL (valid TLS; FCP requires it), plus
-#     websocketEnabled / websocketDomain / prometheusUrl.
+#     websocketEnabled / websocketDomain.
 #   - Remnawave: FCP stores only the PANEL (baseUrl + apiToken), not nodes.
 #     Per-node config reaches users via the panel (register_node + Hosts).
 #     Registering an additional panel is opt-in via fcp_register_remnawave_panel.
@@ -217,12 +217,17 @@ fcp_server_slug: "{{ random_hostname | default('') }}"   # unique, immutable key
 fcp_register_remnawave_panel: false # register the Remnawave panel as a backendServers row
 fcp_remnawave_panel_slug: "remnawave-primary"
 fcp_verify_connectivity: true       # after registering, assert FCP can reach the backend (needs admin:servers:read)
+# The connectivity probe polls until FCP can reach the just-registered origin,
+# waiting out fresh-deploy DNS propagation + Caddy's first Let's Encrypt cert
+# (retries * delay = max wait; default ~3 min).
+fcp_verify_retries: 18
+fcp_verify_delay: 10
 # Declarative squad->tier binding (opt-in). FCP issues a member's key into the
 # Remnawave squad named on their tier; this binds it without the manual CMS copy.
 # Requires the fsv1_ token to ALSO hold admin:tiers:write (wider than servers:*) —
 # mint it with that extra scope when enabling. The squad UUID comes from the
 # panel (Phase-0 provisioning); set it in vault/host_vars, not here.
-fcp_bind_squad: false               # bind remnawave_squad_uuid -> fcp_squad_tier_slug
+fcp_bind_squad: false               # bind remnawave_squad_uuid -> fcp_squad_tier_slug (deploy mode only)
 fcp_squad_tier_slug: "member"       # the FCP tier slug to bind the squad to
 # remnawave_squad_uuid: ""          # the Remnawave internal-squad UUID (vault/host_vars)
 

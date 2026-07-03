@@ -122,6 +122,18 @@
     - effective_cdn_provider | default('none') == 'fastly'
     - domain_providers[deploy_target_domain].fastly_api_token | default(fastly_api_token | default('')) == ''
 
+- name: Validate Cloudflare credentials (deploy)
+  fail:
+    msg: |
+      A Cloudflare API token is required for DNS on '{{ deploy_target_domain }}'.
+      Set cloudflare_api_token (vault-encrypted) or a per-domain
+      domain_providers['{{ deploy_target_domain }}'].cloudflare_api_token.
+      It must be a scoped API Token with Zone:DNS:Edit (not the Global API Key).
+  when:
+    - operation_mode == 'deploy'
+    - effective_dns_provider | default('') == 'cloudflare'
+    - (domain_providers[deploy_target_domain].cloudflare_api_token | default(cloudflare_api_token | default(''))) | length == 0
+
 # ============================================================================
 # VALIDATION & SETUP: Change Mode
 # ============================================================================
@@ -850,7 +862,7 @@
     # Re-register the server with FCP after adding components (Outline path)
     # =========================================================================
     # FCP stores the management apiUrl (+ WSS fields) and dials out. Re-register
-    # so a newly added WSS transport is reflected. Idempotent by slug (PATCH).
+    # so a newly added WSS transport is reflected. Idempotent by slug (PUT by-slug).
     # effective_cdn_provider isn't set in update mode — derive it from the
     # detected host's domain so register_server.yml picks the right websocketDomain.
     - name: Derive WSS base domain (update mode)
