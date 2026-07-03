@@ -128,7 +128,7 @@
 # Cleanup API and Prometheus domain records
 - name: Get existing DNS records for API domain cleanup
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ cloudflare_zone_id }}/dns_records"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: GET
     headers:
       Content-Type: "application/json"
@@ -144,7 +144,7 @@
 
 - name: Delete existing DNS records for API and Prometheus domains
   uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ cloudflare_zone_id }}/dns_records/{{ item.id }}"
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
     method: DELETE
     headers:
       Content-Type: "application/json"

@@ -73,6 +73,11 @@
       delegate_to: localhost
       no_log: true
       register: fcp_panel_testconn
+      # Bounded poll: test-connection returns 200 {ok:false} until the panel is
+      # reachable, so wait it out rather than fail on the first attempt.
+      retries: "{{ fcp_verify_retries | default(18) }}"
+      delay: "{{ fcp_verify_delay | default(10) }}"
+      until: fcp_panel_testconn.json.ok | default(false) | bool
     - name: Assert FCP reached the panel
       assert:
         that:

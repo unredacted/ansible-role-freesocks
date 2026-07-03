@@ -8,10 +8,11 @@
 # uses a plain fetch() with no self-signed-cert handling, so the raw Outline
 # Manager URL on its self-signed port would be rejected).
 #
-# Idempotent by `slug`: GET the list, PATCH if the slug already exists, else POST
-# a new backendServers row. Auth is an fsv1_ service token with the
-# admin:servers:read + admin:servers:write scopes (read for the GET list,
-# write for the POST/PATCH).
+# Idempotent by `slug`: a single PUT /api/v1/admin/backend-servers/by-slug/{slug}
+# creates the row or merges into the existing one (keep-secret-on-blank) — no
+# GET-list, no client-side id resolution. Auth is an fsv1_ service token with
+# admin:servers:write (plus admin:servers:read for the optional post-register
+# test-connection probe below — see fcp_verify_connectivity).
 #
 # Remnawave panels are registered separately via register_remnawave_panel.yml
 # (FCP stores the panel, not individual nodes).
@@ -136,6 +137,12 @@
       delegate_to: localhost
       no_log: true
       register: fcp_testconn
+      # Wait out fresh-deploy DNS propagation + Caddy's first Let's Encrypt
+      # issuance: test-connection returns 200 {ok:false} until the origin is
+      # reachable, so poll until ok (bounded) instead of failing on the first try.
+      retries: "{{ fcp_verify_retries | default(18) }}"
+      delay: "{{ fcp_verify_delay | default(10) }}"
+      until: fcp_testconn.json.ok | default(false) | bool
     - name: Assert FCP reached the backend
       assert:
         that:
