@@ -1,0 +1,47 @@
+---
+# tasks/providers/remnawave/gen_x25519.yml
+#
+# Generate a Reality x25519 keypair via the panel API and capture the PRIVATE key
+# (the Reality inbound embeds it; the panel derives the client public key / pbk).
+# Panel-only (delegate_to: localhost); part of operation_mode=bootstrap.
+#
+# VERIFY on your panel /docs: v2.8 exposes GET /api/system/tools/x25519/generate.
+# The response nesting differs across versions, so the parse below tolerates both
+# a flat {response:{privateKey,publicKey}} and {response:{keypairs:[{privateKey}]}}.
+
+- name: Generate an x25519 keypair (panel API)
+  uri:
+    url: "{{ remnawave_panel_url }}{{ remnawave_x25519_endpoint }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 201]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_x25519
+
+- name: Capture the x25519 private key (tolerate flat or keypairs[] shapes)
+  set_fact:
+    remnawave_reality_private_key: "{{ _pk if (_pk | length > 0) else _pk_kp }}"
+  vars:
+    _resp: "{{ _rw_x25519.json.response | default(_rw_x25519.json, true) }}"
+    _pk: "{{ _resp.privateKey | default('') }}"
+    _pk_kp: "{{ (_resp.keypairs | default([]) | first | default({})).privateKey | default('') }}"
+  no_log: true
+
+- name: Assert an x25519 private key was returned
+  assert:
+    that:
+      - remnawave_reality_private_key is defined
+      - remnawave_reality_private_key | length > 0
+    fail_msg: >-
+      The panel x25519 endpoint ({{ remnawave_x25519_endpoint }}) returned no
+      privateKey. Verify the path + response shape against your panel's /docs
+      OpenAPI (some versions use POST, or nest under response.keypairs[0]).
+  no_log: true
+
+- name: Note x25519 keypair generated
+  debug:
+    msg: "Generated a Reality x25519 keypair (private key captured, not logged)."

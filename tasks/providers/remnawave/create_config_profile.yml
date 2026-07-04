@@ -1,0 +1,169 @@
+---
+# tasks/providers/remnawave/create_config_profile.yml
+#
+# Ensure a Config Profile exists on the panel carrying the WS + XHTTP (+ optional
+# Reality) inbounds a FreeSocks node needs, then read back each inbound's UUID by
+# tag (+ the profile UUID) so create_squad and node deploys can reference them.
+# Idempotent: GET /api/config-profiles, match by name, POST only when absent.
+# Panel-only (delegate_to: localhost); part of operation_mode=bootstrap.
+#
+# VERIFY on your panel /docs before the first run (the contract drifts across
+# versions — pin these):
+#   * POST body: { name, config: { inbounds, outbounds, ... } }  (raw Xray under `config`)
+#   * inbound read-back: GET /api/config-profiles/inbounds -> response[].{uuid,tag}
+#   * Reality streamSettings.network: "raw" (v2.8) vs "tcp" (older) — see the
+#     remnawave_bootstrap_reality_network default.
+
+- name: List existing Config Profiles
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_profiles_list
+
+- name: Determine whether the FreeSocks Config Profile already exists
+  set_fact:
+    _rw_profile_exists: "{{ remnawave_bootstrap_config_profile_name in (_profiles | map(attribute='name') | list) }}"
+  vars:
+    _resp: "{{ _rw_profiles_list.json.response }}"
+    _profiles: "{{ _resp.configProfiles | default(_resp, true) }}"
+
+- name: Build the Reality inbound (inject the generated x25519 private key)
+  set_fact:
+    _rw_reality_inbound:
+      tag: "VLESS_REALITY"
+      listen: "0.0.0.0"
+      port: 443
+      protocol: "vless"
+      settings: { clients: [], decryption: "none" }
+      streamSettings:
+        network: "{{ remnawave_bootstrap_reality_network }}"
+        security: "reality"
+        realitySettings:
+          dest: "{{ remnawave_bootstrap_reality_dest }}"
+          serverNames: "{{ remnawave_bootstrap_reality_server_names }}"
+          privateKey: "{{ remnawave_reality_private_key | default('') }}"
+          shortIds: "{{ remnawave_bootstrap_reality_short_ids }}"
+      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+  no_log: true
+  when: remnawave_bootstrap_reality | default(true) | bool
+
+- name: Assemble the desired inbound set (WS + XHTTP [+ Reality])
+  set_fact:
+    _rw_bootstrap_inbounds: >-
+      {{ remnawave_bootstrap_cdn_inbounds
+         + ([_rw_reality_inbound] if (remnawave_bootstrap_reality | default(true) | bool) else []) }}
+  no_log: true
+
+- name: Create the Config Profile (only when absent)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      name: "{{ remnawave_bootstrap_config_profile_name }}"
+      config:
+        log: { loglevel: "warning" }
+        inbounds: "{{ _rw_bootstrap_inbounds }}"
+        outbounds:
+          - { protocol: "freedom", tag: "DIRECT" }
+          - { protocol: "blackhole", tag: "BLOCK" }
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_profile_create
+  when: not _rw_profile_exists
+
+# Re-list so we resolve the UUID uniformly whether we just created it or it
+# pre-existed (create responses vary; the list is the stable source of truth).
+- name: Re-list Config Profiles
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_profiles_list2
+
+- name: Resolve the Config Profile UUID by name
+  set_fact:
+    remnawave_panel_config_profile_uuid: "{{ (_profiles | selectattr('name', 'equalto', remnawave_bootstrap_config_profile_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+  vars:
+    _resp: "{{ _rw_profiles_list2.json.response }}"
+    _profiles: "{{ _resp.configProfiles | default(_resp, true) }}"
+
+- name: Assert the Config Profile UUID resolved
+  assert:
+    that:
+      - remnawave_panel_config_profile_uuid | length > 0
+    fail_msg: >-
+      Could not resolve the '{{ remnawave_bootstrap_config_profile_name }}' Config
+      Profile UUID from /api/config-profiles. Check the endpoint + response shape.
+
+- name: List Config Profile inbounds (read back the created UUIDs)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles/inbounds"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_inbounds_list
+
+# Map tag -> uuid. Our tags (VLESS_WS_CDN / VLESS_XHTTP_CDN / VLESS_REALITY) are
+# FreeSocks-specific, so matching by tag across all returned inbounds is safe;
+# when the panel scopes inbounds by profile we still only read our three tags.
+- name: Map inbound tag -> uuid
+  set_fact:
+    remnawave_bootstrap_inbound_uuids: "{{ remnawave_bootstrap_inbound_uuids | default({}) | combine({ item.tag: item.uuid }) }}"
+  loop: "{{ _inbounds }}"
+  loop_control:
+    label: "{{ item.tag | default('?') }}"
+  vars:
+    _resp: "{{ _rw_inbounds_list.json.response }}"
+    _inbounds: "{{ _resp.inbounds | default(_resp, true) }}"
+  when:
+    - item.tag is defined
+    - item.uuid is defined
+  no_log: true
+
+- name: Capture the Reality inbound UUID (for node deploys + the Reality squad)
+  set_fact:
+    remnawave_reality_inbound_uuid: "{{ remnawave_bootstrap_inbound_uuids['VLESS_REALITY'] | default('') }}"
+  when: remnawave_bootstrap_reality | default(true) | bool
+
+- name: Assert the CDN inbound UUIDs were read back
+  assert:
+    that:
+      - (remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('')) | length > 0
+    fail_msg: >-
+      Could not read back the VLESS_WS_CDN inbound UUID from
+      /api/config-profiles/inbounds. Verify the read-back path + that the tags in
+      remnawave_bootstrap_cdn_inbounds match what the panel returns.
+
+- name: Summarize the Config Profile + inbound UUIDs (copy into node-deploy vars)
+  debug:
+    msg:
+      - "Config Profile '{{ remnawave_bootstrap_config_profile_name }}' ready."
+      - "remnawave_panel_config_profile_uuid: {{ remnawave_panel_config_profile_uuid }}"
+      - "WS inbound  (VLESS_WS_CDN):    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}"
+      - "XHTTP inbound (VLESS_XHTTP_CDN): {{ remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('(none)') }}"
+      - "Reality inbound (VLESS_REALITY): {{ remnawave_reality_inbound_uuid | default('(disabled)') }}"

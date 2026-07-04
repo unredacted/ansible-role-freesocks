@@ -1,0 +1,122 @@
+---
+# tasks/providers/remnawave/create_squad.yml
+#
+# Ensure the two connection-profile internal squads exist and capture their UUIDs:
+#   * fronted squad  = WS + XHTTP inbounds  -> FCP "Stay connected" (evade)
+#   * Reality squad  = the Reality inbound  -> FCP "Maximize privacy" (privacy)
+# A member's key is issued into whichever squad their FCP connection profile binds
+# to. Idempotent: GET /api/internal-squads, match by name, POST only when absent.
+# Panel-only (delegate_to: localhost); part of operation_mode=bootstrap.
+#
+# VERIFY on your panel /docs: POST /api/internal-squads { name, inbounds: [uuid] }
+# and the list read-back (response[].{uuid,name}).
+#
+# Requires remnawave_bootstrap_inbound_uuids (set by create_config_profile.yml).
+
+- name: List existing internal squads
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_squads_list
+
+- name: Compute existing squad names
+  set_fact:
+    _rw_squad_names: "{{ _squads | map(attribute='name') | list }}"
+  vars:
+    _resp: "{{ _rw_squads_list.json.response }}"
+    _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+
+- name: Compose the fronted squad inbound set (WS + XHTTP, dropping any unbound)
+  set_fact:
+    _rw_fronted_inbounds: >-
+      {{ [remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default(''),
+          remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('')]
+         | select('string') | reject('equalto', '') | list }}
+  no_log: true
+
+- name: Assert the fronted squad has at least one inbound
+  assert:
+    that:
+      - _rw_fronted_inbounds | length > 0
+    fail_msg: "No CDN inbound UUIDs available for the fronted squad — run create_config_profile.yml first."
+
+- name: Create the fronted squad (WS + XHTTP) when absent
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      name: "{{ remnawave_bootstrap_fronted_squad_name }}"
+      inbounds: "{{ _rw_fronted_inbounds }}"
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_fronted_create
+  when: remnawave_bootstrap_fronted_squad_name not in _rw_squad_names
+
+- name: Create the Reality squad when absent
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      name: "{{ remnawave_bootstrap_reality_squad_name }}"
+      inbounds: "{{ [remnawave_reality_inbound_uuid] }}"
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_reality_create
+  when:
+    - remnawave_bootstrap_reality | default(true) | bool
+    - (remnawave_reality_inbound_uuid | default('')) | length > 0
+    - remnawave_bootstrap_reality_squad_name not in _rw_squad_names
+
+- name: Re-list internal squads (resolve UUIDs uniformly)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_squads_list2
+
+- name: Resolve the squad UUIDs by name
+  set_fact:
+    remnawave_fronted_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+    remnawave_reality_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+  vars:
+    _resp: "{{ _rw_squads_list2.json.response }}"
+    _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+
+- name: Assert the fronted squad UUID resolved
+  assert:
+    that:
+      - remnawave_fronted_squad_uuid | length > 0
+    fail_msg: "Could not resolve the fronted squad UUID after create. Check /api/internal-squads."
+
+- name: Summarize squad creation
+  debug:
+    msg:
+      - "Fronted squad '{{ remnawave_bootstrap_fronted_squad_name }}': {{ remnawave_fronted_squad_uuid }}"
+      - "Reality squad '{{ remnawave_bootstrap_reality_squad_name }}': {{ remnawave_reality_squad_uuid | default('(disabled)') }}"

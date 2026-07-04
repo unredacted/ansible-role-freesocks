@@ -1,0 +1,55 @@
+---
+# tasks/providers/fcp/bind_profiles.yml
+#
+# Bind the bootstrap-created Remnawave squads to FCP's member-facing connection
+# profiles (the "Stay connected" / "Maximize privacy" transport chooser):
+#   evade   ("Stay connected")   -> the fronted (WS + XHTTP) squad
+#   privacy ("Maximize privacy") -> the Reality squad
+# A member's key is then issued into the squad their chosen profile binds to. A
+# single idempotent PATCH to FCP's admin connection-profiles endpoint; re-runs are
+# no-ops once the squads match. Squad UUIDs are sensitive infra detail -> no_log.
+#
+# The fsv1_ token here must hold admin:settings:write (wider than the
+# admin:servers:* the node-registration path needs) — mint it with that scope:
+#   bunx convex run adminApi:mintAutomationToken \
+#     '{"scopes":["admin:settings:write","admin:servers:read","admin:servers:write"]}'
+
+- name: Validate FCP connection-profile binding prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - remnawave_fronted_squad_uuid is defined and remnawave_fronted_squad_uuid | length > 0
+    fail_msg: >-
+      Binding FCP connection profiles requires fcp_api_url, fcp_api_token
+      (with admin:settings:write), and a fronted squad UUID from create_squad.yml.
+  no_log: true
+
+# Build the PATCH body: evade always binds the fronted squad; privacy binds the
+# Reality squad only when one was created (Reality is optional).
+- name: Bind squads to FCP connection profiles (idempotent by PATCH)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/connection-profiles"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: "{{ _cp_body }}"
+    status_code: [200]
+    return_content: yes
+  vars:
+    _privacy_entry: "{{ {'privacy': {'squadUuid': remnawave_reality_squad_uuid}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+    _cp_body:
+      default: "{{ fcp_default_connection_profile | default('evade') }}"
+      profiles: "{{ {'evade': {'squadUuid': remnawave_fronted_squad_uuid}} | combine(_privacy_entry) }}"
+  delegate_to: localhost
+  no_log: true
+  register: _fcp_cp_bind
+
+- name: Note FCP connection-profile binding result
+  debug:
+    msg: >-
+      Bound FCP connection profiles: evade -> fronted squad{{ ', privacy -> Reality squad'
+      if ((remnawave_reality_squad_uuid | default('')) | length > 0) else ' (privacy left to the tier fallback — Reality disabled)' }}.

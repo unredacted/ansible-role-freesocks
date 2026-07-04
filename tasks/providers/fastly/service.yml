@@ -1,15 +1,21 @@
 ---
 # tasks/providers/fastly/service.yml - Create and configure Fastly VCL service
 #
-# Creates a Fastly CDN service for WebSocket passthrough (WSS fronting).
+# Creates a Fastly CDN service for WebSocket (+ XHTTP) passthrough (CDN fronting).
 # Supports two domain modes:
-#   - shared: Uses {prefix}-{hostname}.global.ssl.fastly.net (no external DNS/TLS needed)
-#   - custom: Uses your own domain (requires TLS subscription + DNS CNAME)
+#   - shared: <label>.global.ssl.fastly.net. The label is an EXPLICIT choice —
+#     either operator-chosen (fastly_edge_label) or a random fs-<hostname>
+#     (fastly_edge_random). Exactly one selector MUST be set (asserted); no
+#     external DNS/TLS needed.
+#   - custom: your own domain (requires TLS subscription + DNS CNAME)
+#
+# Idempotent: looks the service up by name first (GET /service/search) and reuses
+# it instead of POSTing a duplicate, so re-deploying a chosen stable edge name is
+# safe (no 409, no orphaned service).
 #
 # Requires:
 #   - fastly_api_token (global or per-domain in domain_providers)
 #   - random_hostname (set by main.yml or dns.yml)
-#   - Server IP for backend origin
 
 # ============================================================================
 # Set Fastly credentials
@@ -29,11 +35,38 @@
 # ============================================================================
 # Determine domain name based on mode
 # ============================================================================
-- name: Set Fastly shared domain name
+# Shared mode: the client-facing edge label is an EXPLICIT choice — a chosen,
+# memorable label (fastly_edge_label -> <label>.global.ssl.fastly.net, decoupled
+# from the origin hostname so innocuous names dodge SNI-keyword blocks) OR an
+# explicit opt-in to a random name (fastly_edge_random -> fs-<random_hostname>).
+# No silent default, so a node can never get an unintended random edge name.
+- name: Validate the Fastly shared edge-name selection (exactly one of label / random)
+  assert:
+    that:
+      - (fastly_edge_label | default('') | length > 0) or (fastly_edge_random | default(false) | bool)
+      - not ((fastly_edge_label | default('') | length > 0) and (fastly_edge_random | default(false) | bool))
+    fail_msg: >-
+      Set exactly one of fastly_edge_label (e.g. "cdn-content" ->
+      cdn-content.global.ssl.fastly.net) or fastly_edge_random=true
+      (fs-<random>.global.ssl.fastly.net) for a shared-mode Fastly node.
+  when: fastly_domain_mode_effective == 'shared'
+
+- name: Set Fastly shared domain name (operator-chosen label)
+  set_fact:
+    fastly_service_name: "{{ fastly_edge_label }}"
+    fastly_websocket_domain: "{{ fastly_edge_label }}.global.ssl.fastly.net"
+  when:
+    - fastly_domain_mode_effective == 'shared'
+    - fastly_edge_label | default('') | length > 0
+
+- name: Set Fastly shared domain name (random)
   set_fact:
     fastly_service_name: "{{ fastly_service_name_prefix }}-{{ random_hostname }}"
     fastly_websocket_domain: "{{ fastly_service_name_prefix }}-{{ random_hostname }}.global.ssl.fastly.net"
-  when: fastly_domain_mode_effective == 'shared'
+  when:
+    - fastly_domain_mode_effective == 'shared'
+    - not (fastly_edge_label | default('') | length > 0)
+    - fastly_edge_random | default(false) | bool
 
 - name: Set Fastly custom domain name
   set_fact:
@@ -49,9 +82,44 @@
       - "Fastly WebSocket domain: {{ fastly_websocket_domain }}"
       - "Origin backend: {{ dns_hostname }}"
 
+# ============================================================================
+# Idempotency: reuse an existing service by name (get-or-create)
+# ============================================================================
+# A chosen stable edge name re-deployed must reuse its Fastly service, not
+# collide or leak a duplicate. Search by name; if present, reuse its id + active
+# version and SKIP the create/configure tasks below (the existing service is
+# assumed already configured + activated). Runs in both domain modes. A random
+# edge name changes each run, so it always creates (a new node each time).
+- name: Look up an existing Fastly service by name
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/search?name={{ fastly_service_name | urlencode }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 404]
+  delegate_to: localhost
+  register: fastly_service_lookup
+
+- name: Reuse the existing Fastly service (id + active version)
+  set_fact:
+    fastly_service_exists: true
+    fastly_service_id: "{{ fastly_service_lookup.json.id }}"
+    fastly_version: "{{ fastly_service_lookup.json.version | default('(active)') }}"
+  when: fastly_service_lookup.status == 200
+
+- name: Mark the Fastly service for creation (absent)
+  set_fact:
+    fastly_service_exists: false
+  when: fastly_service_lookup.status != 200
+
+- name: Note the reused Fastly service
+  debug:
+    msg: "Reusing existing Fastly service '{{ fastly_service_name }}' ({{ fastly_service_id }}); skipping create + configure."
+  when: fastly_service_exists
 
 # ============================================================================
-# Create Fastly service
+# Create Fastly service  (only when it does not already exist)
 # ============================================================================
 - name: Create Fastly service
   uri:
@@ -68,17 +136,20 @@
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_service_result
+  when: not fastly_service_exists
 
 - name: Extract Fastly service ID and version
   set_fact:
     fastly_service_id: "{{ fastly_service_result.json.id }}"
     fastly_version: "{{ fastly_service_result.json.versions[0].number }}"
+  when: not fastly_service_exists
 
 - name: Debug Fastly service creation
   debug:
     msg:
       - "Fastly service ID: {{ fastly_service_id }}"
       - "Fastly version: {{ fastly_version }}"
+  when: not fastly_service_exists
 
 # ============================================================================
 # Enable WebSocket passthrough via Products API
@@ -96,10 +167,12 @@
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_websocket_result
+  when: not fastly_service_exists
 
 - name: Debug WebSocket enablement
   debug:
     msg: "WebSocket passthrough enabled on Fastly service {{ fastly_service_id }}"
+  when: not fastly_service_exists
 
 # ============================================================================
 # Add domain to service
@@ -118,10 +191,12 @@
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_domain_result
+  when: not fastly_service_exists
 
 - name: Debug Fastly domain addition
   debug:
     msg: "Domain {{ fastly_websocket_domain }} added to Fastly service"
+  when: not fastly_service_exists
 
 # ============================================================================
 # Add backend (origin server)
@@ -163,10 +238,12 @@
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_backend_result
+  when: not fastly_service_exists
 
 - name: Debug Fastly backend addition
   debug:
     msg: "Backend added: {{ dns_hostname }}:443 (connect_timeout={{ fastly_backend_connect_timeout }}ms, first_byte_timeout={{ fastly_backend_first_byte_timeout }}ms, tcp_keepalive=on)"
+  when: not fastly_service_exists
 
 # ============================================================================
 # Add health check for origin (monitoring only)
@@ -200,10 +277,12 @@
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_healthcheck_result
+  when: not fastly_service_exists
 
 - name: Debug health check addition
   debug:
     msg: "Health check 'origin-health-{{ random_hostname }}' created (monitoring only, not linked to backend)"
+  when: not fastly_service_exists
 
 # ============================================================================
 # Add VCL snippet for WebSocket handoff
@@ -230,18 +309,20 @@
     status_code: [200, 201]
   delegate_to: localhost
   register: fastly_vcl_snippet_result
+  when: not fastly_service_exists
 
 - name: Debug VCL snippet addition
   debug:
     msg: "WebSocket VCL snippet added to Fastly service"
+  when: not fastly_service_exists
 
 # XHTTP (packet-up) transports need their own VCL: the request carries no
 # Upgrade header, so the websocket_upgrade snippet above does not apply. Each
 # enabled xhttp transport gets (1) a recv snippet making its path uncacheable
 # (return(pass)), and (2) a fetch snippet that streams the long-lived GET
 # (beresp.do_stream) and caps timeouts at Fastly's ~60s clustering ceiling.
-# No-op while all xhttp transports are disabled (the default until the Phase C
-# PoC passes). MUST-TEST: do_stream-on-pass streaming + X-Padding integrity.
+# No-op while all xhttp transports are disabled. MUST-TEST: do_stream-on-pass
+# streaming + X-Padding integrity (see HANDOFF-cdn-transports.md Phase C).
 - name: Add XHTTP pass VCL snippet (uncacheable) per transport
   uri:
     url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
@@ -262,6 +343,7 @@
   loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
   loop_control:
     label: "{{ item.name }}"
+  when: not fastly_service_exists
 
 - name: Add XHTTP stream VCL snippet (do_stream + 60s timeouts) per transport
   uri:
@@ -283,6 +365,7 @@
   loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
   loop_control:
     label: "{{ item.name }}"
+  when: not fastly_service_exists
 
 # ============================================================================
 # Activate service version
@@ -297,11 +380,12 @@
     status_code: 200
   delegate_to: localhost
   register: fastly_activate_result
+  when: not fastly_service_exists
 
 - name: Debug Fastly service activation
   debug:
     msg: "Fastly service version {{ fastly_version }} activated"
-
+  when: not fastly_service_exists
 
 # ============================================================================
 # Store Fastly service ID locally and as facts
@@ -316,7 +400,7 @@
 - name: Display Fastly service summary
   debug:
     msg: |
-      Fastly CDN service created successfully!
+      Fastly CDN service ready ({{ 'reused existing' if fastly_service_exists else 'created' }}).
 
       Service ID: {{ fastly_service_id }}
       Service Name: {{ fastly_service_name }}

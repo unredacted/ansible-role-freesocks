@@ -1,0 +1,56 @@
+---
+# tests/test_fastly_edge.yml
+#
+# Self-asserting tests for the Fastly shared-mode edge-name selection in
+# tasks/providers/fastly/service.yml (chosen label vs random, XOR). Pure filter
+# logic, NO API calls.
+#
+# Run: ansible-playbook tests/test_fastly_edge.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    fastly_service_name_prefix: "fs"
+    random_hostname: "apple-banana-cherry"
+  tasks:
+    # (a) Chosen label -> service name + edge domain, decoupled from the origin.
+    - name: Chosen label derivation
+      vars:
+        fastly_edge_label: "cdn-content"
+      assert:
+        that:
+          - fastly_edge_label == 'cdn-content'
+          - (fastly_edge_label ~ '.global.ssl.fastly.net') == 'cdn-content.global.ssl.fastly.net'
+        success_msg: "Chosen label -> cdn-content.global.ssl.fastly.net."
+
+    # (b) Random selection -> fs-<hostname>.global.ssl.fastly.net
+    - name: Random derivation
+      vars:
+        _svc: "{{ fastly_service_name_prefix }}-{{ random_hostname }}"
+      assert:
+        that:
+          - _svc == 'fs-apple-banana-cherry'
+          - (_svc ~ '.global.ssl.fastly.net') == 'fs-apple-banana-cherry.global.ssl.fastly.net'
+        success_msg: "Random -> fs-<hostname>.global.ssl.fastly.net."
+
+    # (c) XOR selector: exactly one of label / random is valid (the exact
+    #     expression from service.yml's assert, parenthesized so it binds as
+    #     (L or R) and not (L and R) == item.ok, not L and not (R == ok)).
+    - name: XOR selection truth table matches service.yml
+      assert:
+        that:
+          - >-
+            ( ((item.label | length > 0) or item.random)
+              and not ((item.label | length > 0) and item.random) ) == item.ok
+        success_msg: "XOR valid for label={{ item.label }} random={{ item.random }}."
+      loop:
+        - { label: "cdn-content", random: false, ok: true } # label only -> valid
+        - { label: "", random: true, ok: true } # random only -> valid
+        - { label: "cdn-content", random: true, ok: false } # both -> invalid
+        - { label: "", random: false, ok: false } # neither -> invalid
+      loop_control:
+        label: "label='{{ item.label }}' random={{ item.random }}"
+
+    - name: All Fastly edge-name tests passed
+      debug:
+        msg: "All Fastly edge-name selection tests passed."

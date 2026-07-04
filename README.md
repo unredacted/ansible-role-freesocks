@@ -43,16 +43,28 @@ role, or the run fails (or, if you skip Remnawave Phase 0, silently issues dead 
   ```sh
   bunx convex run adminApi:mintAutomationToken \
     '{"name":"ansible","scopes":["admin:servers:read","admin:servers:write"]}'
-  # add "admin:tiers:write" to the scopes too if you will use fcp_bind_squad
+  # add "admin:tiers:write" too if you will use fcp_bind_squad
+  # add "admin:settings:write" too if you will bootstrap the panel (see below)
   ```
 
-**Remnawave panel** (Remnawave nodes only — Phase 0, once per panel):
+**Remnawave panel** (Remnawave nodes only — the panel objects a working key needs:
+a Config Profile + inbounds + an internal squad). Two ways to create them:
 
-- Create a Config Profile with your transport inbound(s) (WS and/or Reality); record
-  each inbound's `configProfileInboundUuid` and the Config Profile UUID.
-- Create the internal squad your FCP tier issues into; record its UUID.
-- Create a panel API token.
-- **Skipping Phase 0 leaves the node with no Hosts and no working keys — silently.**
+- **Automated (recommended) — `operation_mode=bootstrap`:** run the role once against
+  the panel (host-agnostic, `delegate_to: localhost`) and it creates the Config Profile
+  + WS/XHTTP/Reality inbounds, generates the Reality x25519 keypair, creates a fronted
+  squad (WS+XHTTP) and a Reality squad, and — with `fcp_enabled=true` — binds those two
+  squads to FCP's connection profiles ("Stay connected" / "Maximize privacy"). It PRINTS
+  the created Config Profile + inbound UUIDs; copy them into your node-deploy vars. Needs
+  a panel API token and (for the FCP bind) an `fsv1_` token with `admin:settings:write`:
+  ```sh
+  ansible-playbook playbook.yml --ask-vault-pass \
+    --extra-vars "operation_mode=bootstrap remnawave_panel_url=https://panel.example.com fcp_enabled=true"
+  ```
+- **Manual:** in the panel UI create a Config Profile with your transport inbound(s) and
+  the internal squad(s), then record each inbound's `configProfileInboundUuid`, the
+  Config Profile UUID, and the squad UUID. Create a panel API token.
+- **Skipping this leaves the node with no Hosts and no working keys — silently.**
 
 **DNS** — a Cloudflare zone for your domain + a scoped API token (`Zone:DNS:Edit`).
 
@@ -171,7 +183,9 @@ dns_provider: "cloudflare"
 environment_mode: "prod"  # or "dev"
 
 # Operation Mode
-operation_mode: "deploy"  # or "migrate"
+operation_mode: "deploy"  # deploy | migrate | change | update | bootstrap
+# bootstrap = one-time, panel-only: create the Remnawave Config Profile +
+# inbounds + squads and bind them to FCP connection profiles (no host touched).
 
 # Cloudflare Configuration (for the DNS provider)
 cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
