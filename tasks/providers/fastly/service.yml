@@ -337,7 +337,7 @@
       type: "recv"
       priority: "20"
       dynamic: "0"
-      content: 'if (req.url.url ~ "^{{ item.path }}/") { return(pass); }'
+      content: 'if (req.url ~ "^{{ item.path }}/") { return(pass); }'
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
@@ -359,7 +359,7 @@
       type: "fetch"
       priority: "20"
       dynamic: "0"
-      content: 'if (req.url.url ~ "^{{ item.path }}/") { set beresp.do_stream = true; set bereq.first_byte_timeout = 60s; set bereq.between_bytes_timeout = 60s; }'
+      content: 'if (req.url ~ "^{{ item.path }}/") { set beresp.do_stream = true; set bereq.first_byte_timeout = 60s; set bereq.between_bytes_timeout = 60s; }'
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
