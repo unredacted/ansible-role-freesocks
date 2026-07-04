@@ -475,10 +475,21 @@ fastly_service_id_dir: "/opt/outline"
 # Required when any domain uses cdn_provider: fastly
 # fastly_api_token: ""
 
-# Fastly service name prefix (for shared mode)
+# Fastly service name prefix (for shared mode, random edge names)
 # Used to construct {prefix}-{hostname}.global.ssl.fastly.net
 # Keep short to avoid hitting domain length limits
 fastly_service_name_prefix: "fs"
+
+# Shared-mode edge hostname selection (EXPLICIT — set exactly one per fronted node):
+#   fastly_edge_label: "cdn-content"  -> client edge cdn-content.global.ssl.fastly.net
+#                                        (chosen, decoupled from the origin hostname;
+#                                         also the Fastly service name, so re-deploying
+#                                         the same label reuses its service idempotently)
+#   fastly_edge_random: true          -> fs-<random-words>.global.ssl.fastly.net
+# The role asserts exactly one is set (no silent default), so a node never gets an
+# unintended random edge name. Fastly shared labels are globally unique first-come.
+fastly_edge_label: ""
+fastly_edge_random: false
 
 # Fastly backend connection settings (optimized for WebSocket passthrough)
 # connect_timeout: Time in ms to wait for a TCP connection to origin (default: 1000)
@@ -486,6 +497,12 @@ fastly_backend_connect_timeout: 5000
 # first_byte_timeout: Time in ms to wait for the first byte from origin (default: 15000)
 # Covers TLS handshake + WebSocket upgrade response
 fastly_backend_first_byte_timeout: 30000
+
+# Docker CE apt suite (codename). Empty -> the running distro's codename
+# (ansible_distribution_release: bookworm on Debian 12, trixie on Debian 13, ...).
+# Override to e.g. "bookworm" on a trixie host ONLY if Docker CE has not yet
+# published a pool for the running codename.
+remnawave_docker_apt_suite: ""
 
 # ============================================================================
 # Panel bootstrap (operation_mode=bootstrap) — one-time, panel-only, host-agnostic
@@ -514,6 +531,10 @@ remnawave_bootstrap_config_profile_name: "FreeSocks-CDN"
 remnawave_bootstrap_reality: true                     # also create the Reality inbound + squad
 remnawave_bootstrap_fronted_squad_name: "FreeSocks-Fronted"
 remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
+# Opt-in: path (localhost) to write the created config-profile + inbound UUIDs +
+# a ready remnawave_cdn_transports list to, so node deploys need no manual paste.
+# Empty = just print them. e.g. "vars/remnawave.generated.yml".
+remnawave_bootstrap_output_file: ""
 
 # Panel x25519 keypair endpoint (Reality). VERIFY on your panel /docs: v2.8 uses
 # GET /api/system/tools/x25519/generate; the response is parsed tolerant of both

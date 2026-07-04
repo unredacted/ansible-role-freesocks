@@ -38,7 +38,10 @@
 
 - name: Add Docker apt repository
   apt_repository:
-    repo: "deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+    # Suite is the running distro's codename by default (bookworm/trixie/...).
+    # Override with remnawave_docker_apt_suite (e.g. "bookworm" on trixie) only if
+    # Docker CE has not yet published a pool for this codename.
+    repo: "deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ remnawave_docker_apt_suite | default(ansible_distribution_release, true) }} stable"
     filename: docker
     state: present
     update_cache: yes
