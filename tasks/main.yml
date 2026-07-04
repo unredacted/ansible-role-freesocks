@@ -285,6 +285,7 @@
       when:
         - remnawave_enabled | default(false) | bool
         - remnanode_path.stat.exists
+        - not (force_reinstall_remnawave | default(false) | bool)
 
     - name: Fail if deploying Outline on a host with Remnawave installed
       fail:
