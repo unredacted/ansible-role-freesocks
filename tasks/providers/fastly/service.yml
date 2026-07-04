@@ -101,17 +101,50 @@
   delegate_to: localhost
   register: fastly_service_lookup
 
-- name: Reuse the existing Fastly service (id + active version)
+# A found service is only safe to REUSE if it has an active version. A service
+# that exists but was never activated is a half-built leftover from a failed run
+# (e.g. an activation rejected for bad VCL) — reusing it would skip re-config and
+# leave the edge dead. Check for an active version; self-heal by deleting a
+# half-built one so it is recreated cleanly below. Deleting a service with no
+# active version is safe by construction (it serves no traffic).
+- name: Check whether the found Fastly service has an active version
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_lookup.json.id }}/version/active"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 404]
+  delegate_to: localhost
+  register: fastly_active_check
+  when: fastly_service_lookup.status == 200
+
+- name: Delete a half-built (never-activated) Fastly service so it is recreated cleanly
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_lookup.json.id }}"
+    method: DELETE
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 404]
+  delegate_to: localhost
+  when:
+    - fastly_service_lookup.status == 200
+    - (fastly_active_check.status | default(404)) != 200
+
+- name: Reuse the existing (activated) Fastly service (id + active version)
   set_fact:
     fastly_service_exists: true
     fastly_service_id: "{{ fastly_service_lookup.json.id }}"
-    fastly_version: "{{ fastly_service_lookup.json.version | default('(active)') }}"
-  when: fastly_service_lookup.status == 200
+    fastly_version: "{{ fastly_active_check.json.number | default('(active)') }}"
+  when:
+    - fastly_service_lookup.status == 200
+    - (fastly_active_check.status | default(404)) == 200
 
-- name: Mark the Fastly service for creation (absent)
+- name: Mark the Fastly service for creation (absent or half-built)
   set_fact:
     fastly_service_exists: false
-  when: fastly_service_lookup.status != 200
+  when: not (fastly_service_lookup.status == 200 and (fastly_active_check.status | default(404)) == 200)
 
 - name: Note the reused Fastly service
   debug:
@@ -345,7 +378,33 @@
     label: "{{ item.name }}"
   when: not fastly_service_exists
 
-- name: Add XHTTP stream VCL snippet (do_stream + 60s timeouts) per transport
+# Backend-request timeouts (bereq.*) are only writable in vcl_pass / vcl_miss —
+# NOT vcl_fetch. The /xh path return(pass)es (recv snippet above), so set the
+# ~60s clustering-ceiling timeouts in a pass-type snippet.
+- name: Add XHTTP pass-phase backend timeouts per transport
+  uri:
+    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/x-www-form-urlencoded"
+      Accept: "application/json"
+    body_format: form-urlencoded
+    body:
+      name: "xhttp_timeouts_{{ item.name }}"
+      type: "pass"
+      priority: "20"
+      dynamic: "0"
+      content: 'if (req.url ~ "^{{ item.path }}/") { set bereq.first_byte_timeout = 60s; set bereq.between_bytes_timeout = 60s; }'
+    status_code: [200, 201]
+  delegate_to: localhost
+  loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not fastly_service_exists
+
+# Response streaming (beresp.do_stream) is the vcl_fetch-phase setting.
+- name: Add XHTTP stream VCL snippet (do_stream) per transport
   uri:
     url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
     method: POST
@@ -359,7 +418,7 @@
       type: "fetch"
       priority: "20"
       dynamic: "0"
-      content: 'if (req.url ~ "^{{ item.path }}/") { set beresp.do_stream = true; set bereq.first_byte_timeout = 60s; set bereq.between_bytes_timeout = 60s; }'
+      content: 'if (req.url ~ "^{{ item.path }}/") { set beresp.do_stream = true; }'
     status_code: [200, 201]
   delegate_to: localhost
   loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
