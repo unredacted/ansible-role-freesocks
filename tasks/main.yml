@@ -187,7 +187,8 @@
       - "DNS Provider: {{ effective_dns_provider | default(dns_provider) | default('pending') }}"
       - "CDN Provider: {{ effective_cdn_provider | default('none') }}"
       - "Deploy Target Domain: {{ deploy_target_domain | default('N/A') }}"
-  when: operation_mode != 'update'  # Update mode sets these later
+  # Update sets these later; bootstrap is panel-only (no environment_mode/dns_provider).
+  when: operation_mode not in ['update', 'bootstrap']
 
 # ============================================================================
 # DEPLOY MODE
