@@ -34,7 +34,11 @@
     body_format: json
     body:
       name: "{{ random_hostname }}"
-      address: "{{ dns_hostname }}"
+      # Management/control-plane endpoint the panel dials on node_port (default
+      # 2222). Defaults to the public data-plane hostname, but can be a Tailscale
+      # MagicDNS name / IP when the panel reaches nodes over Tailscale rather than
+      # the public internet (cross-site routing). Independent of the data plane.
+      address: "{{ remnawave_node_address }}"
       port: "{{ remnawave_node_port | int }}"
       countryCode: "{{ remnawave_panel_country_code }}"
       configProfile:
@@ -75,7 +79,7 @@
 
 - name: Log node UUID
   debug:
-    msg: "Registered node uuid={{ remnawave_node_uuid }} address={{ dns_hostname }} port={{ remnawave_node_port }}"
+    msg: "Registered node uuid={{ remnawave_node_uuid }} address={{ remnawave_node_address }} port={{ remnawave_node_port }}"
   when:
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0

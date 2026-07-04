@@ -286,6 +286,12 @@ remnawave_panel_register_node: false
 remnawave_panel_config_profile_uuid: "" # REQUIRED when register_node=true
 remnawave_panel_active_inbounds: [] # REQUIRED when register_node=true
 remnawave_panel_country_code: "XX" # 2-letter ISO; panel default is "XX"
+# The address the PANEL dials to manage the node (control plane, node_port 2222).
+# Defaults to the public data-plane hostname; override to a Tailscale MagicDNS
+# name / IP (e.g. "{{ inventory_hostname }}") when the panel reaches nodes over
+# Tailscale rather than the public internet. MANAGEMENT endpoint only — does NOT
+# affect the data plane (Fastly origin / Reality address / client Hosts).
+remnawave_node_address: "{{ dns_hostname }}"
 
 # TLS via standalone Caddy (opt-in)
 # Required when fronting through Fastly (Fastly origin needs a valid public cert
