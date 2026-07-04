@@ -114,7 +114,10 @@
     headers:
       Fastly-Key: "{{ fastly_token }}"
       Accept: "application/json"
-    status_code: [200, 404]
+    # 200 = has an active version; 400 = "No active version for service ..."
+    # (Fastly's signal for a never-activated service); 404 defensive. Anything
+    # else (auth/server error) is a real failure and should NOT be tolerated.
+    status_code: [200, 400, 404]
   delegate_to: localhost
   register: fastly_active_check
   when: fastly_service_lookup.status == 200
