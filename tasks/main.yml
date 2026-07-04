@@ -957,8 +957,8 @@
 # BOOTSTRAP MODE (panel-only, host-agnostic, run once per panel)
 # ============================================================================
 # Create the Remnawave panel objects a working key needs — a Config Profile with
-# WS/XHTTP/Reality inbounds, an x25519 keypair for Reality, a fronted squad
-# (WS+XHTTP) and a Reality squad — then bind the two squads to FCP's connection
+# WS/Reality inbounds, an x25519 keypair for Reality, a fronted squad
+# (WS) and a Reality squad — then bind the two squads to FCP's connection
 # profiles (the member "Stay connected" / "Maximize privacy" chooser). Fully
 # idempotent (GET-before-POST); touches NO host (delegate_to: localhost). This
 # replaces the manual "Phase 0" panel setup. Run once, e.g.:
@@ -991,8 +991,8 @@
 
     # Opt-in: write the created UUIDs to a vars file so node deploys need no manual
     # paste. Load it alongside the creds file: -e @<creds>.yml -e @<this file>.
-    # WS + XHTTP are both enabled per the current transport plan (XHTTP behind the
-    # Fastly PoC — flip its `enabled` to false here if you want WS-only nodes).
+    # The fronted transport is WS-over-Fastly (XHTTP was removed 2026-07-04 —
+    # Fastly cannot stream it). Node deploys load this file for the WS inbound UUID.
     - name: Write the generated node-deploy vars file (opt-in)
       copy:
         dest: "{{ remnawave_bootstrap_output_file }}"
@@ -1013,15 +1013,6 @@
               alpn: "http/1.1"
               fingerprint: chrome
               enabled: true
-            - name: xhttp
-              network: xhttp
-              path: "/xh"
-              internal_port: 8444
-              inbound_uuid: "{{ remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('') }}"
-              mode: "packet-up"
-              alpn: "h2,http/1.1"
-              fingerprint: chrome
-              enabled: true
       delegate_to: localhost
       when: remnawave_bootstrap_output_file | default('') | length > 0
 
@@ -1039,7 +1030,6 @@
 
           Inbounds (copy into your node-deploy vars):
             remnawave_cdn_transports[ws].inbound_uuid:    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}
-            remnawave_cdn_transports[xhttp].inbound_uuid: {{ remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('(none)') }}
             remnawave_reality_inbound_uuid:               {{ remnawave_reality_inbound_uuid | default('(disabled)') }}
 
           Squads:

@@ -12,8 +12,8 @@
   gather_facts: false
   vars:
     remnawave_bootstrap_reality_network: "raw"
-    remnawave_bootstrap_reality_dest: "www.microsoft.com:443"
-    remnawave_bootstrap_reality_server_names: ["www.microsoft.com"]
+    remnawave_bootstrap_reality_dest: "dl.google.com:443"
+    remnawave_bootstrap_reality_server_names: ["dl.google.com"]
     remnawave_bootstrap_reality_short_ids: [""]
     remnawave_reality_private_key: "PRIV-KEY-xyz"
     fcp_default_connection_profile: "evade"
@@ -21,13 +21,11 @@
     _fake_inbounds_flat:
       response:
         - { uuid: "uuid-ws", tag: "VLESS_WS_CDN", network: "ws" }
-        - { uuid: "uuid-xh", tag: "VLESS_XHTTP_CDN", network: "xhttp" }
         - { uuid: "uuid-re", tag: "VLESS_REALITY", network: "raw" }
     _fake_inbounds_nested:
       response:
         inbounds:
           - { uuid: "uuid-ws", tag: "VLESS_WS_CDN" }
-          - { uuid: "uuid-xh", tag: "VLESS_XHTTP_CDN" }
   tasks:
     # (a) x25519 extraction tolerates both the flat and keypairs[] shapes.
     - name: x25519 flat shape
@@ -71,7 +69,7 @@
           - _reality_inbound.streamSettings.network == 'raw'
           - _reality_inbound.streamSettings.security == 'reality'
           - _reality_inbound.streamSettings.realitySettings.privateKey == 'PRIV-KEY-xyz'
-          - _reality_inbound.streamSettings.realitySettings.serverNames == ['www.microsoft.com']
+          - _reality_inbound.streamSettings.realitySettings.serverNames == ['dl.google.com']
         success_msg: "Reality inbound assembly OK (raw network, injected key)."
 
     # (c) Config-profiles / inbounds response normalization (flat list vs nested).
@@ -88,8 +86,8 @@
     - name: Assert normalization yields a list of inbounds either way
       assert:
         that:
-          - _norm_flat | length == 3
-          - _norm_nested | length == 2
+          - _norm_flat | length == 2
+          - _norm_nested | length == 1
           - (_norm_flat | selectattr('tag', 'equalto', 'VLESS_WS_CDN') | map(attribute='uuid') | first) == 'uuid-ws'
         success_msg: "Inbound response normalization OK (flat + nested)."
 
@@ -102,15 +100,15 @@
         label: "{{ item.tag }}"
     - name: Assert the map + fronted-squad inbound selection
       vars:
-        _fronted: "{{ [_uuid_by_tag['VLESS_WS_CDN'] | default(''), _uuid_by_tag['VLESS_XHTTP_CDN'] | default('')] | select('string') | reject('equalto', '') | list }}"
+        _fronted: "{{ [_uuid_by_tag['VLESS_WS_CDN'] | default('')] | select('string') | reject('equalto', '') | list }}"
       assert:
         that:
           - _uuid_by_tag['VLESS_WS_CDN'] == 'uuid-ws'
           - _uuid_by_tag['VLESS_REALITY'] == 'uuid-re'
-          - _fronted == ['uuid-ws', 'uuid-xh']
+          - _fronted == ['uuid-ws']
         success_msg: "tag->uuid map + fronted squad inbound selection OK."
 
-    # (e) Fronted selection drops an unbound XHTTP (only WS present).
+    # (e) Fronted selection drops an unbound inbound (only WS present).
     - name: Assert fronted selection drops empties
       vars:
         _partial: "{{ ['uuid-ws', ''] | select('string') | reject('equalto', '') | list }}"

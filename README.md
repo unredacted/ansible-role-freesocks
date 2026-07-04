@@ -52,8 +52,8 @@ a Config Profile + inbounds + an internal squad). Two ways to create them:
 
 - **Automated (recommended) — `operation_mode=bootstrap`:** run the role once against
   the panel (host-agnostic, `delegate_to: localhost`) and it creates the Config Profile
-  + WS/XHTTP/Reality inbounds, generates the Reality x25519 keypair, creates a fronted
-  squad (WS+XHTTP) and a Reality squad, and — with `fcp_enabled=true` — binds those two
+  + WS/Reality inbounds, generates the Reality x25519 keypair, creates a fronted
+  squad (WS) and a Reality squad, and — with `fcp_enabled=true` — binds those two
   squads to FCP's connection profiles ("Stay connected" / "Maximize privacy"). It PRINTS
   the created Config Profile + inbound UUIDs; copy them into your node-deploy vars. Needs
   a panel API token and (for the FCP bind) an `fsv1_` token with `admin:settings:write`:
@@ -525,10 +525,9 @@ remnawave_caddy_listen_port: 443
 remnawave_caddy_xray_internal_port: 8443
 
 # CDN transports (data-driven Caddy + Fastly VCL + Hosts). See the
-# "CDN transports (WebSocket + XHTTP)" section above. XHTTP ships disabled.
+# "CDN transports (WebSocket)" section above.
 remnawave_cdn_transports:
   - { name: ws, network: ws, path: "/ws", internal_port: 8443, inbound_uuid: "", alpn: "http/1.1", fingerprint: chrome, enabled: true }
-  - { name: xhttp, network: xhttp, path: "/xh", internal_port: 8444, inbound_uuid: "", mode: "packet-up", alpn: "h2,http/1.1", fingerprint: chrome, enabled: false }
 
 # Decoy/camouflage site served by Caddy on every non-transport path
 remnawave_decoy_root: "/var/www/decoy"
@@ -568,48 +567,38 @@ Remnawave's Xray runs in `network_mode: host`, so it shares ports with the rest 
 
 The panel-side Xray inbound configuration must match: bind on the internal port (e.g. `127.0.0.1:8443`) with **plaintext WebSocket** transport. TLS termination is handled by Caddy, not Xray.
 
-#### CDN transports (WebSocket + XHTTP)
+#### CDN transports (WebSocket)
 
 When the node is fronted by Fastly, the role models its CDN-fronted Xray transports as a **data-driven list**, `remnawave_cdn_transports`. Each entry corresponds to one panel Xray inbound, one Caddy path-route, one Fastly VCL rule, and one Remnawave Host — all driven from a single place so they can't drift.
 
 ```yaml
 remnawave_cdn_transports:
   - name: ws
-    network: ws                 # ws | xhttp
+    network: ws                 # ws
     path: "/ws"                 # PANEL-GLOBAL — must equal the inbound's wsSettings.path
     internal_port: 8443         # must equal the inbound's listen port
     inbound_uuid: ""            # configProfileInboundUuid from the Config Profile
     alpn: "http/1.1"
     fingerprint: chrome
     enabled: true
-  - name: xhttp
-    network: xhttp
-    path: "/xh"                 # must equal the inbound's xhttpSettings.path
-    internal_port: 8444
-    inbound_uuid: ""
-    mode: "packet-up"
-    alpn: "h2,http/1.1"
-    fingerprint: chrome
-    enabled: false              # EXPERIMENTAL — keep off until the PoC passes (see below)
 
 # Decoy/camouflage site served on every non-transport path
 remnawave_decoy_root: "/var/www/decoy"
 ```
 
-**Path is panel-global, not per-node-random.** Unlike Outline's WSS random paths, each transport's `path` must exactly equal the `wsSettings.path` / `xhttpSettings.path` of the matching inbound in the panel's shared Config Profile. Every node attached to that inbound uses the same path. Likewise `internal_port` must equal the inbound's `listen` port, and `inbound_uuid` is the `configProfileInboundUuid`.
+**Path is panel-global, not per-node-random.** Unlike Outline's WSS random paths, each transport's `path` must exactly equal the `wsSettings.path` of the matching inbound in the panel's shared Config Profile. Every node attached to that inbound uses the same path. Likewise `internal_port` must equal the inbound's `listen` port, and `inbound_uuid` is the `configProfileInboundUuid`.
 
-**Multi-transport Caddy + decoy site.** Caddy path-routes each enabled transport to its loopback inbound — `ws` via an exact-path `handle`, `xhttp` via a `path/*` prefix `handle` with response buffering disabled (`flush_interval -1`) — and serves a plausible static "maintenance" page (rooted at `remnawave_decoy_root`) on all other paths. A probe of `https://<host>/` therefore sees an innocuous site rather than a bare proxy or error.
+**Caddy + decoy site.** Caddy path-routes the `ws` transport to its loopback inbound via an exact-path `handle`, and serves a plausible static "maintenance" page (rooted at `remnawave_decoy_root`) on all other paths. A probe of `https://<host>/` therefore sees an innocuous site rather than a bare proxy or error.
 
 **Automatic Host creation (Fastly and direct).** On a Remnawave deploy with node registration enabled, the role creates **one Remnawave Host per enabled transport** (`POST /api/hosts`, idempotent: it lists existing Hosts first and matches by `remark`). Hosts are what put a node's keys into client subscriptions — without them, a registered node never appears in subscription output. The Host's `address`/`sni`/`host` is the **Fastly edge domain when fronted, otherwise the origin `dns_hostname`** (`fastly_websocket_domain | default(dns_hostname)`) — Caddy already terminates a real Let's Encrypt cert on that origin and path-routes to the inbounds, so a direct (non-Fastly) node is a complete, directly-reachable endpoint (e.g. `wss://<dns_hostname>/ws`). Port is 443 with `securityLayer: TLS`. Hosts are gated on `remnawave_enabled` + `remnawave_panel_register_node` + `remnawave_caddy_enabled` + a `cdn_provider` of `fastly` **or** `none`; `remnawave_panel_active_inbounds` is **derived** from the enabled transports' `inbound_uuid`s, and hostname rotation / migration deletes the old node's Hosts (matched by remark prefix) before creating new ones.
 
-**Phase 0 — one-time manual panel prerequisite.** Before deploying, the operator must add two raw-Xray inbounds to the panel's Config Profile:
+**Phase 0 — one-time manual panel prerequisite** (skipped by `operation_mode=bootstrap`, which creates this for you). The operator adds the WS raw-Xray inbound to the panel's Config Profile:
 
 - **WS** — tag `VLESS_WS_CDN`, `listen 127.0.0.1`, `port 8443`, `network: ws`, `security: none`, `wsSettings.path: /ws`.
-- **XHTTP** — tag `VLESS_XHTTP_CDN`, `listen 127.0.0.1`, `port 8444`, `network: xhttp`, `security: none`, `xhttpSettings: { path: /xh, mode: packet-up, scMaxEachPostBytes: 1000000, scMaxBufferedPosts: 30, scMinPostsIntervalMs: 30, xPaddingBytes: "100-1000" }`.
 
-Then record each inbound's UUID (from `GET /api/config-profiles/inbounds`) into the matching `remnawave_cdn_transports[].inbound_uuid`.
+Then record its UUID (from `GET /api/config-profiles/inbounds`) into the matching `remnawave_cdn_transports[].inbound_uuid`.
 
-**XHTTP is experimental and ships disabled.** VLESS+XHTTP (packet-up) over Fastly has no proven track record — the closest documented analogue (CloudFront) fails on `X-Padding` integrity. The Caddy route, Fastly VCL, and Host entry are all built, but the `xhttp` transport ships `enabled: false` and must stay off until a manual proof-of-concept passes on a live throwaway node — validating streamed `do_stream`-on-`pass`, survival of >60s idle (Fastly's clustering timeout), a >20MB download, `X-Padding` integrity (no `invalid x_padding` in Xray logs), and a working ALPN. Only flip `enabled: true` for `xhttp` after that gate passes.
+**Why WS only (no XHTTP).** XHTTP was removed 2026-07-04: Fastly cannot relay XHTTP's long-lived streamed download — its `do_stream` is a cache feature ("Streaming Miss") that explicitly forbids endless responses, and Fastly staff confirmed the equivalent long-lived gRPC stream is impossible via VCL (only via Fastly Compute). Cloudflare fronting is off the table (VPN fronting is banned there). WS-over-Fastly is a first-class upgrade tunnel — the shape Fastly supports — and is the fronted transport.
 
 #### Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN)
 
@@ -644,10 +633,9 @@ remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
 | Transport | Setup | Strength | Best for |
 |-----------|-------|----------|----------|
 | **VLESS+WS+TLS** (via Caddy, real LE cert) | `remnawave_caddy_enabled` + `ws` transport | Rides ordinary HTTPS — traverses forced proxies; TLS inspection sees normal HTTPS (blocking it means blocking all HTTPS) | **Business / school networks** (forced proxies, TLS inspection) |
-| **VLESS+XHTTP+TLS** (via Caddy/Fastly) | `xhttp` transport (experimental, gated) | Stealthier HTTP-based evolution of WS | Same restrictive networks, once the Fastly PoC passes |
 | **VLESS+Vision+REALITY** (direct) | `remnawave_reality_enabled` | Fastest; best against active probing (raw TCP, mimics a real site's TLS) | **Open networks** |
 
-The tradeoff in one line: **WS+TLS via Caddy** is the choice for restrictive **business/school** networks because it looks like — and rides — normal HTTPS, so it gets through forced HTTP proxies and TLS inspection. **Reality** is the **fastest** option and the strongest against active probing, but it does **not** traverse forced HTTP proxies / TLS inspection, so it is for **open** networks, not the business/school case. XHTTP+TLS is a stealthier evolution of the WS approach but remains experimental (Fastly PoC-gated — see above).
+The tradeoff in one line: **WS+TLS via Caddy** is the choice for restrictive **business/school** networks because it looks like — and rides — normal HTTPS, so it gets through forced HTTP proxies and TLS inspection. **Reality** is the **fastest** option and the strongest against active probing, but it does **not** traverse forced HTTP proxies / TLS inspection, so it is for **open** networks, not the business/school case.
 
 #### Notes
 

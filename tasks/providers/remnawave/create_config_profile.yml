@@ -1,7 +1,7 @@
 ---
 # tasks/providers/remnawave/create_config_profile.yml
 #
-# Ensure a Config Profile exists on the panel carrying the WS + XHTTP (+ optional
+# Ensure a Config Profile exists on the panel carrying the WS (+ optional
 # Reality) inbounds a FreeSocks node needs, then read back each inbound's UUID by
 # tag (+ the profile UUID) so create_squad and node deploys can reference them.
 # Idempotent: GET /api/config-profiles, match by name, POST only when absent.
@@ -54,7 +54,7 @@
   no_log: true
   when: remnawave_bootstrap_reality | default(true) | bool
 
-- name: Assemble the desired inbound set (WS + XHTTP [+ Reality])
+- name: Assemble the desired inbound set (WS [+ Reality])
   set_fact:
     _rw_bootstrap_inbounds: >-
       {{ remnawave_bootstrap_cdn_inbounds
@@ -128,9 +128,9 @@
   no_log: true
   register: _rw_inbounds_list
 
-# Map tag -> uuid. Our tags (VLESS_WS_CDN / VLESS_XHTTP_CDN / VLESS_REALITY) are
+# Map tag -> uuid. Our tags (VLESS_WS_CDN / VLESS_REALITY) are
 # FreeSocks-specific, so matching by tag across all returned inbounds is safe;
-# when the panel scopes inbounds by profile we still only read our three tags.
+# when the panel scopes inbounds by profile we still only read our two tags.
 - name: Map inbound tag -> uuid
   set_fact:
     remnawave_bootstrap_inbound_uuids: "{{ remnawave_bootstrap_inbound_uuids | default({}) | combine({ item.tag: item.uuid }) }}"
@@ -165,5 +165,4 @@
       - "Config Profile '{{ remnawave_bootstrap_config_profile_name }}' ready."
       - "remnawave_panel_config_profile_uuid: {{ remnawave_panel_config_profile_uuid }}"
       - "WS inbound  (VLESS_WS_CDN):    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}"
-      - "XHTTP inbound (VLESS_XHTTP_CDN): {{ remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('(none)') }}"
       - "Reality inbound (VLESS_REALITY): {{ remnawave_reality_inbound_uuid | default('(disabled)') }}"

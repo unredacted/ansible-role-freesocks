@@ -6,7 +6,7 @@
 # Let's Encrypt cert via HTTP-01 (port 80 — must be free), and path-routes each
 # enabled remnawave_cdn_transports entry to its loopback Xray inbound (all other
 # paths fall through to a decoy site). The Panel-side Xray inbounds must be
-# configured to listen on those internal ports with plaintext WS/XHTTP —
+# configured to listen on those internal ports with plaintext WS —
 # coordinate panel config accordingly.
 
 - name: Validate Caddy required variables
@@ -113,6 +113,6 @@
       A panel-side Xray inbound is likely bound to this port. Reconfigure the
       inbounds to listen on their loopback ports
       ({{ remnawave_cdn_transports | selectattr('enabled') | map(attribute='internal_port') | join(', ') }})
-      with plaintext WS/XHTTP so Caddy can own {{ remnawave_caddy_listen_port }}.
+      with plaintext WS so Caddy can own {{ remnawave_caddy_listen_port }}.
     success_msg: "Caddy owns port {{ remnawave_caddy_listen_port }}."
   when: caddy_port_owner.stdout | default('') | length > 0

@@ -11,7 +11,7 @@
 # is absent (also tolerate 409). Verified against Remnawave panel API v2.7.4 —
 # the create body nests the inbound under
 # `inbound: {configProfileUuid, configProfileInboundUuid}` and requires an
-# integer `port`; the Host inherits its transport (ws/xhttp) from the inbound.
+# integer `port`; the Host inherits its transport (ws) from the inbound.
 
 - name: Validate Host-creation prerequisites
   assert:
