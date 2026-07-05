@@ -317,14 +317,18 @@ remnawave_caddy_xray_internal_port: 8443
 # Remnawave CDN transports (data-driven multi-transport Caddy + Fastly + Hosts)
 # ============================================================================
 # Each entry = one panel Xray inbound + one Caddy route + one Fastly VCL rule +
-# one Remnawave Host. WS is the proven default; XHTTP is experimental and stays
-# disabled until the manual PoC passes on a live node (see CLAUDE.md Phase C).
+# one Remnawave Host. WS-over-Fastly is the fronted transport.
 #
-# The `path` is PANEL-GLOBAL: it must equal the inbound's wsSettings/xhttpSettings
-# path in the shared Config Profile (every node on that inbound uses the same
-# path — it is NOT per-node-random). `internal_port` must equal the inbound's
-# listen port. `inbound_uuid` is the configProfileInboundUuid from
-# GET /api/config-profiles/inbounds.
+# (XHTTP was removed 2026-07-04: Fastly cannot relay XHTTP's long-lived streamed
+# download — its `do_stream` is a cache feature ("Streaming Miss") that forbids
+# endless responses, and Fastly staff confirmed the equivalent gRPC stream is
+# impossible via VCL — while Cloudflare fronting is off the table. WS is a
+# first-class Fastly upgrade tunnel and is the proven fronted path.)
+#
+# The `path` is PANEL-GLOBAL: it must equal the inbound's wsSettings path in the
+# shared Config Profile (every node on that inbound uses the same path — it is
+# NOT per-node-random). `internal_port` must equal the inbound's listen port.
+# `inbound_uuid` is the configProfileInboundUuid from GET /api/config-profiles/inbounds.
 remnawave_cdn_transports:
   - name: ws
     network: ws
@@ -334,15 +338,6 @@ remnawave_cdn_transports:
     alpn: "http/1.1"
     fingerprint: chrome
     enabled: true
-  - name: xhttp
-    network: xhttp
-    path: "/xh"
-    internal_port: 8444
-    inbound_uuid: ""
-    mode: "packet-up"
-    alpn: "h2,http/1.1"     # MUST-TEST in the Phase C PoC
-    fingerprint: chrome
-    enabled: false          # flip true ONLY after the Phase C PoC passes
 
 # Decoy/camouflage site served by Caddy on every non-transport path.
 remnawave_decoy_root: "/var/www/decoy"
@@ -516,8 +511,8 @@ remnawave_docker_apt_suite: ""
 # `operation_mode=bootstrap` creates the panel objects a working key needs and
 # is IDEMPOTENT (GET-before-POST). It replaces the manual "Phase 0" panel setup:
 #   1. x25519 keypair (Reality)                → gen_x25519.yml
-#   2. a Config Profile + WS/XHTTP/Reality inbounds → create_config_profile.yml
-#   3. a fronted squad (WS+XHTTP) + a Reality squad → create_squad.yml
+#   2. a Config Profile + WS/Reality inbounds → create_config_profile.yml
+#   3. a fronted squad (WS) + a Reality squad → create_squad.yml
 #   4. bind those squads to FCP connection profiles → providers/fcp/bind_profiles.yml
 # It touches NO host (delegate_to: localhost throughout). Run once per panel, e.g.:
 #   ansible-playbook playbook.yml -e operation_mode=bootstrap \
@@ -549,16 +544,21 @@ remnawave_x25519_endpoint: "/api/system/tools/x25519/generate"
 
 # Reality inbound params (the borrowed-site TLS handshake it mimics). dest +
 # serverNames must be a real, reachable TLS site; shortIds [""] = accept-all.
-remnawave_bootstrap_reality_dest: "www.microsoft.com:443"
-remnawave_bootstrap_reality_server_names: ["www.microsoft.com"]
+# Decoy = dl.google.com: no in-country PoPs in CN/RU/IR (so no routing /
+# reverse-DNS anomaly, which Iran actively exploits) and it emits no
+# NewSessionTicket (the current Reality-detection fingerprint, net4people #481).
+# NOT www.microsoft.com — its ~8273-byte cert record trips Xray's hardcoded
+# 8192-byte REALITY buffer (#6356) AND it has in-country servers.
+remnawave_bootstrap_reality_dest: "dl.google.com:443"
+remnawave_bootstrap_reality_server_names: ["dl.google.com"]
 remnawave_bootstrap_reality_short_ids: [""]
 # Reality stream network: v2.8 renamed the raw-TCP carrier "tcp" -> "raw". VERIFY
 # against your panel; flip to "tcp" on older panels.
 remnawave_bootstrap_reality_network: "raw"
 
-# The WS/XHTTP inbounds (raw Xray) the bootstrap POSTs into the Config Profile.
-# tags MUST match what create_config_profile reads back + what create_squad binds
-# (VLESS_WS_CDN / VLESS_XHTTP_CDN); ports/paths MUST match remnawave_cdn_transports.
+# The WS inbound (raw Xray) the bootstrap POSTs into the Config Profile.
+# The tag MUST match what create_config_profile reads back + what create_squad
+# binds (VLESS_WS_CDN); ports/paths MUST match remnawave_cdn_transports.
 remnawave_bootstrap_cdn_inbounds:
   - tag: "VLESS_WS_CDN"
     listen: "127.0.0.1"
@@ -569,22 +569,6 @@ remnawave_bootstrap_cdn_inbounds:
       network: "ws"
       security: "none"
       wsSettings: { path: "/ws" }
-    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
-  - tag: "VLESS_XHTTP_CDN"
-    listen: "127.0.0.1"
-    port: 8444
-    protocol: "vless"
-    settings: { clients: [], decryption: "none" }
-    streamSettings:
-      network: "xhttp"
-      security: "none"
-      xhttpSettings:
-        path: "/xh"
-        mode: "packet-up"
-        scMaxEachPostBytes: 1000000
-        scMaxBufferedPosts: 30
-        scMinPostsIntervalMs: 30
-        xPaddingBytes: "100-1000"
     sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
 
 # FCP default connection profile bind_profiles sets ('evade' = Stay connected).

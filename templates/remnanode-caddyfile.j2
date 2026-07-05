@@ -9,10 +9,6 @@
 
    - ws    -> exact path match, reverse_proxy to the inbound (the WebSocket
               upgrade passes through transparently).
-   - xhttp -> PREFIX match (path/*) with response buffering disabled
-              (flush_interval -1) so the long-lived packet-up GET stream isn't
-              held back. Uses `handle` (NOT handle_path, which would strip the
-              prefix and break XHTTP).
 #}
 {
     email {{ remnawave_caddy_email }}
@@ -24,12 +20,6 @@
     @{{ t.name }} path {{ t.path }}
     handle @{{ t.name }} {
         reverse_proxy 127.0.0.1:{{ t.internal_port }}
-    }
-{% elif t.network == 'xhttp' %}
-    handle {{ t.path }}/* {
-        reverse_proxy 127.0.0.1:{{ t.internal_port }} {
-            flush_interval -1
-        }
     }
 {% endif %}
 {% endfor %}

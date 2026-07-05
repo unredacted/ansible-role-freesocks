@@ -2,7 +2,7 @@
 # tasks/providers/remnawave/create_squad.yml
 #
 # Ensure the two connection-profile internal squads exist and capture their UUIDs:
-#   * fronted squad  = WS + XHTTP inbounds  -> FCP "Stay connected" (evade)
+#   * fronted squad  = WS inbound           -> FCP "Stay connected" (evade)
 #   * Reality squad  = the Reality inbound  -> FCP "Maximize privacy" (privacy)
 # A member's key is issued into whichever squad their FCP connection profile binds
 # to. Idempotent: GET /api/internal-squads, match by name, POST only when absent.
@@ -33,11 +33,10 @@
     _resp: "{{ _rw_squads_list.json.response }}"
     _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
 
-- name: Compose the fronted squad inbound set (WS + XHTTP, dropping any unbound)
+- name: Compose the fronted squad inbound set (WS, dropping any unbound)
   set_fact:
     _rw_fronted_inbounds: >-
-      {{ [remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default(''),
-          remnawave_bootstrap_inbound_uuids['VLESS_XHTTP_CDN'] | default('')]
+      {{ [remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('')]
          | select('string') | reject('equalto', '') | list }}
   no_log: true
 
@@ -47,7 +46,7 @@
       - _rw_fronted_inbounds | length > 0
     fail_msg: "No CDN inbound UUIDs available for the fronted squad — run create_config_profile.yml first."
 
-- name: Create the fronted squad (WS + XHTTP) when absent
+- name: Create the fronted squad (WS) when absent
   uri:
     url: "{{ remnawave_panel_url }}/api/internal-squads"
     method: POST

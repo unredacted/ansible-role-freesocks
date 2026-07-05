@@ -712,7 +712,7 @@
 # host terminating TLS and path-routing the WebSocket transport to the panel's
 # loopback Xray inbound. The role registers the node on the panel AND creates
 # one Remnawave Host per enabled CDN transport (so issued keys reach
-# subscriptions). XHTTP ships disabled — leave it off until the Phase C PoC.
+# subscriptions).
 #
 # Phase 0 prerequisite (one-time, MANUAL in the panel): add a raw-Xray WS
 # inbound to the Config Profile (tag VLESS_WS_CDN, listen 127.0.0.1:8443,
@@ -743,7 +743,7 @@
     remnawave_panel_secret_key: "your-panel-secret-key"            # vault me
 
     # CDN transports: fill the WS inbound UUID (from Phase 0). The `path` is
-    # panel-global (must equal the inbound's wsSettings.path). XHTTP stays off.
+    # panel-global (must equal the inbound's wsSettings.path).
     remnawave_cdn_transports:
       - name: ws
         network: ws
@@ -753,15 +753,6 @@
         alpn: "http/1.1"
         fingerprint: chrome
         enabled: true
-      - name: xhttp
-        network: xhttp
-        path: "/xh"
-        internal_port: 8444
-        inbound_uuid: ""
-        mode: "packet-up"
-        alpn: "h2,http/1.1"
-        fingerprint: chrome
-        enabled: false                          # Phase C gate — keep disabled
 
     domain_providers:
       example.com:
@@ -837,7 +828,7 @@
     remnawave_panel_secret_key: "your-panel-secret-key"            # vault me
 
     # CDN transports: fill the WS inbound UUID (from Phase 0). The `path` is
-    # panel-global (must equal the inbound's wsSettings.path). XHTTP stays off.
+    # panel-global (must equal the inbound's wsSettings.path).
     remnawave_cdn_transports:
       - name: ws
         network: ws
@@ -847,15 +838,6 @@
         alpn: "http/1.1"
         fingerprint: chrome
         enabled: true
-      - name: xhttp
-        network: xhttp
-        path: "/xh"
-        internal_port: 8444
-        inbound_uuid: ""
-        mode: "packet-up"
-        alpn: "h2,http/1.1"
-        fingerprint: chrome
-        enabled: false                          # Phase C gate — keep disabled
 
     # No CDN — origin is reached directly (cdn_provider omitted == none).
     domain_providers:

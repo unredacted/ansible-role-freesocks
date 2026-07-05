@@ -3,7 +3,7 @@
 #
 # Bind the bootstrap-created Remnawave squads to FCP's member-facing connection
 # profiles (the "Stay connected" / "Maximize privacy" transport chooser):
-#   evade   ("Stay connected")   -> the fronted (WS + XHTTP) squad
+#   evade   ("Stay connected")   -> the fronted (WS) squad
 #   privacy ("Maximize privacy") -> the Reality squad
 # A member's key is then issued into the squad their chosen profile binds to. A
 # single idempotent PATCH to FCP's admin connection-profiles endpoint; re-runs are

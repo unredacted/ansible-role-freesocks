@@ -1,7 +1,7 @@
 ---
 # tasks/providers/fastly/service.yml - Create and configure Fastly VCL service
 #
-# Creates a Fastly CDN service for WebSocket (+ XHTTP) passthrough (CDN fronting).
+# Creates a Fastly CDN service for WebSocket passthrough (CDN fronting).
 # Supports two domain modes:
 #   - shared: <label>.global.ssl.fastly.net. The label is an EXPLICIT choice —
 #     either operator-chosen (fastly_edge_label) or a random fs-<hostname>
@@ -352,82 +352,10 @@
     msg: "WebSocket VCL snippet added to Fastly service"
   when: not fastly_service_exists
 
-# XHTTP (packet-up) transports need their own VCL: the request carries no
-# Upgrade header, so the websocket_upgrade snippet above does not apply. Each
-# enabled xhttp transport gets (1) a recv snippet making its path uncacheable
-# (return(pass)), and (2) a fetch snippet that streams the long-lived GET
-# (beresp.do_stream) and caps timeouts at Fastly's ~60s clustering ceiling.
-# No-op while all xhttp transports are disabled. MUST-TEST: do_stream-on-pass
-# streaming + X-Padding integrity (see HANDOFF-cdn-transports.md Phase C).
-- name: Add XHTTP pass VCL snippet (uncacheable) per transport
-  uri:
-    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
-    method: POST
-    headers:
-      Fastly-Key: "{{ fastly_token }}"
-      Content-Type: "application/x-www-form-urlencoded"
-      Accept: "application/json"
-    body_format: form-urlencoded
-    body:
-      name: "xhttp_pass_{{ item.name }}"
-      type: "recv"
-      priority: "20"
-      dynamic: "0"
-      content: 'if (req.url ~ "^{{ item.path }}/") { return(pass); }'
-    status_code: [200, 201]
-  delegate_to: localhost
-  loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
-  loop_control:
-    label: "{{ item.name }}"
-  when: not fastly_service_exists
-
-# Backend-request timeouts (bereq.*) are only writable in vcl_pass / vcl_miss —
-# NOT vcl_fetch. The /xh path return(pass)es (recv snippet above), so set the
-# ~60s clustering-ceiling timeouts in a pass-type snippet.
-- name: Add XHTTP pass-phase backend timeouts per transport
-  uri:
-    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
-    method: POST
-    headers:
-      Fastly-Key: "{{ fastly_token }}"
-      Content-Type: "application/x-www-form-urlencoded"
-      Accept: "application/json"
-    body_format: form-urlencoded
-    body:
-      name: "xhttp_timeouts_{{ item.name }}"
-      type: "pass"
-      priority: "20"
-      dynamic: "0"
-      content: 'if (req.url ~ "^{{ item.path }}/") { set bereq.first_byte_timeout = 60s; set bereq.between_bytes_timeout = 60s; }'
-    status_code: [200, 201]
-  delegate_to: localhost
-  loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
-  loop_control:
-    label: "{{ item.name }}"
-  when: not fastly_service_exists
-
-# Response streaming (beresp.do_stream) is the vcl_fetch-phase setting.
-- name: Add XHTTP stream VCL snippet (do_stream) per transport
-  uri:
-    url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/snippet"
-    method: POST
-    headers:
-      Fastly-Key: "{{ fastly_token }}"
-      Content-Type: "application/x-www-form-urlencoded"
-      Accept: "application/json"
-    body_format: form-urlencoded
-    body:
-      name: "xhttp_stream_{{ item.name }}"
-      type: "fetch"
-      priority: "20"
-      dynamic: "0"
-      content: 'if (req.url ~ "^{{ item.path }}/") { set beresp.do_stream = true; }'
-    status_code: [200, 201]
-  delegate_to: localhost
-  loop: "{{ remnawave_cdn_transports | default([]) | selectattr('enabled') | selectattr('network', 'equalto', 'xhttp') | list }}"
-  loop_control:
-    label: "{{ item.name }}"
-  when: not fastly_service_exists
+# (XHTTP VCL removed 2026-07-04: Fastly cannot relay XHTTP's long-lived streamed
+# download — `beresp.do_stream` is a cache feature that forbids endless responses,
+# confirmed unworkable by Fastly staff for the equivalent gRPC stream. WS uses the
+# `return(upgrade)` snippet above and is the fronted transport.)
 
 # ============================================================================
 # Activate service version
