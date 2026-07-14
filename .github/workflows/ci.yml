@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Cheap structural checks: every YAML parses + the test playbooks pass
+  # ansible's own syntax check.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible-core
+        run: pipx install ansible-core
+      - name: YAML-parse every role file
+        run: |
+          python3 - <<'EOF'
+          import sys, yaml, pathlib
+          bad = []
+          for p in pathlib.Path('.').rglob('*.yml'):
+              if '.git' in p.parts:
+                  continue
+              try:
+                  list(yaml.safe_load_all(p.read_text()))
+              except Exception as e:
+                  bad.append(f"{p}: {e}")
+          if bad:
+              print("\n".join(bad)); sys.exit(1)
+          print("all YAML files parse")
+          EOF
+      - name: Syntax-check the test playbooks
+        run: |
+          ansible-playbook --syntax-check tests/test_bootstrap.yml
+          ansible-playbook --syntax-check tests/test_caddyfile_render.yml
+          ANSIBLE_ROLES_PATH="$(dirname "$PWD")" \
+            ansible-playbook --syntax-check tests/test_integration.yml
+
+  # The self-asserting expression tests (pure filter logic, no network):
+  # bootstrap/placement body building, per-node plan+clone expressions, and
+  # the Caddyfile render.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible-core
+        run: pipx install ansible-core
+      - name: Run expression tests
+        run: |
+          ansible-playbook tests/test_bootstrap.yml
+          ansible-playbook tests/test_caddyfile_render.yml
+
+  # The real thing: a pinned Remnawave panel (same image the fleet runs) + a
+  # contract-strict mock FCP, driven end to end — bootstrap, per-node placement
+  # for two nodes (including the duplicate-inbound-port case), pool
+  # append/detach, and teardown. Catches panel contract drift and FCP request
+  # regressions before any production deploy.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ansible-core
+        run: pipx install ansible-core
+      - name: Run the integration harness
+        run: bash tests/run_integration.sh
+      - name: Panel logs on failure
+        if: failure()
+        run: docker compose -f tests/panel/docker-compose.yml logs --tail=100 || true

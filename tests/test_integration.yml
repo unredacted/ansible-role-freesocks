@@ -1,0 +1,304 @@
+---
+# tests/test_integration.yml — end-to-end integration test against a REAL
+# Remnawave panel (tests/panel/docker-compose.yml) + the mock FCP
+# (tests/mock_fcp.py). Run via tests/run_integration.sh (which stands both up
+# and exports REMNAWAVE_TEST_URL / REMNAWAVE_TEST_TOKEN / FCP_MOCK_URL).
+#
+# What it proves, in order:
+#   1. operation_mode=bootstrap creates the Config Profile with the no-log
+#      posture + base inbounds, and sets the FCP default mode.
+#   2. Per-node placement (node 1, WS + Reality): inbound clones + squads on
+#      the panel, pool append in FCP, node registration, panel registration
+#      with maxKeys/priority + the strict test-connection probe.
+#   3. Idempotent re-run: no duplicate inbounds/squads.
+#   4. Node 2 (WS only): a SECOND same-port inbound clone in the same profile
+#      (the duplicate-port VERIFY item) + append-only pool growth.
+#   5. Teardown (node 1): pool detach, squad delete, inbound strip — node 2
+#      untouched.
+
+# --- shared expressions ------------------------------------------------------
+- name: Integration — phase 1 (panel bootstrap through the role)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: &ci_vars
+    operation_mode: bootstrap
+    remnawave_panel_url: "{{ lookup('env', 'REMNAWAVE_TEST_URL') | default('http://127.0.0.1:3000', true) }}"
+    remnawave_panel_api_token: "{{ lookup('env', 'REMNAWAVE_TEST_TOKEN') }}"
+    fcp_enabled: true
+    fcp_api_url: "{{ lookup('env', 'FCP_MOCK_URL') | default('http://127.0.0.1:8811', true) }}"
+    fcp_api_token: "fsv1_ci-mock-token"
+    fcp_default_connection_mode: "evade"
+    remnawave_bootstrap_output_file: "/tmp/role-ci/bootstrap-vars.yml"
+    remnawave_persist_become: false
+  pre_tasks:
+    - name: Ensure the CI scratch dir exists
+      file: { path: /tmp/role-ci, state: directory, mode: '0755' }
+    - name: Assert the harness exported the panel token
+      assert:
+        that: [remnawave_panel_api_token | length > 0]
+        fail_msg: "REMNAWAVE_TEST_TOKEN not set — run via tests/run_integration.sh"
+  roles:
+    - role: "{{ playbook_dir | dirname | basename }}"
+  post_tasks:
+    - name: Read back the Config Profiles
+      uri:
+        url: "{{ remnawave_panel_url }}/api/config-profiles"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _profiles
+    # set_fact MATERIALIZES the value — chained lazy task-vars mis-evaluate on
+    # ansible-core 2.19+ (the same quirk the role files avoid).
+    - name: Materialize the bootstrap profile
+      set_fact:
+        _t1_profile: "{{ _profiles.json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first }}"
+    - name: Assert the profile exists with the no-log posture + base inbounds
+      assert:
+        that:
+          - _t1_profile.config.log.access == 'none'
+          - _t1_profile.config.log.loglevel == 'none'
+          - _t1_profile.config.log.dnsLog == false
+          - _t1_profile.config.log.maskAddress == 'full'
+          - _t1_profile.config.policy.levels['0'].statsUserOnline == false
+          - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_WS_CDN') | list | length == 1
+          - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_REALITY') | list | length == 1
+        fail_msg: "Bootstrap profile missing or not born with the no-log Xray posture"
+    - name: Read the mock FCP state
+      uri: { url: "{{ fcp_api_url }}/__state", return_content: yes }
+      register: _fcp1
+    - name: Assert the default mode was bound and no squads were created (per-node model)
+      assert:
+        that:
+          - _fcp1.json.defaultMode == 'evade'
+          - (_fcp1.json.pools.evade | default([])) | length == 0
+        fail_msg: "Bootstrap should bind the default mode but create no shared squads by default"
+
+- name: Integration — phase 2 (node 1 per-node placement + registration)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    <<: *ci_vars
+    operation_mode: deploy # cosmetic here; tasks are included directly
+    random_hostname: "ci-node-one"
+    dns_hostname: "ci-node-one.example.test"
+    remnawave_node_address: "127.0.0.1"
+    remnawave_caddy_enabled: true
+    remnawave_reality_enabled: true
+    remnawave_node_install_dir: "/tmp/role-ci/node1"
+    remnawave_panel_register_node: true
+    fcp_register_remnawave_panel: true
+    fcp_remnawave_panel_slug: "ci-panel"
+    fcp_max_keys: 100
+    fcp_priority: 5
+  pre_tasks:
+    # Each phase simulates a DIFFERENT node on the same localhost. Real deploys
+    # run one play per inventory host, so facts never leak between nodes — here
+    # they would (set_fact outlives the play and outranks include_vars), so
+    # clear them to model a fresh host.
+    - meta: clear_facts
+    - name: Ensure node 1 install dir exists
+      file: { path: "{{ remnawave_node_install_dir }}", state: directory, mode: '0755' }
+    - name: Reload node-deploy vars from the bootstrap output (fresh-host simulation)
+      # set_fact, NOT include_vars: a prior phase's repointed facts outrank
+      # include_vars (and survive clear_facts on ansible-core 2.21), so force
+      # the file values the way a genuinely fresh host would see them.
+      set_fact:
+        remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
+        remnawave_reality_inbound_uuid: "{{ _boot.remnawave_reality_inbound_uuid }}"
+        remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
+      vars:
+        _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
+  tasks:
+    - name: Create per-node placement objects (node 1)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_node_placement
+    - name: Capture the profile inbound count after the first run
+      uri:
+        url: "{{ remnawave_panel_url }}/api/config-profiles"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _profiles_a
+    - name: Re-run per-node placement (idempotency)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_node_placement
+    - name: Read back profile + squads after the re-run
+      uri:
+        url: "{{ remnawave_panel_url }}{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop: ["/api/config-profiles", "/api/internal-squads"]
+      register: _panel_b
+    - name: Materialize the phase-2 panel state
+      set_fact:
+        _t2_tags: "{{ (_panel_b.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t2_tags_a: "{{ (_profiles_a.json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t2_squads: "{{ _panel_b.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+    - name: Assert per-node inbounds + squads (and idempotent re-run)
+      assert:
+        that:
+          - _t2_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_ONE') | list | length == 1
+          - _t2_tags | select('equalto', 'VLESS_REALITY_CI_NODE_ONE') | list | length == 1
+          - _t2_tags | length == (_t2_tags_a | length)  # re-run added nothing
+          - _t2_squads | select('equalto', 'FreeSocks-Fronted-ci-node-one') | list | length == 1
+          - _t2_squads | select('equalto', 'FreeSocks-Reality-ci-node-one') | list | length == 1
+        fail_msg: "Per-node inbound/squad creation is wrong or not idempotent"
+    - name: Add node 1's squads to the FCP pools (as main.yml does)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/fcp/bind_placements
+      vars:
+        _evade_entry: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
+        _privacy_entry: "{{ {'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+    - name: Derive active inbounds + register the node (as setup/remnawave.yml does)
+      set_fact:
+        remnawave_panel_active_inbounds: >-
+          {{ (remnawave_cdn_transports | selectattr('enabled') | map(attribute='inbound_uuid')
+              | select('string') | reject('equalto', '') | list)
+             + ([remnawave_reality_inbound_uuid] if (remnawave_reality_inbound_uuid | default('') | length > 0) else []) }}
+    - name: Register node 1 with the panel
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/register_node
+    - name: Register the panel with FCP (maxKeys/priority + strict probe)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/fcp/register_remnawave_panel
+    - name: Read panel nodes + mock FCP state
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ remnawave_panel_url }}/api/nodes"
+        - "{{ fcp_api_url }}/__state"
+      register: _phase2
+    - name: Materialize the phase-2 node list + FCP state
+      set_fact:
+        _t2_nodes: "{{ _phase2.results[0].json.response['nodes'] if (_phase2.results[0].json.response is mapping and 'nodes' in _phase2.results[0].json.response) else _phase2.results[0].json.response }}"
+        _t2_state: "{{ _phase2.results[1].json }}"
+    - name: Assert node registered + pools/panel row in FCP
+      assert:
+        that:
+          - _t2_nodes | selectattr('name', 'equalto', 'ci-node-one') | list | length == 1
+          - _t2_state.pools.evade | length == 1
+          - _t2_state.pools.privacy | length == 1
+          - _t2_state.servers['ci-panel'].maxKeys == 100
+          - _t2_state.servers['ci-panel'].priority == 5
+        fail_msg: "Node registration / FCP pool append / panel upsert drifted"
+
+- name: Integration — phase 3 (node 2, WS only — duplicate-port + pool append)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    <<: *ci_vars
+    operation_mode: deploy
+    random_hostname: "ci-node-two"
+    dns_hostname: "ci-node-two.example.test"
+    remnawave_caddy_enabled: true
+    remnawave_reality_enabled: false
+    remnawave_node_install_dir: "/tmp/role-ci/node2"
+  pre_tasks:
+    # Each phase simulates a DIFFERENT node on the same localhost. Real deploys
+    # run one play per inventory host, so facts never leak between nodes — here
+    # they would (set_fact outlives the play and outranks include_vars), so
+    # clear them to model a fresh host.
+    - meta: clear_facts
+    - name: Ensure node 2 install dir exists
+      file: { path: "{{ remnawave_node_install_dir }}", state: directory, mode: '0755' }
+    - name: Reload node-deploy vars from the bootstrap output (fresh-host simulation)
+      # set_fact, NOT include_vars: a prior phase's repointed facts outrank
+      # include_vars (and survive clear_facts on ansible-core 2.21), so force
+      # the file values the way a genuinely fresh host would see them.
+      set_fact:
+        remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
+        remnawave_reality_inbound_uuid: "{{ _boot.remnawave_reality_inbound_uuid }}"
+        remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
+      vars:
+        _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
+  tasks:
+    # THE duplicate-port VERIFY item: node 2's WS clone reuses port 8443 in the
+    # SAME profile as node 1's clone. If the panel rejects duplicate inbound
+    # ports, this include fails and CI catches it before any production deploy.
+    - name: Create per-node placement objects (node 2)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_node_placement
+    - name: Add node 2's squad to the FCP evade pool
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/fcp/bind_placements
+      vars:
+        _fcp_placement_modes: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} }}"
+    - name: Read the mock FCP state
+      uri: { url: "{{ fcp_api_url }}/__state", return_content: yes }
+      register: _fcp3
+    - name: Assert append-only pool growth (node 1 undisturbed)
+      assert:
+        that:
+          - _fcp3.json.pools.evade | length == 2
+          - _fcp3.json.pools.privacy | length == 1
+        fail_msg: "Pool append disturbed existing membership"
+
+- name: Integration — phase 4 (teardown node 1; node 2 untouched)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    <<: *ci_vars
+    operation_mode: deploy
+    random_hostname: "ci-node-one"
+    remnawave_node_install_dir: "/tmp/role-ci/node1"
+  pre_tasks:
+    # Each phase simulates a DIFFERENT node on the same localhost. Real deploys
+    # run one play per inventory host, so facts never leak between nodes — here
+    # they would (set_fact outlives the play and outranks include_vars), so
+    # clear them to model a fresh host.
+    - meta: clear_facts
+    - name: Reload node-deploy vars from the bootstrap output (fresh-host simulation)
+      # set_fact, NOT include_vars: a prior phase's repointed facts outrank
+      # include_vars (and survive clear_facts on ansible-core 2.21), so force
+      # the file values the way a genuinely fresh host would see them.
+      set_fact:
+        remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
+        remnawave_reality_inbound_uuid: "{{ _boot.remnawave_reality_inbound_uuid }}"
+        remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
+      vars:
+        _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
+  tasks:
+    - name: Tear down node 1's placement
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/teardown_node_placement
+    - name: Read back profile + squads + mock FCP state
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ remnawave_panel_url }}/api/config-profiles"
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+        - "{{ fcp_api_url }}/__state"
+      register: _phase4
+    - name: Materialize the phase-4 panel state
+      set_fact:
+        _t4_tags: "{{ (_phase4.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t4_squads: "{{ _phase4.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+        _t4_state: "{{ _phase4.results[2].json }}"
+    - name: Assert node 1 fully detached and node 2 intact
+      assert:
+        that:
+          - _t4_tags | select('search', '_CI_NODE_ONE$') | list | length == 0
+          - _t4_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_TWO') | list | length == 1
+          - _t4_squads | select('search', '-ci-node-one$') | list | length == 0
+          - _t4_squads | select('equalto', 'FreeSocks-Fronted-ci-node-two') | list | length == 1
+          - _t4_state.pools.evade | length == 1
+          - _t4_state.pools.privacy | length == 0
+        fail_msg: "Teardown left node-1 residue or disturbed node 2"
+    - name: All integration phases passed
+      debug:
+        msg: "Integration OK: bootstrap, per-node placement (x2, idempotent, duplicate-port), pool append/detach, teardown."

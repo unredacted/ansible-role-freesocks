@@ -1,0 +1,94 @@
+# Ephemeral Remnawave panel for the role's CI integration test.
+#
+# NOT for production — a throwaway panel the integration playbook drives the
+# role's bootstrap + per-node placement tasks against, so a panel contract
+# drift (endpoint path / DTO shape / version bump) fails CI instead of a
+# production node deploy. Pinned to the same Remnawave release the fleet runs.
+#
+# Fresh state every `up` (no persistent DB volume) so bootstrap_panel.py can
+# always register the first admin. Mirrors FCP's docker-compose.remnawave-test.yml.
+#   docker compose -f tests/panel/docker-compose.yml up -d
+#   python3 tests/panel/bootstrap_panel.py            # prints URL/TOKEN lines
+#   docker compose -f tests/panel/docker-compose.yml down -v
+name: role-rw-test
+
+services:
+  rw-test-backend:
+    image: remnawave/backend:2.8.0
+    container_name: role-rw-test-backend
+    hostname: rw-test-backend
+    restart: 'no'
+    env_file:
+      - panel.env
+    volumes:
+      - valkey-socket:/var/run/valkey
+    # No host ports: the API is reached only through rw-test-proxy (which injects
+    # the X-Forwarded-* headers Remnawave's proxy guard requires).
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:3001/health || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      rw-test-db:
+        condition: service_healthy
+      rw-test-redis:
+        condition: service_healthy
+
+  # Reverse proxy injecting X-Forwarded-Proto/For (the panel's ProxyCheck
+  # middleware requires them) — same topology as a real deployment.
+  rw-test-proxy:
+    image: caddy:2-alpine
+    container_name: role-rw-test-proxy
+    hostname: rw-test-proxy
+    restart: 'no'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - '127.0.0.1:3000:3000'
+    depends_on:
+      rw-test-backend:
+        condition: service_started
+
+  rw-test-db:
+    image: postgres:18.4
+    container_name: role-rw-test-db
+    hostname: rw-test-db
+    shm_size: 512mb
+    restart: 'no'
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+      - TZ=UTC # Remnawave requires the DB timezone to be UTC.
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  rw-test-redis:
+    image: valkey/valkey:9-alpine
+    container_name: role-rw-test-redis
+    hostname: rw-test-redis
+    restart: 'no'
+    volumes:
+      - valkey-socket:/var/run/valkey
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory-policy noeviction
+      --loglevel warning
+      --unixsocket /var/run/valkey/valkey.sock
+      --unixsocketperm 777
+      --port 0
+    healthcheck:
+      test: ['CMD', 'valkey-cli', '-s', '/var/run/valkey/valkey.sock', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  valkey-socket:
