@@ -1,0 +1,47 @@
+---
+# tasks/providers/fcp/status_gate.yml
+#
+# Post-deploy health gate (opt-in via fcp_status_gate): poll FCP's shared
+# status endpoint until THIS backend row reports healthy. Complements the
+# test-connection probe: that proves FCP *can* reach the backend on demand;
+# this proves FCP's own healthcheck CRON has observed it (the same freshness
+# signal issuance's pool scoring uses). The cron runs every ~10 minutes, so a
+# fresh registration can legitimately take that long to turn healthy — the
+# defaults poll for up to ~15 min.
+#
+# Scope: admin:status:read (add it to the fsv1_ token when enabling the gate).
+# The caller passes _fcp_gate_slug (the backend-servers slug to wait for).
+
+- name: Validate FCP status-gate prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - _fcp_gate_slug is defined and _fcp_gate_slug | length > 0
+    fail_msg: >-
+      The FCP status gate requires fcp_api_url, fcp_api_token (with
+      admin:status:read), and _fcp_gate_slug from the caller.
+  no_log: true
+
+- name: Wait for FCP to report this backend healthy (healthcheck cron ~10 min)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/status"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _fcp_gate
+  retries: "{{ fcp_status_gate_retries | default(45) }}"
+  delay: "{{ fcp_status_gate_delay | default(20) }}"
+  until: >-
+    (_fcp_gate.json.backends | default([])
+     | selectattr('slug', 'equalto', _fcp_gate_slug)
+     | selectattr('healthy') | list | length) > 0
+
+- name: Note FCP status-gate result
+  debug:
+    msg: "FCP reports backend '{{ _fcp_gate_slug }}' healthy."

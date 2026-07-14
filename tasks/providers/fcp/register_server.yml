@@ -89,6 +89,17 @@
     _fcp_body: "{{ _fcp_body | combine({'websocketDomain': _fcp_ws_domain}) }}"
   when: _fcp_ws_domain is defined and _fcp_ws_domain | length > 0
 
+# Optional capacity/ordering hints. Only sent when the operator set them (an
+# absent field leaves FCP's stored value unchanged, so admin CMS edits survive
+# re-runs). fcp_max_keys="null" clears a previously-set cap.
+- name: Add maxKeys / priority to FCP body (when set)
+  set_fact:
+    _fcp_body: "{{ _fcp_body | combine(_mk) | combine(_pr) }}"
+  vars:
+    _mk: "{{ ({'maxKeys': (none if ((fcp_max_keys | string) == 'null') else (fcp_max_keys | int))}) if ((fcp_max_keys | default('') | string) | length > 0) else {} }}"
+    _pr: "{{ ({'priority': (fcp_priority | int)}) if ((fcp_priority | default('') | string) | length > 0) else {} }}"
+  when: (_mk | length > 0) or (_pr | length > 0)
+
 # Idempotent upsert: the slug in the path is authoritative; FCP creates the row
 # or merges into the existing one (keep-secret-on-blank), returning {created}.
 # A write-only-then-read token both works here and on the test-connection probe.
@@ -123,14 +134,14 @@
 - name: Verify FCP can reach the Outline backend
   when: fcp_verify_connectivity | default(true) | bool
   block:
-    # FCP's test-connection validator declares only { backend, baseUrl, apiToken,
-    # apiUrl, websocketEnabled, websocketDomain } — NOT `name`. Convex arg
-    # validators are strict (an undeclared field is rejected), and the route
-    # forwards the body unfiltered, so reusing the upsert body (which carries
-    # `name`) 500s the probe. Send the same body minus `name`.
-    - name: Build the FCP test-connection body (drop `name`; the probe validator omits it)
+    # FCP's test-connection validator declares only { backend, id, baseUrl,
+    # apiToken, apiUrl, websocketEnabled, websocketDomain } — NOT `name` /
+    # `maxKeys` / `priority`. Convex arg validators are strict (an undeclared
+    # field is rejected), and the route forwards the body unfiltered, so send
+    # the upsert body minus the upsert-only fields.
+    - name: Build the FCP test-connection body (drop the upsert-only fields)
       set_fact:
-        _fcp_testconn_body: "{{ _fcp_body | dict2items | rejectattr('key', 'equalto', 'name') | items2dict }}"
+        _fcp_testconn_body: "{{ _fcp_body | dict2items | rejectattr('key', 'in', ['name', 'maxKeys', 'priority']) | items2dict }}"
     - name: Probe FCP -> backend connectivity (test-connection)
       uri:
         url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/test-connection"

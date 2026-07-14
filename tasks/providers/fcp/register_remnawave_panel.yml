@@ -34,6 +34,16 @@
       apiToken: "{{ remnawave_panel_api_token }}"
   no_log: true
 
+# Optional capacity/ordering hints (see register_server.yml — same semantics).
+- name: Add maxKeys / priority to FCP panel body (when set)
+  set_fact:
+    _fcp_panel_body: "{{ _fcp_panel_body | combine(_mk) | combine(_pr) }}"
+  vars:
+    _mk: "{{ ({'maxKeys': (none if ((fcp_max_keys | string) == 'null') else (fcp_max_keys | int))}) if ((fcp_max_keys | default('') | string) | length > 0) else {} }}"
+    _pr: "{{ ({'priority': (fcp_priority | int)}) if ((fcp_priority | default('') | string) | length > 0) else {} }}"
+  no_log: true
+  when: (_mk | length > 0) or (_pr | length > 0)
+
 - name: Upsert FCP panel (Remnawave, idempotent by slug)
   uri:
     url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/by-slug/{{ fcp_remnawave_panel_slug | urlencode }}"
@@ -59,11 +69,11 @@
 - name: Verify FCP can reach the Remnawave panel
   when: fcp_verify_connectivity | default(true) | bool
   block:
-    # FCP's test-connection validator omits `name` (Convex rejects undeclared
-    # fields), so reuse the panel body minus `name`.
-    - name: Build the FCP panel test-connection body (drop `name`)
+    # FCP's test-connection validator omits `name`/`maxKeys`/`priority` (Convex
+    # rejects undeclared fields), so reuse the panel body minus those.
+    - name: Build the FCP panel test-connection body (drop the upsert-only fields)
       set_fact:
-        _fcp_panel_testconn_body: "{{ _fcp_panel_body | dict2items | rejectattr('key', 'equalto', 'name') | items2dict }}"
+        _fcp_panel_testconn_body: "{{ _fcp_panel_body | dict2items | rejectattr('key', 'in', ['name', 'maxKeys', 'priority']) | items2dict }}"
     - name: Probe FCP -> panel connectivity (test-connection)
       uri:
         url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/test-connection"
