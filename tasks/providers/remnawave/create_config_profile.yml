@@ -73,7 +73,22 @@
     body:
       name: "{{ remnawave_bootstrap_config_profile_name }}"
       config:
-        log: { loglevel: "warning" }
+        # Born compliant with the FreeSocks no-client-IP posture (FCP
+        # docs/privacy.md §5 / PRIVACY_XRAY_LOG — the same block FCP's
+        # Admin → Remnawave harden-logging enforces): no access/error/DNS
+        # logging, full IP masking if a level is ever raised, and the per-user
+        # online-IP tracker OFF. statsUserOnline:false costs the panel's
+        # usersOnline signal (FCP's node placement then ties on it and falls
+        # back to the realtime-bandwidth tiebreak) — that trade is deliberate.
+        log:
+          access: "none"
+          error: "none"
+          loglevel: "none"
+          dnsLog: false
+          maskAddress: "full"
+        policy:
+          levels:
+            "0": { statsUserOnline: false }
         inbounds: "{{ _rw_bootstrap_inbounds }}"
         outbounds:
           - { protocol: "freedom", tag: "DIRECT" }
