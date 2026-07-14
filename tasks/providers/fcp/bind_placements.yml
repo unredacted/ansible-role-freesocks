@@ -1,0 +1,67 @@
+---
+# tasks/providers/fcp/bind_placements.yml
+#
+# Bind Remnawave squads to FCP's per-connection-mode NODE-PLACEMENT pools via
+#   PATCH {fcp_api_url}/api/v1/admin/remnawave/mode-placements
+# (replaced the removed /api/v1/admin/connection-profiles endpoint — FCP's
+# node-placement redesign moved squad binding off connection profiles/tiers and
+# onto per-mode squad POOLS; at issuance FCP homes each new key to the
+# least-loaded node of the chosen mode's pool).
+#
+# The caller builds the per-mode ops and passes them as `_fcp_placement_modes`:
+#   full replace:   { evade: { squadUuids:       [<uuid>, ...] } }   ([] clears)
+#   append itself:  { evade: { addSquadUuids:    [<uuid>] } }
+#   detach itself:  { evade: { removeSquadUuids: [<uuid>] } }
+# (mode ids: evade = "Beat censorship" / fronted WS; privacy = "Maximum
+# privacy" / Reality.) add/remove exist so a node deploy can join or leave the
+# pool without knowing the rest of it — the UUIDs are write-only in FCP (never
+# echoed back; audited only as a poolBound boolean + pool size).
+#
+# Scope: the fsv1_ token needs admin:servers:write — the SAME scope node/panel
+# registration already uses, so no extra scope for placement binding:
+#   bunx convex run adminApi:mintAutomationToken \
+#     '{"scopes":["admin:servers:read","admin:servers:write"]}'
+# FCP validates replace/add entries as UUIDs server-side (a typo'd squad is a
+# 400, not a silently dead pool).
+
+- name: Validate FCP placement-binding prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - _fcp_placement_modes is defined
+      - _fcp_placement_modes | length > 0
+    fail_msg: >-
+      Binding FCP mode placements requires fcp_api_url, fcp_api_token
+      (with admin:servers:write), and a non-empty _fcp_placement_modes dict
+      built by the caller.
+  no_log: true
+
+- name: Bind squads to FCP mode placements (idempotent by PATCH)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/remnawave/mode-placements"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      modes: "{{ _fcp_placement_modes }}"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _fcp_placement_result
+
+# The response carries only non-secret data (bound mode ids + pool SIZES),
+# so it is safe to print.
+- name: Note FCP placement-binding result
+  debug:
+    msg: >-
+      FCP mode placements updated — bound modes:
+      {{ _fcp_placement_result.json.bound | default([]) | join(', ') | default('(none)', true) }};
+      pool sizes:
+      {%- for p in _fcp_placement_result.json.placements | default([]) %}
+      {{ ' ' }}{{ p.modeId }}={{ p.boundCount }}{{ '' if loop.last else ',' }}
+      {%- endfor %}

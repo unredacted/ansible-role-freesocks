@@ -1,0 +1,355 @@
+---
+# tasks/providers/remnawave/create_node_placement.yml
+#
+# PER-NODE placement objects (remnawave_per_node_placement=true, the default):
+# give THIS node its own config-profile inbound(s) + its own internal squad(s),
+# so FCP's issuance-time node placement can balance keys across nodes. A squad
+# only maps to ONE node when that node is the only one activating the squad's
+# inbounds — with the panel-wide bootstrap squads every node looks like one unit
+# and the least-loaded-node picker has nothing to pick between.
+#
+# What it does (idempotent, panel-side, delegate_to: localhost):
+#   1. Clone the bootstrap base inbound(s) inside the Config Profile under a
+#      node-scoped tag (VLESS_WS_CDN_<HOSTNAME> / VLESS_REALITY_<HOSTNAME>) via
+#      GET -> merge -> PATCH /api/config-profiles (full-replace of `config`,
+#      same read-modify-write pattern FCP's harden-logging uses; skip when the
+#      tag already exists).
+#   2. Point this deploy's facts at the per-node inbounds: the enabled
+#      remnawave_cdn_transports[].inbound_uuid + remnawave_reality_inbound_uuid
+#      are REPLACED with the per-node UUIDs, so node registration
+#      (activeInbounds) and Host creation reference the node's own inbounds.
+#   3. Create the per-node squad(s) (<bootstrap squad name>-<hostname>) bound to
+#      those inbounds, resolve their UUIDs, and persist them to
+#      {{ remnawave_node_install_dir }}/.squad_uuids for later teardown.
+# The FCP pool add (addSquadUuids) happens later in main.yml's FCP section.
+#
+# VERIFY items (panel-version drift; check /docs on your panel):
+#   * PATCH /api/config-profiles body { uuid, config } (full config replace) —
+#     the same call FCP's harden-logging makes, verified against v2.8.
+#   * Whether the panel accepts DUPLICATE ports across inbounds within one
+#     profile (each node only ACTIVATES its own inbound, so only one is live
+#     per host). If it refuses, give each node a distinct
+#     remnawave_cdn_transports[].internal_port — the WS clone's port follows it
+#     (and the Caddyfile template already proxies to the same var).
+
+- name: Validate per-node placement prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid is defined and remnawave_panel_config_profile_uuid | length > 0
+    fail_msg: >-
+      Per-node placement requires remnawave_panel_api_token and
+      remnawave_panel_config_profile_uuid (run operation_mode=bootstrap first and
+      load its output vars file).
+  no_log: true
+
+# Tags must be stable per node and tag-safe; the dictionary hostname can carry
+# hyphens, so normalize to A-Z0-9_ (e.g. quiet-falcon -> QUIET_FALCON).
+- name: Compute the node tag suffix
+  set_fact:
+    _np_tag_suffix: "{{ random_hostname | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
+
+# --- Read the Config Profile + the panel's tag<->uuid inbound map -----------
+- name: List Config Profiles
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _np_profiles_list
+
+- name: Resolve the Config Profile by UUID
+  set_fact:
+    _np_profile: "{{ (_profiles | selectattr('uuid', 'equalto', remnawave_panel_config_profile_uuid) | list | first) | default({}, true) }}"
+  vars:
+    _resp: "{{ _np_profiles_list.json.response }}"
+    _profiles: "{{ _resp.configProfiles | default(_resp, true) }}"
+  no_log: true
+
+- name: Assert the Config Profile was found
+  assert:
+    that:
+      - _np_profile.uuid is defined
+      - _np_profile.config is defined
+      - (_np_profile.config.inbounds | default([])) | length > 0
+    fail_msg: >-
+      Config Profile {{ remnawave_panel_config_profile_uuid }} was not found on
+      the panel (or carries no inbounds). Re-run operation_mode=bootstrap.
+  no_log: true
+
+- name: List Config Profile inbounds (tag <-> uuid)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles/inbounds"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _np_inbounds_list
+
+- name: Map inbound uuid -> tag
+  set_fact:
+    _np_uuid_to_tag: "{{ _np_uuid_to_tag | default({}) | combine({ item.uuid: item.tag }) }}"
+  loop: "{{ _inbounds }}"
+  loop_control:
+    label: "{{ item.tag | default('?') }}"
+  vars:
+    _resp: "{{ _np_inbounds_list.json.response }}"
+    _inbounds: "{{ _resp.inbounds | default(_resp, true) }}"
+  when:
+    - item.tag is defined
+    - item.uuid is defined
+  no_log: true
+
+# --- Plan the per-node inbounds ----------------------------------------------
+# WS transports need the node's Caddy in front (remnawave_caddy_enabled); a
+# Reality node clones only the Reality inbound. Each plan entry:
+#   { kind: ws|reality, transport: <name|''>, base_tag, node_tag, port }
+- name: Plan the per-node inbound set
+  set_fact:
+    _np_plan: >-
+      {%- set plan = [] -%}
+      {%- if remnawave_caddy_enabled | default(false) | bool -%}
+        {%- for t in remnawave_cdn_transports | default([]) if (t.enabled | default(false)) and ((t.inbound_uuid | default('')) | length > 0) -%}
+          {%- set base_tag = _np_uuid_to_tag.get(t.inbound_uuid, '') -%}
+          {%- if base_tag -%}
+            {%- set _ = plan.append({'kind': 'ws', 'transport': t.name, 'base_tag': base_tag, 'node_tag': base_tag ~ '_' ~ _np_tag_suffix, 'port': t.internal_port | default(0)}) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- if (remnawave_reality_enabled | default(false) | bool) and ((remnawave_reality_inbound_uuid | default('')) | length > 0) -%}
+        {%- set base_tag = _np_uuid_to_tag.get(remnawave_reality_inbound_uuid, '') -%}
+        {%- if base_tag -%}
+          {%- set _ = plan.append({'kind': 'reality', 'transport': '', 'base_tag': base_tag, 'node_tag': base_tag ~ '_' ~ _np_tag_suffix, 'port': 0}) -%}
+        {%- endif -%}
+      {%- endif -%}
+      {{ plan }}
+  no_log: true
+
+- name: Assert something is planned
+  assert:
+    that:
+      - _np_plan | length > 0
+    fail_msg: >-
+      Per-node placement found no base inbound to clone — the enabled
+      remnawave_cdn_transports carry no inbound_uuid (and Reality is off or has
+      no remnawave_reality_inbound_uuid). Load the bootstrap output vars file.
+
+# --- Clone the missing inbounds into the profile (GET -> merge -> PATCH) -----
+- name: Compose the missing per-node inbound clones
+  set_fact:
+    _np_clones: >-
+      {%- set clones = [] -%}
+      {%- set existing = _np_profile.config.inbounds | map(attribute='tag') | list -%}
+      {%- for p in _np_plan if p.node_tag not in existing -%}
+        {%- set base = (_np_profile.config.inbounds | selectattr('tag', 'equalto', p.base_tag) | list | first) | default(none) -%}
+        {%- if base is not none -%}
+          {%- set overrides = {'tag': p.node_tag} -%}
+          {%- if p.kind == 'ws' and (p.port | int) > 0 -%}
+            {%- set overrides = overrides | combine({'port': p.port | int}) -%}
+          {%- endif -%}
+          {%- set _ = clones.append(base | combine(overrides)) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ clones }}
+  no_log: true
+
+- name: Append the per-node inbounds to the Config Profile (full-replace PATCH)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      uuid: "{{ remnawave_panel_config_profile_uuid }}"
+      config: "{{ _np_profile.config | combine({'inbounds': _np_profile.config.inbounds + _np_clones}) }}"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  when: _np_clones | length > 0
+
+# --- Resolve the per-node inbound UUIDs + repoint this deploy's facts --------
+- name: Re-list Config Profile inbounds (read back the per-node UUIDs)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles/inbounds"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _np_inbounds_list2
+
+- name: Map inbound tag -> uuid
+  set_fact:
+    _np_tag_to_uuid: "{{ _np_tag_to_uuid | default({}) | combine({ item.tag: item.uuid }) }}"
+  loop: "{{ _inbounds }}"
+  loop_control:
+    label: "{{ item.tag | default('?') }}"
+  vars:
+    _resp: "{{ _np_inbounds_list2.json.response }}"
+    _inbounds: "{{ _resp.inbounds | default(_resp, true) }}"
+  when:
+    - item.tag is defined
+    - item.uuid is defined
+  no_log: true
+
+- name: Assert every planned per-node inbound resolved
+  assert:
+    that:
+      - _np_plan | selectattr('node_tag', 'in', _np_tag_to_uuid | default({})) | list | length == _np_plan | length
+    fail_msg: >-
+      Not every per-node inbound UUID could be read back from
+      /api/config-profiles/inbounds after the PATCH. Check the VERIFY notes at
+      the top of this file (duplicate-port rejection is the usual culprit — give
+      this node a distinct remnawave_cdn_transports[].internal_port).
+
+# From here on, THIS deploy references only the node's own inbounds: node
+# registration (activeInbounds derives from these facts) and Host creation
+# must point at the per-node inbound, or subscribers of the per-node squad
+# would see hosts for an inbound this node never serves.
+- name: Repoint transports + Reality at the per-node inbound UUIDs
+  set_fact:
+    remnawave_cdn_transports: >-
+      {%- set out = [] -%}
+      {%- for t in remnawave_cdn_transports | default([]) -%}
+        {%- set hit = (_np_plan | selectattr('kind', 'equalto', 'ws') | selectattr('transport', 'equalto', t.name) | list | first) | default(none) -%}
+        {%- if hit is not none -%}
+          {%- set _ = out.append(t | combine({'inbound_uuid': _np_tag_to_uuid[hit.node_tag]})) -%}
+        {%- elif remnawave_caddy_enabled | default(false) | bool -%}
+          {%- set _ = out.append(t) -%}
+        {%- else -%}
+          {# a non-Caddy (Reality) node must not activate the shared WS inbound #}
+          {%- set _ = out.append(t | combine({'inbound_uuid': ''})) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    remnawave_reality_inbound_uuid: >-
+      {{ _np_tag_to_uuid[(_np_plan | selectattr('kind', 'equalto', 'reality') | map(attribute='node_tag') | list | first)]
+         if (_np_plan | selectattr('kind', 'equalto', 'reality') | list | length > 0)
+         else (remnawave_reality_inbound_uuid | default('')) }}
+  no_log: true
+
+# --- Per-node squads ----------------------------------------------------------
+- name: List internal squads
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _np_squads_list
+
+- name: Compute per-node squad names + existing set
+  set_fact:
+    _np_fronted_squad_name: "{{ remnawave_bootstrap_fronted_squad_name }}-{{ random_hostname }}"
+    _np_reality_squad_name: "{{ remnawave_bootstrap_reality_squad_name }}-{{ random_hostname }}"
+    _np_squad_names: "{{ _squads | map(attribute='name') | list }}"
+  vars:
+    _resp: "{{ _np_squads_list.json.response }}"
+    _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+
+- name: Create the per-node fronted squad (WS) when absent
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      name: "{{ _np_fronted_squad_name }}"
+      inbounds: "{{ _ws_uuids }}"
+    status_code: [200, 201, 409]
+  vars:
+    _ws_uuids: >-
+      {{ _np_plan | selectattr('kind', 'equalto', 'ws') | map(attribute='node_tag')
+         | map('extract', _np_tag_to_uuid) | list }}
+  delegate_to: localhost
+  no_log: true
+  when:
+    - _np_plan | selectattr('kind', 'equalto', 'ws') | list | length > 0
+    - _np_fronted_squad_name not in _np_squad_names
+
+- name: Create the per-node Reality squad when absent
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      name: "{{ _np_reality_squad_name }}"
+      inbounds: "{{ [remnawave_reality_inbound_uuid] }}"
+    status_code: [200, 201, 409]
+  delegate_to: localhost
+  no_log: true
+  when:
+    - _np_plan | selectattr('kind', 'equalto', 'reality') | list | length > 0
+    - _np_reality_squad_name not in _np_squad_names
+
+- name: Re-list internal squads (resolve the per-node UUIDs)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _np_squads_list2
+
+- name: Resolve the per-node squad UUIDs by name
+  set_fact:
+    remnawave_node_fronted_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', _np_fronted_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+    remnawave_node_reality_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', _np_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+  vars:
+    _resp: "{{ _np_squads_list2.json.response }}"
+    _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+
+- name: Assert the planned per-node squads resolved
+  assert:
+    that:
+      - (_np_plan | selectattr('kind', 'equalto', 'ws') | list | length == 0) or (remnawave_node_fronted_squad_uuid | length > 0)
+      - (_np_plan | selectattr('kind', 'equalto', 'reality') | list | length == 0) or (remnawave_node_reality_squad_uuid | length > 0)
+    fail_msg: "Could not resolve the per-node squad UUID(s) after create. Check /api/internal-squads."
+
+# Persisted so teardown_node_placement.yml (and migrate-away cleanup) can find
+# them without re-deriving names.
+- name: Persist the per-node squad UUIDs
+  copy:
+    content: |
+      fronted={{ remnawave_node_fronted_squad_uuid }}
+      reality={{ remnawave_node_reality_squad_uuid }}
+    dest: "{{ remnawave_node_install_dir }}/.squad_uuids"
+    mode: '0640'
+  become: yes
+
+- name: Summarize per-node placement
+  debug:
+    msg:
+      - "Per-node inbounds: {{ _np_plan | map(attribute='node_tag') | join(', ') }}"
+      - "Fronted squad '{{ _np_fronted_squad_name }}': {{ remnawave_node_fronted_squad_uuid | default('(none)', true) }}"
+      - "Reality squad '{{ _np_reality_squad_name }}': {{ remnawave_node_reality_squad_uuid | default('(n/a)', true) }}"

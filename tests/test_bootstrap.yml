@@ -3,8 +3,8 @@
 #
 # Self-asserting tests for the operation_mode=bootstrap expressions — pure filter
 # logic, NO API calls. Mirrors the templating in
-# tasks/providers/remnawave/{gen_x25519,create_config_profile,create_squad}.yml
-# and tasks/providers/fcp/bind_profiles.yml.
+# tasks/providers/remnawave/{gen_x25519,create_config_profile,create_squad,create_node_placement}.yml
+# and tasks/providers/fcp/bind_placements.yml.
 #
 # Run: ansible-playbook tests/test_bootstrap.yml
 - hosts: localhost
@@ -16,7 +16,7 @@
     remnawave_bootstrap_reality_server_names: ["dl.google.com"]
     remnawave_bootstrap_reality_short_ids: [""]
     remnawave_reality_private_key: "PRIV-KEY-xyz"
-    fcp_default_connection_profile: "evade"
+    fcp_default_connection_mode: "evade"
     # A fake GET /api/config-profiles/inbounds response (both plausible shapes).
     _fake_inbounds_flat:
       response:
@@ -116,36 +116,95 @@
         that: ["_partial == ['uuid-ws']"]
         success_msg: "Fronted squad selection drops unbound inbounds."
 
-    # (f) FCP connection-profiles PATCH body — both squads present.
-    - name: Build FCP bind body (with Reality)
+    # (f) FCP mode-placements PATCH body (shared-squad full replace) — both pools.
+    - name: Build FCP placement body (shared squads, with Reality)
       vars:
         remnawave_fronted_squad_uuid: "sq-front"
         remnawave_reality_squad_uuid: "sq-reality"
-        _privacy_entry: "{{ {'privacy': {'squadUuid': remnawave_reality_squad_uuid}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _cp_body:
-          default: "{{ fcp_default_connection_profile | default('evade') }}"
-          profiles: "{{ {'evade': {'squadUuid': remnawave_fronted_squad_uuid}} | combine(_privacy_entry) }}"
+        _privacy_entry: "{{ {'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
       assert:
         that:
-          - _cp_body.default == 'evade'
-          - _cp_body.profiles.evade.squadUuid == 'sq-front'
-          - _cp_body.profiles.privacy.squadUuid == 'sq-reality'
-        success_msg: "FCP bind body OK (evade -> fronted, privacy -> reality)."
+          - _fcp_placement_modes.evade.squadUuids == ['sq-front']
+          - _fcp_placement_modes.privacy.squadUuids == ['sq-reality']
+        success_msg: "FCP placement body OK (evade -> fronted pool, privacy -> reality pool)."
 
-    # (g) FCP body omits privacy when Reality is disabled (empty squad).
-    - name: Build FCP bind body (Reality disabled)
+    # (g) The pool body omits privacy when Reality is disabled (empty squad).
+    - name: Build FCP placement body (Reality disabled)
       vars:
         remnawave_fronted_squad_uuid: "sq-front"
         remnawave_reality_squad_uuid: ""
-        _privacy_entry: "{{ {'privacy': {'squadUuid': remnawave_reality_squad_uuid}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _cp_body:
-          default: "{{ fcp_default_connection_profile | default('evade') }}"
-          profiles: "{{ {'evade': {'squadUuid': remnawave_fronted_squad_uuid}} | combine(_privacy_entry) }}"
+        _privacy_entry: "{{ {'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
       assert:
         that:
-          - _cp_body.profiles.evade.squadUuid == 'sq-front'
-          - "'privacy' not in _cp_body.profiles"
-        success_msg: "FCP bind body omits privacy when Reality is disabled."
+          - _fcp_placement_modes.evade.squadUuids == ['sq-front']
+          - "'privacy' not in _fcp_placement_modes"
+        success_msg: "FCP placement body omits privacy when Reality is disabled."
+
+    # (h) Per-node deploy: the append-only add body (never disturbs the pool).
+    - name: Build FCP placement body (per-node addSquadUuids)
+      vars:
+        remnawave_node_fronted_squad_uuid: "sq-node-front"
+        remnawave_node_reality_squad_uuid: ""
+        _evade_entry: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
+        _privacy_entry: "{{ {'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+      assert:
+        that:
+          - _fcp_placement_modes.evade.addSquadUuids == ['sq-node-front']
+          - "'squadUuids' not in _fcp_placement_modes.evade"
+          - "'privacy' not in _fcp_placement_modes"
+        success_msg: "Per-node add body OK (append-only, WS squad only)."
+
+    # (i) Per-node inbound plan + clone expressions (create_node_placement.yml).
+    - name: Per-node plan clones the base WS inbound under a node tag
+      vars:
+        random_hostname: "quiet-falcon"
+        remnawave_caddy_enabled: true
+        remnawave_reality_enabled: false
+        remnawave_reality_inbound_uuid: ""
+        remnawave_cdn_transports:
+          - { name: ws, network: ws, path: "/ws", internal_port: 8443, inbound_uuid: "uuid-ws", alpn: "http/1.1", fingerprint: chrome, enabled: true }
+        _np_uuid_to_tag: { "uuid-ws": "VLESS_WS_CDN" }
+        _np_tag_suffix: "{{ random_hostname | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
+        _np_plan: >-
+          {%- set plan = [] -%}
+          {%- if remnawave_caddy_enabled | default(false) | bool -%}
+            {%- for t in remnawave_cdn_transports | default([]) if (t.enabled | default(false)) and ((t.inbound_uuid | default('')) | length > 0) -%}
+              {%- set base_tag = _np_uuid_to_tag.get(t.inbound_uuid, '') -%}
+              {%- if base_tag -%}
+                {%- set _ = plan.append({'kind': 'ws', 'transport': t.name, 'base_tag': base_tag, 'node_tag': base_tag ~ '_' ~ _np_tag_suffix, 'port': t.internal_port | default(0)}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ plan }}
+        _np_profile_config:
+          inbounds:
+            - { tag: "VLESS_WS_CDN", listen: "127.0.0.1", port: 8443, protocol: "vless" }
+        _np_clones: >-
+          {%- set clones = [] -%}
+          {%- set existing = _np_profile_config.inbounds | map(attribute='tag') | list -%}
+          {%- for p in _np_plan if p.node_tag not in existing -%}
+            {%- set base = (_np_profile_config.inbounds | selectattr('tag', 'equalto', p.base_tag) | list | first) | default(none) -%}
+            {%- if base is not none -%}
+              {%- set overrides = {'tag': p.node_tag} -%}
+              {%- if p.kind == 'ws' and (p.port | int) > 0 -%}
+                {%- set overrides = overrides | combine({'port': p.port | int}) -%}
+              {%- endif -%}
+              {%- set _ = clones.append(base | combine(overrides)) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ clones }}
+      assert:
+        that:
+          - _np_plan | length == 1
+          - _np_plan[0].node_tag == 'VLESS_WS_CDN_QUIET_FALCON'
+          - _np_clones | length == 1
+          - _np_clones[0].tag == 'VLESS_WS_CDN_QUIET_FALCON'
+          - _np_clones[0].port == 8443
+          - _np_clones[0].protocol == 'vless'
+        success_msg: "Per-node plan + clone expressions OK."
 
     - name: All bootstrap expression tests passed
       debug:

@@ -1,0 +1,45 @@
+---
+# tasks/providers/fcp/bind_default_mode.yml
+#
+# Set FCP's DEFAULT connection mode (which mode a brand-new member issues
+# into) via PATCH {fcp_api_url}/api/v1/admin/connection-modes — the generic
+# mode-catalog endpoint (label/description/default; it carries NO squads —
+# placement pools are bound separately, see bind_placements.yml).
+#
+# Opt-in: only runs when fcp_default_connection_mode is non-empty. FCP's
+# compiled default is already "evade", so most deployments never need this —
+# and skipping it keeps the fsv1_ token at admin:servers:* only. Setting it
+# requires the WIDER admin:settings:write scope:
+#   bunx convex run adminApi:mintAutomationToken \
+#     '{"scopes":["admin:servers:read","admin:servers:write","admin:settings:write"]}'
+
+- name: Validate FCP default-mode prerequisites
+  assert:
+    that:
+      - fcp_api_url is defined and fcp_api_url | length > 0
+      - fcp_api_token is defined and fcp_api_token | length > 0
+      - fcp_default_connection_mode in ['evade', 'privacy']
+    fail_msg: >-
+      Setting the FCP default connection mode requires fcp_api_url,
+      fcp_api_token (with admin:settings:write), and
+      fcp_default_connection_mode set to 'evade' or 'privacy'.
+  no_log: true
+
+- name: Set the FCP default connection mode (idempotent by PATCH)
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/connection-modes"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      default: "{{ fcp_default_connection_mode }}"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+
+- name: Note FCP default-mode result
+  debug:
+    msg: "FCP default connection mode set to '{{ fcp_default_connection_mode }}'."

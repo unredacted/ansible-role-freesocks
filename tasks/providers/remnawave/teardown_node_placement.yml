@@ -1,0 +1,137 @@
+---
+# tasks/providers/remnawave/teardown_node_placement.yml
+#
+# Undo create_node_placement.yml when a node is retired (mirror of
+# delete_node.yml, which removes the node entry itself). In order:
+#   1. Detach the node's squad(s) from FCP's mode pools (removeSquadUuids), so
+#      issuance stops homing NEW keys to a disappearing node first.
+#   2. Delete the per-node internal squads on the panel.
+#   3. Strip the node's cloned inbounds (VLESS_*_<HOSTNAME>) out of the Config
+#      Profile (GET -> filter -> full-replace PATCH).
+# Reads the squad UUIDs from {{ remnawave_node_install_dir }}/.squad_uuids when
+# reachable, else falls back to resolving the per-node squad NAMES on the panel.
+#
+# Not wired to an operation_mode — include it from an ops playbook when
+# decommissioning a node, BEFORE delete_node.yml:
+#   - include_role: { name: ansible-role-freesocks, tasks_from: providers/remnawave/teardown_node_placement }
+#   - include_role: { name: ansible-role-freesocks, tasks_from: providers/remnawave/delete_node }
+# Existing keys homed to the squad keep their assignment in FCP until they
+# regenerate/switch; tear the node down only after draining or accepting that.
+
+- name: Read the persisted per-node squad UUIDs (best effort)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.squad_uuids"
+  register: _td_squad_file
+  become: yes
+  failed_when: false
+
+- name: Parse the persisted squad UUIDs
+  set_fact:
+    _td_fronted_uuid: "{{ _lines | select('match', '^fronted=') | map('regex_replace', '^fronted=', '') | list | first | default('') }}"
+    _td_reality_uuid: "{{ _lines | select('match', '^reality=') | map('regex_replace', '^reality=', '') | list | first | default('') }}"
+  vars:
+    _lines: "{{ ((_td_squad_file.content | default('') | b64decode) if (_td_squad_file.content is defined) else '') | split('\n') }}"
+
+# Fallback: resolve by the deterministic per-node names when the file is gone.
+- name: Resolve per-node squads by name (fallback)
+  when: (_td_fronted_uuid | length == 0) and (_td_reality_uuid | length == 0)
+  block:
+    - name: List internal squads
+      uri:
+        url: "{{ remnawave_panel_url }}/api/internal-squads"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ remnawave_panel_api_token }}"
+          Accept: "application/json"
+        status_code: [200]
+        return_content: yes
+      delegate_to: localhost
+      no_log: true
+      register: _td_squads_list
+
+    - name: Resolve the per-node squad UUIDs by name
+      set_fact:
+        _td_fronted_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name ~ '-' ~ random_hostname) | map(attribute='uuid') | list | first) | default('', true) }}"
+        _td_reality_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name ~ '-' ~ random_hostname) | map(attribute='uuid') | list | first) | default('', true) }}"
+      vars:
+        _resp: "{{ _td_squads_list.json.response }}"
+        _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+
+- name: Nothing to tear down?
+  debug:
+    msg: "No per-node squads found for {{ random_hostname }} — nothing to tear down."
+  when: (_td_fronted_uuid | length == 0) and (_td_reality_uuid | length == 0)
+
+# --- 1. FCP pool detach (before the panel objects go away) -------------------
+- name: Detach this node's squads from FCP mode placements
+  include_tasks: ../fcp/bind_placements.yml
+  vars:
+    _evade_entry: "{{ {'evade': {'removeSquadUuids': [_td_fronted_uuid]}} if (_td_fronted_uuid | length > 0) else {} }}"
+    _privacy_entry: "{{ {'privacy': {'removeSquadUuids': [_td_reality_uuid]}} if (_td_reality_uuid | length > 0) else {} }}"
+    _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+  when:
+    - fcp_enabled | default(false) | bool
+    - (_td_fronted_uuid | length > 0) or (_td_reality_uuid | length > 0)
+
+# --- 2. Delete the per-node squads -------------------------------------------
+- name: Delete the per-node squads
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads/{{ item }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 204, 404]
+  loop: "{{ [_td_fronted_uuid, _td_reality_uuid] | select('string') | reject('equalto', '') | list }}"
+  delegate_to: localhost
+  no_log: true
+
+# --- 3. Strip the node's cloned inbounds from the Config Profile -------------
+- name: List Config Profiles
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _td_profiles_list
+
+- name: Resolve the Config Profile + the node's inbound tags
+  set_fact:
+    _td_profile: "{{ (_profiles | selectattr('uuid', 'equalto', remnawave_panel_config_profile_uuid) | list | first) | default({}, true) }}"
+    _td_tag_suffix: "{{ random_hostname | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
+  vars:
+    _resp: "{{ _td_profiles_list.json.response }}"
+    _profiles: "{{ _resp.configProfiles | default(_resp, true) }}"
+  no_log: true
+
+- name: Remove the node's inbounds from the Config Profile (full-replace PATCH)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/config-profiles"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      uuid: "{{ remnawave_panel_config_profile_uuid }}"
+      config: "{{ _td_profile.config | combine({'inbounds': _kept}) }}"
+    status_code: [200]
+  vars:
+    _kept: "{{ _td_profile.config.inbounds | rejectattr('tag', 'search', '_' ~ _td_tag_suffix ~ '$') | list }}"
+  delegate_to: localhost
+  no_log: true
+  when:
+    - _td_profile.config is defined
+    - (_td_profile.config.inbounds | default([]) | selectattr('tag', 'search', '_' ~ _td_tag_suffix ~ '$') | list | length) > 0
+
+- name: Summarize teardown
+  debug:
+    msg: >-
+      Per-node placement torn down for {{ random_hostname }} (squads removed
+      from FCP pools + deleted; per-node inbounds stripped from the profile).

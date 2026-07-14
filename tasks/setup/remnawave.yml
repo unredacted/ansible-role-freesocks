@@ -58,6 +58,18 @@
   include_tasks: ../providers/remnawave/keygen.yml
   when: remnawave_secret_key_source == 'panel_api'
 
+# === Panel API: per-node placement (inbound clones + per-node squads) ===
+# Gives this node its own config-profile inbound(s) + internal squad(s) and
+# REPOINTS remnawave_cdn_transports[].inbound_uuid / the Reality inbound fact at
+# them, so registration + Host creation below reference the node's own inbounds.
+# Must run BEFORE the derive/register steps. The FCP pool add happens later in
+# main.yml's control-plane section.
+- name: Create per-node placement objects (inbounds + squads)
+  include_tasks: ../providers/remnawave/create_node_placement.yml
+  when:
+    - remnawave_per_node_placement | default(true) | bool
+    - remnawave_panel_register_node | default(false) | bool
+
 # Derive the panel's active inbounds from the enabled CDN transports (+ the
 # Reality inbound when enabled) so node registration and Host creation can't
 # drift. Falls back to an explicitly-set remnawave_panel_active_inbounds when no

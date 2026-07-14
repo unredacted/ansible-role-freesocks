@@ -43,8 +43,9 @@ role, or the run fails (or, if you skip Remnawave Phase 0, silently issues dead 
   ```sh
   bunx convex run adminApi:mintAutomationToken \
     '{"name":"ansible","scopes":["admin:servers:read","admin:servers:write"]}'
-  # add "admin:tiers:write" too if you will use fcp_bind_squad
-  # add "admin:settings:write" too if you will bootstrap the panel (see below)
+  # admin:servers:write also covers the mode-placement (squad pool) binding.
+  # add "admin:settings:write" only if you set fcp_default_connection_mode
+  # add "admin:status:read"    only if you enable fcp_status_gate
   ```
 
 **Remnawave panel** (Remnawave nodes only — the panel objects a working key needs:
@@ -52,11 +53,14 @@ a Config Profile + inbounds + an internal squad). Two ways to create them:
 
 - **Automated (recommended) — `operation_mode=bootstrap`:** run the role once against
   the panel (host-agnostic, `delegate_to: localhost`) and it creates the Config Profile
-  + WS/Reality inbounds, generates the Reality x25519 keypair, creates a fronted
-  squad (WS) and a Reality squad, and — with `fcp_enabled=true` — binds those two
-  squads to FCP's connection profiles ("Stay connected" / "Maximize privacy"). It PRINTS
-  the created Config Profile + inbound UUIDs; copy them into your node-deploy vars. Needs
-  a panel API token and (for the FCP bind) an `fsv1_` token with `admin:settings:write`:
+  with the BASE WS/Reality inbounds (born compliant with the FreeSocks no-log Xray
+  posture) and generates the Reality x25519 keypair. Squads are then created **per
+  node** at deploy time (`remnawave_per_node_placement`, default on): each node clones
+  the base inbound under its own tag, gets its own squad, and appends that squad to
+  FCP's per-mode placement pools ("Beat censorship" / "Maximum privacy") — which is
+  what lets FCP home each new key to the least-loaded node. Bootstrap PRINTS the
+  created Config Profile + base inbound UUIDs; copy them into your node-deploy vars.
+  Needs a panel API token and an `fsv1_` token with `admin:servers:write`:
   ```sh
   ansible-playbook playbook.yml --ask-vault-pass \
     --extra-vars "operation_mode=bootstrap remnawave_panel_url=https://panel.example.com fcp_enabled=true"
@@ -81,13 +85,12 @@ ansible-galaxy collection install -r requirements.yml
 
 Put every secret in an **Ansible Vault** — for a fronted Remnawave node that is
 `cloudflare_api_token`, `fcp_api_token`, `remnawave_panel_api_token` (and/or
-`remnawave_panel_secret_key`), `fastly_api_token` (only if `cdn_provider: fastly`), and
-`remnawave_squad_uuid` (only if binding a squad).
+`remnawave_panel_secret_key`), and `fastly_api_token` (only if `cdn_provider: fastly`).
 
-> ⚠️ The role's vault-decryption guard only checks `cloudflare_api_token`. It will **not**
-> catch a Remnawave/FCP secret left as a `your-…` placeholder — those fail later at
-> runtime (a node that can't reach its panel, or a 401 from FCP). Confirm every secret is
-> filled/vaulted before running.
+> The vault-decryption guard checks all of `cloudflare_api_token`, `fcp_api_token`,
+> `remnawave_panel_api_token`, and `remnawave_panel_secret_key` for undecrypted vault
+> blobs and fails fast. It still cannot catch a plain-text `your-…` placeholder — confirm
+> every secret is filled before running.
 
 Define your domain → provider map (in `group_vars` or the playbook):
 
@@ -123,8 +126,8 @@ Write a `playbook.yml` that applies the role to your host. A **fronted Remnawave
     fcp_enabled: true
     fcp_api_url: "https://control-plane.example.org"
     fcp_register_remnawave_panel: true # register the panel row (once)
-    fcp_bind_squad: true # bind the squad to a tier (needs admin:tiers:write)
-    remnawave_squad_uuid: "<squad-uuid>"
+    # per-node placement is ON by default: this deploy creates the node's own
+    # inbound + squad and appends the squad to FCP's mode pools automatically
   roles:
     - ansible-role-freesocks
 ```
@@ -289,11 +292,13 @@ fcp_register_remnawave_panel: false
 # Slug for the Remnawave panel record in FCP
 fcp_remnawave_panel_slug: "remnawave-primary"
 
-# Remnawave only: bind a squad to an FCP tier declaratively (default: false).
-# Needs the token to ALSO hold admin:tiers:write; squad UUID goes in vault.
-fcp_bind_squad: false
-fcp_squad_tier_slug: "member"        # the FCP tier to bind the squad to
-# remnawave_squad_uuid: "..."        # the Remnawave squad UUID (vault/host_vars)
+# Optional capacity/ordering hints on the backend-servers row (empty = not sent)
+fcp_max_keys: ""                     # cap issuance onto this instance ("null" clears)
+fcp_priority: ""                     # pool ordering (lower = preferred)
+
+# Opt-in post-deploy gate: poll GET /api/v1/admin/status until this slug reports
+# healthy (needs admin:status:read; FCP's healthcheck cron runs every ~10 min).
+fcp_status_gate: false
 ```
 
 **What gets registered depends on the backend:**
@@ -306,7 +311,7 @@ fcp_squad_tier_slug: "member"        # the FCP tier to bind the squad to
 
 - **Remnawave** — FCP stores only the **panel** (`baseUrl` + `apiToken`), **not** individual nodes. Per-node config reaches users through the panel's subscription output. The role still registers the node and creates Hosts on the panel (separate, unchanged behavior). Registering the panel with FCP is opt-in via `fcp_register_remnawave_panel: true` (with `fcp_remnawave_panel_slug`).
 
-**Declarative squad → tier binding (opt-in).** FCP issues a member's key into the Remnawave **squad** named on their tier (`tiers.remnawaveSquadUuid`). Rather than hand-copying that UUID into the admin CMS, set `fcp_bind_squad: true` with `remnawave_squad_uuid` (from the panel, in vault) and `fcp_squad_tier_slug` (the tier, default `member`); the role then `PUT`s the squad onto that tier via FCP's idempotent **`tiers/by-slug/{slug}`** upsert. This needs the `fsv1_` token to **also** hold `admin:tiers:write` (wider than `admin:servers:*`) — mint it with that extra scope. The squad UUID is treated as sensitive (the request is `no_log`, and FCP audits a `squadBound` boolean, never the UUID).
+**Node placement (per-mode squad pools).** FCP no longer binds squads to tiers — it homes each new key to the **least-loaded node** of the chosen connection mode's squad POOL, bound via `PATCH /api/v1/admin/remnawave/mode-placements` (scope `admin:servers:write`, the same one registration uses). With `remnawave_per_node_placement: true` (the default) every node deploy creates a per-node inbound + squad and **appends itself** to the right pool (`addSquadUuids` — never disturbing the rest); retiring a node runs `tasks/providers/remnawave/teardown_node_placement.yml`, which detaches it (`removeSquadUuids`), deletes the squad, and strips its inbounds from the Config Profile. Squad UUIDs are treated as sensitive (requests are `no_log`; FCP validates them server-side, audits only a `poolBound` boolean + pool size, and never echoes them back). The legacy single-unit topology (one panel-wide squad per mode, bound at bootstrap) remains available via `remnawave_bootstrap_shared_squads: true`.
 
 **Migrate cleans up the source row.** When an Outline server is migrated to a new host, the destination is registered under its own slug and the role then **deletes the source server's FCP `backendServers` row** (by the source slug, `source_kv_hostname`) via `tasks/providers/fcp/delete_server.yml` — a single idempotent `DELETE …/backend-servers/by-slug/{slug}` (no GET-list / id resolution; no-ops if absent). This leaves no orphaned row behind, and is skipped when source and destination slugs are identical.
 

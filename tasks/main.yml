@@ -3,15 +3,27 @@
 # ============================================================================
 # VALIDATION: Vault Decryption Check
 # ============================================================================
+# Checks every secret the enabled features consume, not just the Cloudflare
+# token — a vault blob (or template placeholder) in any of them used to
+# surface only later, as an opaque 401 mid-run.
 - name: Fail if vault-encrypted variables are not decrypted
   fail:
     msg: |
-      Vault-encrypted variables detected but not decrypted!
-      Please run the playbook with --ask-vault-pass or configure vault password file.
+      Vault-encrypted (or placeholder) secrets detected: {{ _undecrypted_secrets | join(', ') }}
+      Please run the playbook with --ask-vault-pass or configure a vault password file.
       Example: ansible-playbook playbook.yml --ask-vault-pass --extra-vars "..."
-  when: >
-    (cloudflare_api_token is defined and cloudflare_api_token is string and 
-     '$ANSIBLE_VAULT;' in cloudflare_api_token)
+  vars:
+    _secret_values:
+      cloudflare_api_token: "{{ cloudflare_api_token | default('') }}"
+      fcp_api_token: "{{ fcp_api_token | default('') if (fcp_enabled | default(false) | bool) else '' }}"
+      remnawave_panel_api_token: "{{ remnawave_panel_api_token | default('') }}"
+      remnawave_panel_secret_key: "{{ remnawave_panel_secret_key | default('') if (remnawave_secret_key_source | default('vault') == 'vault') else '' }}"
+    _undecrypted_secrets: >-
+      {{ _secret_values | dict2items
+         | selectattr('value', 'string')
+         | selectattr('value', 'search', '\$ANSIBLE_VAULT;')
+         | map(attribute='key') | list }}
+  when: _undecrypted_secrets | length > 0
 
 # ============================================================================
 # VALIDATION: Operation Mode
@@ -558,13 +570,47 @@
         - remnawave_enabled | default(false) | bool
         - fcp_register_remnawave_panel | default(false) | bool
 
-    - name: Bind Remnawave squad to an FCP tier (optional)
-      include_tasks: providers/fcp/bind_squad.yml
+    # Per-node placement: add THIS node's squad(s) to FCP's per-mode pools
+    # (append-only — addSquadUuids never disturbs the rest of the pool). The
+    # fronted (WS) squad joins the "evade" pool; the Reality squad joins
+    # "privacy". Needs the same admin:servers:write scope registration uses.
+    - name: Add this node's squads to FCP mode placements
+      include_tasks: providers/fcp/bind_placements.yml
+      vars:
+        _evade_entry: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
+        _privacy_entry: "{{ {'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
       when:
         - component_install_success | bool
         - fcp_enabled | default(false) | bool
         - remnawave_enabled | default(false) | bool
-        - fcp_bind_squad | default(false) | bool
+        - remnawave_per_node_placement | default(true) | bool
+        - >-
+          ((remnawave_node_fronted_squad_uuid | default('')) | length > 0)
+          or ((remnawave_node_reality_squad_uuid | default('')) | length > 0)
+
+    # Opt-in post-deploy gate: wait until FCP's healthcheck cron has observed
+    # the just-registered backend (needs admin:status:read on the token).
+    - name: Wait for FCP status to report the Outline server healthy
+      include_tasks: providers/fcp/status_gate.yml
+      vars:
+        _fcp_gate_slug: "{{ fcp_server_slug }}"
+      when:
+        - component_install_success | bool
+        - fcp_enabled | default(false) | bool
+        - fcp_status_gate | default(false) | bool
+        - outline_enabled | default(true) | bool
+
+    - name: Wait for FCP status to report the Remnawave panel healthy
+      include_tasks: providers/fcp/status_gate.yml
+      vars:
+        _fcp_gate_slug: "{{ fcp_remnawave_panel_slug }}"
+      when:
+        - component_install_success | bool
+        - fcp_enabled | default(false) | bool
+        - fcp_status_gate | default(false) | bool
+        - remnawave_enabled | default(false) | bool
+        - fcp_register_remnawave_panel | default(false) | bool
 
     - name: Display deployment summary
       debug:
@@ -956,18 +1002,20 @@
 # ============================================================================
 # BOOTSTRAP MODE (panel-only, host-agnostic, run once per panel)
 # ============================================================================
-# Create the Remnawave panel objects a working key needs — a Config Profile with
-# WS/Reality inbounds, an x25519 keypair for Reality, a fronted squad
-# (WS) and a Reality squad — then bind the two squads to FCP's connection
-# profiles (the member "Stay connected" / "Maximize privacy" chooser). Fully
-# idempotent (GET-before-POST); touches NO host (delegate_to: localhost). This
-# replaces the manual "Phase 0" panel setup. Run once, e.g.:
+# Create the panel objects a working key needs — a Config Profile with the
+# BASE WS/Reality inbounds (the templates node deploys clone per node) and an
+# x25519 keypair for Reality. Per-node squads are created at NODE deploy time
+# (create_node_placement.yml) and appended to FCP's mode pools there; the
+# legacy panel-wide squads are only created when
+# remnawave_bootstrap_shared_squads=true (simple single-unit topology).
+# Fully idempotent (GET-before-POST); touches NO host (delegate_to: localhost).
+# This replaces the manual "Phase 0" panel setup. Run once, e.g.:
 #   ansible-playbook playbook.yml -e operation_mode=bootstrap \
 #     -e remnawave_panel_url=https://panel.example.com -e fcp_enabled=true \
 #     --ask-vault-pass
 # It PRINTS the created Config Profile + inbound UUIDs — copy them into your
 # node-deploy vars (see defaults/main.yml "Panel bootstrap").
-- name: Bootstrap the Remnawave panel (config profile + inbounds + squads) and FCP profiles
+- name: Bootstrap the Remnawave panel (config profile + inbounds) and FCP binding
   block:
     - name: Validate bootstrap prerequisites
       assert:
@@ -986,8 +1034,12 @@
     - name: Ensure the Config Profile + inbounds exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_config_profile.yml
 
-    - name: Ensure the connection-profile squads exist (capture their UUIDs)
+    # Legacy/simple topology only: one panel-wide squad per mode (every node
+    # looks like one unit to FCP's node placement). The per-node model creates
+    # squads at node deploy time instead.
+    - name: Ensure the shared connection-mode squads exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_squad.yml
+      when: remnawave_bootstrap_shared_squads | default(false) | bool
 
     # Opt-in: write the created UUIDs to a vars file so node deploys need no manual
     # paste. Load it alongside the creds file: -e @<creds>.yml -e @<this file>.
@@ -1016,9 +1068,25 @@
       delegate_to: localhost
       when: remnawave_bootstrap_output_file | default('') | length > 0
 
-    - name: Bind the squads to FCP connection profiles
-      include_tasks: providers/fcp/bind_profiles.yml
-      when: fcp_enabled | default(false) | bool
+    # Shared-squad topology only: bind the two panel-wide squads as one-element
+    # pools (full replace). Per-node deploys append their own squads instead.
+    - name: Bind the shared squads to FCP mode placements
+      include_tasks: providers/fcp/bind_placements.yml
+      vars:
+        _privacy_entry: "{{ {'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
+      when:
+        - fcp_enabled | default(false) | bool
+        - remnawave_bootstrap_shared_squads | default(false) | bool
+        - (remnawave_fronted_squad_uuid | default('')) | length > 0
+
+    # Opt-in (needs admin:settings:write; FCP's compiled default is already
+    # 'evade', so most deployments leave fcp_default_connection_mode empty).
+    - name: Set the FCP default connection mode
+      include_tasks: providers/fcp/bind_default_mode.yml
+      when:
+        - fcp_enabled | default(false) | bool
+        - (fcp_default_connection_mode | default('')) | length > 0
 
     - name: Bootstrap summary
       debug:
@@ -1028,19 +1096,21 @@
           Config Profile: {{ remnawave_bootstrap_config_profile_name }}
             uuid: {{ remnawave_panel_config_profile_uuid | default('(unresolved)') }}
 
-          Inbounds (copy into your node-deploy vars):
+          Base inbounds (copy into your node-deploy vars — node deploys clone
+          them per node when remnawave_per_node_placement is on):
             remnawave_cdn_transports[ws].inbound_uuid:    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}
             remnawave_reality_inbound_uuid:               {{ remnawave_reality_inbound_uuid | default('(disabled)') }}
 
-          Squads:
+          {% if remnawave_bootstrap_shared_squads | default(false) | bool %}
+          Shared squads (legacy single-unit topology):
             fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ remnawave_fronted_squad_uuid | default('(none)') }}
             reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ remnawave_reality_squad_uuid | default('(disabled)') }}
-
           {% if fcp_enabled | default(false) | bool %}
-          FCP connection profiles bound (evade -> fronted, privacy -> reality).
+          FCP mode placements bound (evade -> fronted pool, privacy -> reality pool).
+          {% endif %}
           {% else %}
-          FCP binding skipped (fcp_enabled=false) — set the squad UUIDs in the FCP
-          admin CMS (Settings -> Connection profiles) or re-run with fcp_enabled=true.
+          No squads created at bootstrap: node deploys create a per-node squad
+          and append it to FCP's mode pools (remnawave_per_node_placement=true).
           {% endif %}
   when: operation_mode == 'bootstrap'
 

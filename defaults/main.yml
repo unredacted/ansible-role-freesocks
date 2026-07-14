@@ -222,14 +222,17 @@ fcp_verify_connectivity: true       # after registering, assert FCP can reach th
 # (retries * delay = max wait; default ~3 min).
 fcp_verify_retries: 18
 fcp_verify_delay: 10
-# Declarative squad->tier binding (opt-in). FCP issues a member's key into the
-# Remnawave squad named on their tier; this binds it without the manual CMS copy.
-# Requires the fsv1_ token to ALSO hold admin:tiers:write (wider than servers:*) —
-# mint it with that extra scope when enabling. The squad UUID comes from the
-# panel (Phase-0 provisioning); set it in vault/host_vars, not here.
-fcp_bind_squad: false               # bind remnawave_squad_uuid -> fcp_squad_tier_slug (deploy mode only)
-fcp_squad_tier_slug: "member"       # the FCP tier slug to bind the squad to
-# remnawave_squad_uuid: ""          # the Remnawave internal-squad UUID (vault/host_vars)
+# Optional capacity/ordering hints on the FCP backend-servers row. Empty = not
+# sent (the upsert leaves an absent field unchanged, so an admin-set value in
+# the CMS survives re-runs). fcp_max_keys caps issuance onto this instance
+# (integer; the literal string "null" clears a previously-set cap);
+# fcp_priority orders pool candidates (lower = preferred).
+fcp_max_keys: ""
+fcp_priority: ""
+# Post-registration health gate (opt-in): poll GET /api/v1/admin/status until
+# this server's slug reports healthy (needs admin:status:read on the token).
+# Bounded by fcp_verify_retries * fcp_verify_delay like the connectivity probe.
+fcp_status_gate: false
 
 # Additional required variables for migration mode:
 # source_hostname: "outline1-jfk"      # Hostname of the source server
@@ -285,6 +288,15 @@ remnawave_panel_api_token: "" # vault-encrypted; created via Panel UI → Tokens
 remnawave_panel_register_node: false
 remnawave_panel_config_profile_uuid: "" # REQUIRED when register_node=true
 remnawave_panel_active_inbounds: [] # REQUIRED when register_node=true
+# Per-node placement (default ON; needs register_node=true): give this node its
+# own config-profile inbound clones (VLESS_WS_CDN_<HOSTNAME> / VLESS_REALITY_
+# <HOSTNAME>) + its own internal squad(s), activate ONLY those, and append the
+# squad UUID(s) to FCP's per-mode placement pools (evade <- fronted squad,
+# privacy <- Reality squad). This is what lets FCP home each new key to the
+# least-loaded node. OFF = the legacy shared-squad topology (all nodes are one
+# unit; see remnawave_bootstrap_shared_squads). Teardown when retiring a node:
+# providers/remnawave/teardown_node_placement.yml.
+remnawave_per_node_placement: true
 remnawave_panel_country_code: "XX" # 2-letter ISO; panel default is "XX"
 # The address the PANEL dials to manage the node (control plane, node_port 2222).
 # Defaults to the public data-plane hostname; override to a Tailscale MagicDNS
@@ -510,10 +522,12 @@ remnawave_docker_apt_suite: ""
 # ============================================================================
 # `operation_mode=bootstrap` creates the panel objects a working key needs and
 # is IDEMPOTENT (GET-before-POST). It replaces the manual "Phase 0" panel setup:
-#   1. x25519 keypair (Reality)                → gen_x25519.yml
-#   2. a Config Profile + WS/Reality inbounds → create_config_profile.yml
-#   3. a fronted squad (WS) + a Reality squad → create_squad.yml
-#   4. bind those squads to FCP connection profiles → providers/fcp/bind_profiles.yml
+#   1. x25519 keypair (Reality)                    → gen_x25519.yml
+#   2. a Config Profile + BASE WS/Reality inbounds → create_config_profile.yml
+#      (node deploys CLONE these per node — see remnawave_per_node_placement)
+#   3. (legacy, remnawave_bootstrap_shared_squads=true only) one panel-wide
+#      squad per mode → create_squad.yml, bound as one-element FCP pools
+#   4. optional FCP default-mode bind → providers/fcp/bind_default_mode.yml
 # It touches NO host (delegate_to: localhost throughout). Run once per panel, e.g.:
 #   ansible-playbook playbook.yml -e operation_mode=bootstrap \
 #     -e remnawave_panel_url=https://panel.example.com -e fcp_enabled=true ...
@@ -521,15 +535,22 @@ remnawave_docker_apt_suite: ""
 # node-deploy vars (remnawave_panel_config_profile_uuid,
 # remnawave_cdn_transports[].inbound_uuid, remnawave_reality_inbound_uuid).
 #
-# NOTE: the fsv1_ token used for bind_profiles must hold admin:settings:write
-# (wider than the admin:servers:* the node-registration path needs); mint it with
-# that scope when bootstrapping:
+# Scopes: placement binding uses admin:servers:write (the SAME scope node/panel
+# registration needs — no extra scope). Only the opt-in default-mode bind
+# (fcp_default_connection_mode) needs the wider admin:settings:write:
 #   bunx convex run adminApi:mintAutomationToken \
-#     '{"scopes":["admin:settings:write","admin:servers:read","admin:servers:write"]}'
+#     '{"scopes":["admin:servers:read","admin:servers:write"]}'
 
 # Master switch is operation_mode=bootstrap; these tune what it creates.
 remnawave_bootstrap_config_profile_name: "FreeSocks-CDN"
-remnawave_bootstrap_reality: true                     # also create the Reality inbound + squad
+remnawave_bootstrap_reality: true                     # also create the Reality inbound
+# Legacy single-unit topology: create the two panel-wide squads at bootstrap and
+# bind them as one-element pools. Default OFF — the per-node model (see
+# remnawave_per_node_placement) creates a squad per node instead, which is what
+# lets FCP's issuance-time placement balance keys across nodes.
+remnawave_bootstrap_shared_squads: false
+# Squad NAME PREFIXES: bootstrap's shared squads use them verbatim; per-node
+# squads append "-<hostname>" (FreeSocks-Fronted-quiet-falcon).
 remnawave_bootstrap_fronted_squad_name: "FreeSocks-Fronted"
 remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
 # Opt-in: path (localhost) to write the created config-profile + inbound UUIDs +
@@ -571,5 +592,8 @@ remnawave_bootstrap_cdn_inbounds:
       wsSettings: { path: "/ws" }
     sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
 
-# FCP default connection profile bind_profiles sets ('evade' = Stay connected).
-fcp_default_connection_profile: "evade"
+# Opt-in: set FCP's default connection mode at bootstrap ('evade' = Beat
+# censorship, 'privacy' = Maximum privacy). Empty = skip (FCP's compiled
+# default is already 'evade', and skipping keeps the token at admin:servers:*
+# only — setting it needs admin:settings:write).
+fcp_default_connection_mode: ""
