@@ -22,6 +22,13 @@ services:
       - panel.env
     volumes:
       - valkey-socket:/var/run/valkey
+    # The real-deploy CI phase runs a remnawave/node container on the RUNNER's
+    # host network; the panel dials it at host.docker.internal:2222 (mapped to
+    # the docker host gateway). Real deployments dial the node's public/VPN
+    # address the same way — this just makes "the host" addressable from inside
+    # the compose network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # No host ports: the API is reached only through rw-test-proxy (which injects
     # the X-Forwarded-* headers Remnawave's proxy guard requires).
     healthcheck:

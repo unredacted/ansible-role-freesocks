@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   # Cheap structural checks: every YAML parses + the test playbooks pass
@@ -37,6 +38,11 @@ jobs:
           ansible-playbook --syntax-check tests/test_caddyfile_render.yml
           ANSIBLE_ROLES_PATH="$(dirname "$PWD")" \
             ansible-playbook --syntax-check tests/test_integration.yml
+          # test_deploy.yml loads the bootstrap output via vars_files, which the
+          # syntax check also resolves — provide a placeholder.
+          mkdir -p /tmp/role-ci && printf 'remnawave_panel_config_profile_uuid: ""\n' > /tmp/role-ci/bootstrap-vars.yml
+          ANSIBLE_ROLES_PATH="$(dirname "$PWD")" \
+            ansible-playbook --syntax-check tests/test_deploy.yml
 
   # The self-asserting expression tests (pure filter logic, no network):
   # bootstrap/placement body building, per-node plan+clone expressions, and
@@ -47,25 +53,32 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ansible-core
         run: pipx install ansible-core
-      - name: Run expression tests
-        run: |
-          ansible-playbook tests/test_bootstrap.yml
-          ansible-playbook tests/test_caddyfile_render.yml
+      - name: Run the offline expression tests
+        run: tests/run.sh
 
   # The real thing: a pinned Remnawave panel (same image the fleet runs) + a
-  # contract-strict mock FCP, driven end to end — bootstrap, per-node placement
-  # for two nodes (including the duplicate-inbound-port case), pool
-  # append/detach, and teardown. Catches panel contract drift and FCP request
-  # regressions before any production deploy.
+  # contract-strict mock FCP + a mock Cloudflare API, driven end to end —
+  # bootstrap, per-node placement for two nodes (including the
+  # duplicate-inbound-port case), pool append/detach, teardown, and then the
+  # FULL operation_mode=deploy path: a real remnawave/node container the panel
+  # actually connects to, Reality placement, DNS, FCP registration + status
+  # gate. Catches panel contract drift and FCP request regressions before any
+  # production deploy.
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install ansible-core
-        run: pipx install ansible-core
-      - name: Run the integration harness
-        run: bash tests/run_integration.sh
-      - name: Panel logs on failure
+      - name: Install ansible-core + collections + docker SDK
+        run: |
+          pipx install ansible-core
+          pipx inject ansible-core docker requests
+          ansible-galaxy collection install -r requirements.yml
+      - name: Run the integration harness (incl. the real-deploy phase)
+        run: RUN_DEPLOY_PHASE=1 bash tests/run_integration.sh
+      - name: Panel + node logs on failure
         if: failure()
-        run: docker compose -f tests/panel/docker-compose.yml logs --tail=100 || true
+        run: |
+          docker compose -f tests/panel/docker-compose.yml logs --tail=100 || true
+          sudo docker logs remnanode --tail=100 || true
+          sudo cat /opt/remnanode/docker-compose.yml || true

@@ -1,0 +1,162 @@
+---
+# tests/test_deploy.yml — the REAL `operation_mode=deploy` path, end to end.
+#
+# Unlike test_integration.yml (which drives individual task files), this runs
+# the role exactly as production does — tasks/main.yml validation, hostname,
+# DNS, install, docker, node container, panel registration, Reality Host, FCP
+# registration + placement — against:
+#   * the REAL Remnawave panel   (tests/panel/, pinned release)
+#   * a REAL remnawave/node container (role-managed compose, host network) that
+#     the panel actually connects to
+#   * the mock FCP               (tests/mock_fcp.py, contract-strict)
+#   * the mock Cloudflare API    (tests/mock_cloudflare.py — the role's DNS
+#     layer is endpoint-variable, so no role changes needed)
+#
+# Topology: a Reality node (direct, no Caddy/Fastly) — the one production
+# topology whose full deploy needs no public TLS issuance, so it can run
+# ANYWHERE. Runs under tests/run_integration.sh when RUN_DEPLOY_PHASE=1
+# (default in CI; locally needs passwordless sudo — the role writes
+# /opt/remnanode and drives Docker with become).
+
+- name: Real deploy — Reality node through the full role
+  hosts: localhost
+  connection: local
+  gather_facts: true # the DNS fallback publishes ansible_default_ipv4
+  vars:
+    operation_mode: deploy
+    environment_mode: dev
+    deploy_target_domain: "ci.example.test"
+    custom_hostname: "ci-real-node"
+    domain_providers:
+      ci.example.test:
+        dns_provider: cloudflare
+        cdn_provider: none
+        zone_id: "ci-zone"
+    cloudflare_api_token: "ci-cloudflare-token-not-a-vault-blob"
+    cloudflare_api_endpoint: "{{ lookup('env', 'CF_MOCK_URL') | default('http://127.0.0.1:8812', true) }}/client/v4"
+
+    outline_enabled: false
+    remnawave_enabled: true
+    remnawave_panel_url: "{{ lookup('env', 'REMNAWAVE_TEST_URL') | default('http://127.0.0.1:3000', true) }}"
+    remnawave_panel_api_token: "{{ lookup('env', 'REMNAWAVE_TEST_TOKEN') }}"
+    remnawave_secret_key_source: "panel_api"
+    remnawave_panel_register_node: true
+    # The panel (inside the compose network) dials the node at the docker host
+    # gateway — the node container runs on the RUNNER's host network.
+    remnawave_node_address: "host.docker.internal"
+    remnawave_reality_enabled: true
+    remnawave_reality_sni: "dl.google.com"
+    # remnawave_reality_inbound_uuid + remnawave_panel_config_profile_uuid +
+    # remnawave_cdn_transports come from the bootstrap output (vars_files below);
+    # per-node placement repoints them at this node's own inbounds.
+
+    fcp_enabled: true
+    fcp_api_url: "{{ lookup('env', 'FCP_MOCK_URL') | default('http://127.0.0.1:8811', true) }}"
+    fcp_api_token: "fsv1_ci-mock-token"
+    fcp_register_remnawave_panel: true
+    fcp_remnawave_panel_slug: "ci-panel"
+    fcp_status_gate: true # exercised against the mock's healthy status
+    fcp_status_gate_retries: 3
+    fcp_status_gate_delay: 2
+  vars_files:
+    - /tmp/role-ci/bootstrap-vars.yml
+  pre_tasks:
+    - name: Assert the harness exported the panel token
+      assert:
+        that: [remnawave_panel_api_token | length > 0]
+        fail_msg: "REMNAWAVE_TEST_TOKEN not set — run via tests/run_integration.sh"
+  roles:
+    - role: "{{ playbook_dir | dirname | basename }}"
+  post_tasks:
+    # --- the node container is really running -------------------------------
+    - name: Check the remnanode container
+      command: docker ps --filter name=remnanode --format '{{ "{{" }}.Names{{ "}}" }} {{ "{{" }}.Status{{ "}}" }}'
+      register: _dk
+      changed_when: false
+      become: yes
+    - name: Assert the node container is up
+      assert:
+        that:
+          - "'remnanode' in _dk.stdout"
+          - "'Up' in _dk.stdout"
+        fail_msg: "remnawave/node container is not running: {{ _dk.stdout }} {{ _dk.stderr }}"
+
+    # --- the PANEL actually connected to the node (the real handshake) ------
+    # The panel dials host.docker.internal:2222 and the node authenticates with
+    # the SECRET_KEY fetched from /api/keygen. Poll until isConnected.
+    - name: Wait for the panel to report the node connected
+      uri:
+        url: "{{ remnawave_panel_url }}/api/nodes"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _nodes
+      retries: 30
+      delay: 5
+      until: >-
+        (( _nodes.json.response['nodes']
+           if (_nodes.json.response is mapping and 'nodes' in _nodes.json.response)
+           else _nodes.json.response )
+         | selectattr('name', 'equalto', 'ci-real-node')
+         | selectattr('isConnected') | list | length) > 0
+    - name: Materialize the node row
+      set_fact:
+        _dep_node: >-
+          {{ (( _nodes.json.response['nodes']
+                if (_nodes.json.response is mapping and 'nodes' in _nodes.json.response)
+                else _nodes.json.response )
+              | selectattr('name', 'equalto', 'ci-real-node') | list | first) }}
+    - name: Assert the node is connected and enabled
+      assert:
+        that:
+          - _dep_node.isConnected
+          - not (_dep_node.isDisabled | default(false))
+        fail_msg: "Panel never connected to the deployed node: {{ _dep_node }}"
+
+    # --- per-node placement objects came from the REAL deploy path ----------
+    - name: Read back profiles + squads + hosts
+      uri:
+        url: "{{ remnawave_panel_url }}{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop: ["/api/config-profiles", "/api/internal-squads", "/api/hosts"]
+      register: _panel
+    - name: Materialize panel state
+      set_fact:
+        _dep_tags: "{{ (_panel.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _dep_squads: "{{ _panel.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+        _dep_hosts: >-
+          {{ (_panel.results[2].json.response['hosts']
+              if (_panel.results[2].json.response is mapping and 'hosts' in _panel.results[2].json.response)
+              else _panel.results[2].json.response) | map(attribute='remark') | list }}
+    - name: Assert per-node inbound + squad + Reality Host exist
+      assert:
+        that:
+          - _dep_tags | select('equalto', 'VLESS_REALITY_CI_REAL_NODE') | list | length == 1
+          - _dep_squads | select('equalto', 'FreeSocks-Reality-ci-real-node') | list | length == 1
+          - _dep_hosts | select('equalto', 'ci-real-node-reality') | list | length == 1
+        fail_msg: "Deploy did not create the per-node Reality inbound/squad/Host"
+
+    # --- FCP got everything through the real main.yml control-plane section --
+    - name: Read the mock FCP + mock Cloudflare state
+      uri: { url: "{{ item }}/__state", return_content: yes }
+      loop:
+        - "{{ fcp_api_url }}"
+        - "{{ lookup('env', 'CF_MOCK_URL') | default('http://127.0.0.1:8812', true) }}"
+      register: _mocks
+    - name: Assert FCP registration + placement and the DNS record
+      assert:
+        that:
+          # Reality-only node: privacy pool gains this node's squad, evade untouched.
+          - _mocks.results[0].json.pools.privacy | length == 1
+          - (_mocks.results[0].json.pools.evade | default([])) | length == 0
+          - "'ci-panel' in _mocks.results[0].json.servers"
+          # the mock CF holds the A record the deploy created
+          - _mocks.results[1].json.records | dict2items | map(attribute='value')
+            | selectattr('name', 'equalto', 'ci-real-node') | selectattr('type', 'equalto', 'A') | list | length >= 1
+        fail_msg: "FCP registration/placement or the DNS record is missing"
+
+    - name: Real-deploy phase passed
+      debug:
+        msg: >-
+          Real deploy OK: full role path, node container up + panel-connected,
+          per-node Reality placement, FCP registration + pools, mock DNS record.

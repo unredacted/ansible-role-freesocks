@@ -1,5 +1,7 @@
 # ansible-role-freesocks
 
+[![CI](https://github.com/unredacted/ansible-role-freesocks/actions/workflows/ci.yml/badge.svg)](https://github.com/unredacted/ansible-role-freesocks/actions/workflows/ci.yml)
+
 An Ansible role for deploying and managing VPN servers for [FreeSocks](https://freesocks.org/). The role supports two backends:
 
 - **Outline** — Shadowsocks proxy via the Outline `shadowbox` Docker container
@@ -1026,21 +1028,54 @@ templates/
 
 ## Testing
 
-The role ships offline, self-asserting tests under `tests/` (they run with `connection: local`, render templates, and exercise the role's filter expressions — no real hosts or API calls):
+Every push and PR runs three CI jobs (`.github/workflows/ci.yml`): **lint**
+(YAML parse + playbook syntax checks), **unit** (offline expression tests), and
+**integration** — a full end-to-end run against a **real Remnawave panel**.
 
-- **`tests/test_caddyfile_render.yml`** — renders the Remnawave Caddyfile template and asserts its structure (transport routes + decoy fallback).
-- **`tests/test_fcp_and_hosts.yml`** — exercises the FCP Outline `apiUrl` construction and the Remnawave Host request-body shaping (FCP is addressed by slug, so there is no id resolution to test).
+**Unit tests** (offline, `connection: local`, no hosts or APIs):
 
-Run them all with the helper script, or individually:
+- **`tests/test_bootstrap.yml`** — the bootstrap/placement filter expressions:
+  FCP mode-placement bodies (full-replace + per-node `addSquadUuids`), the
+  per-node inbound plan + clone logic (incl. re-run idempotency), x25519/response
+  shape tolerance.
+- **`tests/test_caddyfile_render.yml`** — renders the Remnawave Caddyfile
+  template and asserts its structure (transport routes + decoy fallback).
+- **`tests/test_fcp_and_hosts.yml`** — the FCP Outline `apiUrl` construction and
+  the Remnawave Host request-body shaping.
 
 ```bash
-# Run every tests/test_*.yml
-tests/run.sh
-
-# Or run a single test
-ansible-playbook tests/test_caddyfile_render.yml
-ansible-playbook tests/test_fcp_and_hosts.yml
+tests/run.sh                                   # every tests/test_*.yml
+ansible-playbook tests/test_bootstrap.yml      # or one at a time
 ```
+
+**Integration harness** (`tests/run_integration.sh`) — stands up an ephemeral
+**Remnawave panel** (`tests/panel/`, pinned to the fleet's release, fresh DB
+every run), a **contract-strict mock FCP** (`tests/mock_fcp.py` — validates
+requests exactly like the real control plane, including Convex-style
+undeclared-field rejection and squad-UUID checks), and a **mock Cloudflare API**
+(`tests/mock_cloudflare.py`), then runs two playbooks:
+
+1. **`tests/test_integration.yml`** — task-level: `operation_mode=bootstrap`
+   (asserts the profile is born with the no-log Xray posture), per-node
+   placement for two simulated nodes (idempotent re-runs, the duplicate
+   inbound-port case, append-only FCP pools), and teardown (pool detach, squad
+   delete, inbound strip — the other node untouched).
+2. **`tests/test_deploy.yml`** (with `RUN_DEPLOY_PHASE=1`) — the **real
+   `operation_mode=deploy` path**, exactly as production runs it: validation,
+   hostname, (mock) DNS, apt installs, a **real `remnawave/node` container**
+   the panel actually connects to over the node port, per-node Reality
+   placement, the Reality Host, and FCP registration + placement pools + the
+   status gate. A Reality node is used because it is the one production
+   topology needing no public TLS issuance.
+
+```bash
+bash tests/run_integration.sh                     # task-level phases (any OS)
+RUN_DEPLOY_PHASE=1 bash tests/run_integration.sh  # + the real deploy (Linux + passwordless sudo)
+```
+
+Requires Docker, ansible-core ≥ 2.15, and python3. Both mocks are ephemeral and
+everything is torn down on exit (including `/opt/remnanode` from the deploy
+phase). CI always runs the deploy phase.
 
 A syntax check of the example playbook is also useful:
 

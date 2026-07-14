@@ -9,59 +9,69 @@
 # Installs Docker CE + the Compose v2 plugin + the python3-docker library so
 # Ansible's community.docker modules can talk to the local daemon.
 
-- name: Install Docker apt prerequisites
-  apt:
-    name:
-      - ca-certificates
-      - curl
-      - gnupg
-      - apt-transport-https
-    state: present
-    update_cache: yes
-    cache_valid_time: 3600
+# Skip the whole Docker CE apt dance when Docker + Compose v2 already work —
+# idempotent re-runs stop touching apt, and hosts with a pre-installed Docker
+# (cloud images, CI runners — where the debian-pool repo would even conflict)
+# keep the install they have. NB: python3-docker is part of the skipped set, so
+# a pre-installed-Docker host must provide the Python docker SDK itself.
+- name: Check whether Docker + Compose v2 are already installed
+  command: docker compose version
+  register: _docker_present
+  changed_when: false
+  failed_when: false
   become: yes
 
-- name: Create /etc/apt/keyrings directory
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
+- name: Install Docker CE (skipped when already present)
+  when: _docker_present.rc != 0
   become: yes
+  block:
+    - name: Install Docker apt prerequisites
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - apt-transport-https
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
 
-- name: Download Docker apt signing key
-  get_url:
-    url: "https://download.docker.com/linux/debian/gpg"
-    dest: /etc/apt/keyrings/docker.asc
-    mode: '0644'
-    force: no
-  become: yes
+    - name: Create /etc/apt/keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
 
-- name: Add Docker apt repository
-  apt_repository:
-    # Suite is the running distro's codename by default (bookworm/trixie/...).
-    # Override with remnawave_docker_apt_suite (e.g. "bookworm" on trixie) only if
-    # Docker CE has not yet published a pool for this codename.
-    repo: "deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ remnawave_docker_apt_suite | default(ansible_distribution_release, true) }} stable"
-    filename: docker
-    state: present
-    update_cache: yes
-  become: yes
+    - name: Download Docker apt signing key
+      get_url:
+        url: "https://download.docker.com/linux/debian/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+        force: no
 
-- name: Install Docker CE and Compose plugin
-  apt:
-    name:
-      - docker-ce
-      - docker-ce-cli
-      - containerd.io
-      - docker-buildx-plugin
-      - docker-compose-plugin
-      - python3-docker
-    state: present
-  become: yes
+    - name: Add Docker apt repository
+      apt_repository:
+        # Suite is the running distro's codename by default (bookworm/trixie/...).
+        # Override with remnawave_docker_apt_suite (e.g. "bookworm" on trixie) only if
+        # Docker CE has not yet published a pool for this codename.
+        repo: "deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ remnawave_docker_apt_suite | default(ansible_distribution_release, true) }} stable"
+        filename: docker
+        state: present
+        update_cache: yes
 
-- name: Ensure docker service is enabled and running
-  systemd:
-    name: docker
-    state: started
-    enabled: yes
-  become: yes
+    - name: Install Docker CE and Compose plugin
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+          - python3-docker
+        state: present
+
+    - name: Ensure docker service is enabled and running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
