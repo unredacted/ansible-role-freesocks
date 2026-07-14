@@ -31,7 +31,7 @@
     _rw_squad_names: "{{ _squads | map(attribute='name') | list }}"
   vars:
     _resp: "{{ _rw_squads_list.json.response }}"
-    _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+    _squads: "{{ _resp['internalSquads'] if (_resp is mapping and 'internalSquads' in _resp) else _resp }}"
 
 - name: Compose the fronted squad inbound set (WS, dropping any unbound)
   set_fact:
@@ -106,7 +106,7 @@
     remnawave_reality_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
   vars:
     _resp: "{{ _rw_squads_list2.json.response }}"
-    _squads: "{{ _resp.internalSquads | default(_resp, true) }}"
+    _squads: "{{ _resp['internalSquads'] if (_resp is mapping and 'internalSquads' in _resp) else _resp }}"
 
 - name: Assert the fronted squad UUID resolved
   assert:

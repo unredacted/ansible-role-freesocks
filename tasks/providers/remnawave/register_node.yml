@@ -72,7 +72,7 @@
     content: "{{ remnawave_node_uuid }}\n"
     dest: "{{ remnawave_node_install_dir }}/.node_uuid"
     mode: '0640'
-  become: yes
+  become: "{{ remnawave_persist_become | default(true) }}"
   when:
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0

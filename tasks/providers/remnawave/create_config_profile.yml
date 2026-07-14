@@ -32,7 +32,7 @@
     _rw_profile_exists: "{{ remnawave_bootstrap_config_profile_name in (_profiles | map(attribute='name') | list) }}"
   vars:
     _resp: "{{ _rw_profiles_list.json.response }}"
-    _profiles: "{{ _resp.configProfiles | default(_resp, true) }}"
+    _profiles: "{{ _resp['configProfiles'] if (_resp is mapping and 'configProfiles' in _resp) else _resp }}"
 
 - name: Build the Reality inbound (inject the generated x25519 private key)
   set_fact:
@@ -120,7 +120,7 @@
     remnawave_panel_config_profile_uuid: "{{ (_profiles | selectattr('name', 'equalto', remnawave_bootstrap_config_profile_name) | map(attribute='uuid') | list | first) | default('', true) }}"
   vars:
     _resp: "{{ _rw_profiles_list2.json.response }}"
-    _profiles: "{{ _resp.configProfiles | default(_resp, true) }}"
+    _profiles: "{{ _resp['configProfiles'] if (_resp is mapping and 'configProfiles' in _resp) else _resp }}"
 
 - name: Assert the Config Profile UUID resolved
   assert:
@@ -154,7 +154,7 @@
     label: "{{ item.tag | default('?') }}"
   vars:
     _resp: "{{ _rw_inbounds_list.json.response }}"
-    _inbounds: "{{ _resp.inbounds | default(_resp, true) }}"
+    _inbounds: "{{ _resp['inbounds'] if (_resp is mapping and 'inbounds' in _resp) else _resp }}"
   when:
     - item.tag is defined
     - item.uuid is defined

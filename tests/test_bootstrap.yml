@@ -174,7 +174,8 @@
             {%- for t in remnawave_cdn_transports | default([]) if (t.enabled | default(false)) and ((t.inbound_uuid | default('')) | length > 0) -%}
               {%- set base_tag = _np_uuid_to_tag.get(t.inbound_uuid, '') -%}
               {%- if base_tag -%}
-                {%- set _ = plan.append({'kind': 'ws', 'transport': t.name, 'base_tag': base_tag, 'node_tag': base_tag ~ '_' ~ _np_tag_suffix, 'port': t.internal_port | default(0)}) -%}
+                {%- set node_tag = base_tag if base_tag.endswith('_' ~ _np_tag_suffix) else base_tag ~ '_' ~ _np_tag_suffix -%}
+                {%- set _ = plan.append({'kind': 'ws', 'transport': t.name, 'base_tag': base_tag, 'node_tag': node_tag, 'port': t.internal_port | default(0)}) -%}
               {%- endif -%}
             {%- endfor -%}
           {%- endif -%}
@@ -205,6 +206,30 @@
           - _np_clones[0].port == 8443
           - _np_clones[0].protocol == 'vless'
         success_msg: "Per-node plan + clone expressions OK."
+
+    # A re-run sees the REPOINTED per-node uuid; the plan must not re-suffix.
+    - name: Per-node plan is idempotent against an already-node-tagged base
+      vars:
+        random_hostname: "quiet-falcon"
+        remnawave_caddy_enabled: true
+        remnawave_cdn_transports:
+          - { name: ws, network: ws, path: "/ws", internal_port: 8443, inbound_uuid: "uuid-node-ws", enabled: true }
+        _np_uuid_to_tag: { "uuid-node-ws": "VLESS_WS_CDN_QUIET_FALCON" }
+        _np_tag_suffix: "{{ random_hostname | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
+        _np_plan: >-
+          {%- set plan = [] -%}
+          {%- for t in remnawave_cdn_transports if (t.enabled | default(false)) and ((t.inbound_uuid | default('')) | length > 0) -%}
+            {%- set base_tag = _np_uuid_to_tag.get(t.inbound_uuid, '') -%}
+            {%- if base_tag -%}
+              {%- set node_tag = base_tag if base_tag.endswith('_' ~ _np_tag_suffix) else base_tag ~ '_' ~ _np_tag_suffix -%}
+              {%- set _ = plan.append({'node_tag': node_tag}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ plan }}
+      assert:
+        that:
+          - _np_plan[0].node_tag == 'VLESS_WS_CDN_QUIET_FALCON'
+        success_msg: "Re-run does not double-suffix the node tag."
 
     - name: All bootstrap expression tests passed
       debug:
