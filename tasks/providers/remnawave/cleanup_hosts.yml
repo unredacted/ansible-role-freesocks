@@ -22,9 +22,16 @@
   register: remnawave_cleanup_hosts_list
   when: old_random_hostname is defined and old_random_hostname | length > 0
 
+- name: Normalize the Hosts list payload (cleanup; bare array or hosts-wrapped)
+  set_fact:
+    _remnawave_cleanup_hosts: "{{ remnawave_cleanup_hosts_list.json.response['hosts'] if (remnawave_cleanup_hosts_list.json.response is mapping and 'hosts' in remnawave_cleanup_hosts_list.json.response) else (remnawave_cleanup_hosts_list.json.response | default([])) }}"
+  when:
+    - old_random_hostname is defined and old_random_hostname | length > 0
+    - remnawave_cleanup_hosts_list.json is defined
+
 - name: Select OLD Host UUIDs by remark prefix
   set_fact:
-    _old_host_uuids: "{{ remnawave_cleanup_hosts_list.json.response | default([]) | selectattr('remark', 'match', old_random_hostname ~ '-') | map(attribute='uuid') | list }}"
+    _old_host_uuids: "{{ _remnawave_cleanup_hosts | selectattr('remark', 'match', old_random_hostname ~ '-') | map(attribute='uuid') | list }}"
   when:
     - old_random_hostname is defined and old_random_hostname | length > 0
     - remnawave_cleanup_hosts_list.json is defined

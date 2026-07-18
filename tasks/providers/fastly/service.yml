@@ -74,13 +74,22 @@
     fastly_websocket_domain: "{{ dns_hostname }}"
   when: fastly_domain_mode_effective == 'custom'
 
+# In custom mode the client-facing name (dns_hostname) becomes a CNAME to the
+# Fastly edge, so the backend must dial a DISTINCT origin name or the edge
+# would fetch from itself. fastly/dns.yml creates origin-<hostname> A/AAAA
+# records for this. Shared mode has no edge CNAME — the backend dials the
+# origin hostname directly.
+- name: Set the Fastly origin backend address
+  set_fact:
+    fastly_origin_address: "{{ ('origin-' ~ random_hostname ~ '.' ~ base_domain) if fastly_domain_mode_effective == 'custom' else dns_hostname }}"
+
 - name: Debug Fastly configuration
   debug:
     msg:
       - "Fastly domain mode: {{ fastly_domain_mode_effective }}"
       - "Fastly service name: {{ fastly_service_name }}"
       - "Fastly WebSocket domain: {{ fastly_websocket_domain }}"
-      - "Origin backend: {{ dns_hostname }}"
+      - "Origin backend: {{ fastly_origin_address }}"
 
 # ============================================================================
 # Idempotency: reuse an existing service by name (get-or-create)
@@ -99,6 +108,7 @@
       Accept: "application/json"
     status_code: [200, 404]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_service_lookup
 
 # A found service is only safe to REUSE if it has an active version. A service
@@ -119,6 +129,7 @@
     # else (auth/server error) is a real failure and should NOT be tolerated.
     status_code: [200, 400, 404]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_active_check
   when: fastly_service_lookup.status == 200
 
@@ -131,6 +142,7 @@
       Accept: "application/json"
     status_code: [200, 404]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   when:
     - fastly_service_lookup.status == 200
     - (fastly_active_check.status | default(404)) != 200
@@ -171,6 +183,7 @@
       type: "vcl"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_service_result
   when: not fastly_service_exists
 
@@ -202,6 +215,7 @@
       Accept: "application/json"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_websocket_result
   when: not fastly_service_exists
 
@@ -226,6 +240,7 @@
       name: "{{ fastly_websocket_domain }}"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_domain_result
   when: not fastly_service_exists
 
@@ -243,8 +258,10 @@
 #   - between_bytes_timeout is irrelevant (ignored for WebSocket connections)
 #   - max_conn left at default (0 = unlimited) to avoid blocking connection bursts
 #   - keepalive_time disabled (0) since WebSocket connections aren't pooled
-# We always use the DNS hostname as the origin address (not raw IP) so that:
+# We always use a DNS name as the origin address (not raw IP) so that:
 #   1. TLS SNI works correctly with Caddy's Let's Encrypt certificate
+#      (SNI/override/cert host stay dns_hostname — the cert's name — while the
+#      dial address is the origin name in custom mode)
 #   2. Fastly can resolve the hostname to get the correct IP
 - name: Add backend to Fastly service
   uri:
@@ -257,7 +274,7 @@
     body_format: form-urlencoded
     body:
       name: "origin-{{ random_hostname }}"
-      address: "{{ dns_hostname }}"
+      address: "{{ fastly_origin_address }}"
       port: "443"
       use_ssl: "true"
       override_host: "{{ dns_hostname }}"
@@ -273,12 +290,13 @@
       tcp_keepalive_time: "300"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_backend_result
   when: not fastly_service_exists
 
 - name: Debug Fastly backend addition
   debug:
-    msg: "Backend added: {{ dns_hostname }}:443 (connect_timeout={{ fastly_backend_connect_timeout }}ms, first_byte_timeout={{ fastly_backend_first_byte_timeout }}ms, tcp_keepalive=on)"
+    msg: "Backend added: {{ fastly_origin_address }}:443 (connect_timeout={{ fastly_backend_connect_timeout }}ms, first_byte_timeout={{ fastly_backend_first_byte_timeout }}ms, tcp_keepalive=on)"
   when: not fastly_service_exists
 
 # ============================================================================
@@ -300,7 +318,7 @@
     body_format: form-urlencoded
     body:
       name: "origin-health-{{ random_hostname }}"
-      host: "{{ dns_hostname }}"
+      host: "{{ fastly_origin_address }}"
       path: "/"
       method: "HEAD"
       http_version: "1.1"
@@ -312,6 +330,7 @@
       initial: "3"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_healthcheck_result
   when: not fastly_service_exists
 
@@ -344,6 +363,7 @@
       content: "if (req.http.Upgrade) { return (upgrade); }"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_vcl_snippet_result
   when: not fastly_service_exists
 
@@ -369,6 +389,7 @@
       Accept: "application/json"
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_activate_result
   when: not fastly_service_exists
 
@@ -396,7 +417,7 @@
       Service Name: {{ fastly_service_name }}
       Domain Mode: {{ fastly_domain_mode_effective }}
       WebSocket Domain: {{ fastly_websocket_domain }}
-      Origin Backend: {{ dns_hostname }}:443
+      Origin Backend: {{ fastly_origin_address }}:443
       WebSocket Passthrough: Enabled
       VCL Snippet: websocket_upgrade (return upgrade)
 

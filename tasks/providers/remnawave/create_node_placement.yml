@@ -362,10 +362,11 @@
     dest: "{{ remnawave_node_install_dir }}/.squad_uuids"
     mode: '0640'
   become: "{{ remnawave_persist_become | default(true) }}"
+  no_log: true  # content carries the per-node squad UUIDs
 
 - name: Summarize per-node placement
   debug:
     msg:
       - "Per-node inbounds: {{ _np_plan | map(attribute='node_tag') | join(', ') }}"
-      - "Fronted squad '{{ _np_fronted_squad_name }}': {{ remnawave_node_fronted_squad_uuid | default('(none)', true) }}"
-      - "Reality squad '{{ _np_reality_squad_name }}': {{ remnawave_node_reality_squad_uuid | default('(n/a)', true) }}"
+      - "Fronted squad '{{ _np_fronted_squad_name }}': {{ 'uuid persisted' if (remnawave_node_fronted_squad_uuid | default('') | length > 0) else '(none)' }}"
+      - "Reality squad '{{ _np_reality_squad_name }}': {{ 'uuid persisted' if (remnawave_node_reality_squad_uuid | default('') | length > 0) else '(n/a)' }}"

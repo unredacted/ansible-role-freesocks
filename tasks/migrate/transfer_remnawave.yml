@@ -56,9 +56,18 @@
   become: yes
   when: inventory_hostname == destination_hostname
 
-- name: Clean up archive files
+- name: Clean up archive files (both hosts)
   file:
     path: "/tmp/remnanode.tar.gz"
     state: absent
   become: yes
   when: inventory_hostname in [source_hostname, destination_hostname]
+
+# The fetched copy on the controller carries the panel-wide SECRET_KEY too.
+- name: Clean up the controller-side migration archive
+  file:
+    path: "/tmp/remnanode-migration-{{ source_kv_hostname }}.tar.gz"
+    state: absent
+  delegate_to: localhost
+  run_once: true
+  when: inventory_hostname == destination_hostname

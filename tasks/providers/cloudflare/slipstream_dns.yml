@@ -37,6 +37,7 @@
     return_content: yes
   register: ns_record_check
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
 
 - name: Debug NS record check result
   debug:
@@ -55,6 +56,7 @@
     return_content: yes
   register: a_record_check
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
 
 - name: Check if AAAA record exists for nameserver
   uri:
@@ -65,6 +67,7 @@
     return_content: yes
   register: aaaa_record_check
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   when: ansible_default_ipv6.address is defined
 
 # ============================================================================
@@ -91,6 +94,7 @@
   when:
     - a_record_check.json.result | length == 0
     - ansible_default_ipv4.address is defined
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: a_record_created
 
 - name: Update existing A record if IP changed
@@ -111,6 +115,7 @@
     - a_record_check.json.result | length > 0
     - a_record_check.json.result[0].content != ansible_default_ipv4.address
     - ansible_default_ipv4.address is defined
+  no_log: true  # carries the Cloudflare API token in the Authorization header
 
 # ============================================================================
 # Create AAAA record for nameserver (ns1.your-dns.com → server IPv6)
@@ -136,6 +141,7 @@
   when:
     - ansible_default_ipv6.address is defined
     - aaaa_record_check.json.result | default([]) | length == 0
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: aaaa_record_created
 
 - name: Update existing AAAA record if IPv6 changed
@@ -156,6 +162,7 @@
     - ansible_default_ipv6.address is defined
     - aaaa_record_check.json.result | default([]) | length > 0
     - aaaa_record_check.json.result[0].content != ansible_default_ipv6.address
+  no_log: true  # carries the Cloudflare API token in the Authorization header
 
 # ============================================================================
 # Create NS record (dns1.your-dns.com → ns1.your-dns.com)
@@ -178,6 +185,7 @@
     status_code: [200, 201]
   delegate_to: localhost
   when: ns_record_check.json.result | length == 0
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: ns_record_created
 
 # ============================================================================

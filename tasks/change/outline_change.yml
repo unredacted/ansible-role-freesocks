@@ -62,10 +62,6 @@
   set_fact:
     access_txt_decoded: "{{ access_txt_raw.content | b64decode }}"
 
-- name: Debug access.txt content
-  debug:
-    msg: "access.txt content: {{ access_txt_decoded }}"
-
 # access.txt format is key:value pairs, one per line:
 # certSha256:XXXX
 # apiUrl:https://hostname:port/secret
@@ -75,9 +71,7 @@
 
 - name: Fail if API URL not found
   fail:
-    msg: |
-      Could not find apiUrl in access.txt. File content:
-      {{ access_txt_decoded }}
+    msg: "Could not find apiUrl in /opt/outline/access.txt (content not logged — it carries the management secret)."
   when: api_url_line is not defined or api_url_line == ''
 
 - name: Build outline_api_info object
@@ -89,12 +83,6 @@
 - name: Extract API random string
   set_fact:
     api_random_string: "{{ outline_api_info.apiUrl | regex_search('/([^/]+)$') | regex_replace('/', '') }}"
-
-- name: Display current configuration
-  debug:
-    msg:
-      - "Current API URL: {{ outline_api_info.apiUrl }}"
-      - "API Secret: {{ api_random_string }}"
 
 - name: Check if shadowbox_server_config.json exists
   stat:
@@ -126,19 +114,47 @@
   set_fact:
     current_working_api_url: "https://{{ current_api_hostname }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string }}"
 
-- name: Debug working API URL
-  debug:
-    msg: "Working API URL: {{ current_working_api_url }}"
-
 # ============================================================================
 # STEP 2: Get current hostname from server config
 # ============================================================================
-- name: Get current server config
+# The Caddy-proxied URL only answers when Outline's embedded web-server is
+# enabled (WSS, or the FCP API proxy). On a bare Outline server nothing serves
+# TLS on 443, so probe first and fall back to the raw self-signed management
+# URL from access.txt instead of dying here.
+- name: Get current server config (Caddy-proxied URL)
   uri:
     url: "{{ current_working_api_url }}/server"
     method: GET
     validate_certs: yes
+    status_code: [200]
+    timeout: 15
   register: current_server_config
+  failed_when: false
+  no_log: true  # the apiUrl carries the Outline management secret
+
+- name: Note the Caddy web-server is enabled (probe succeeded)
+  set_fact:
+    current_working_api_validate_certs: true
+    _outline_web_server_enabled: true
+  when: current_server_config.status | default(0) == 200
+
+- name: Fall back to the raw self-signed management URL (no Caddy web-server)
+  set_fact:
+    current_working_api_url: "{{ outline_api_info.apiUrl }}"
+    current_working_api_validate_certs: false
+    _outline_web_server_enabled: false
+    _outline_mgmt_port: "{{ outline_api_info.apiUrl | regex_search(':([0-9]+)/', '\\1') | first | default('') }}"
+  when: current_server_config.status | default(0) != 200
+
+- name: Get current server config (raw URL fallback)
+  uri:
+    url: "{{ current_working_api_url }}/server"
+    method: GET
+    validate_certs: no
+    status_code: 200
+  register: current_server_config
+  when: not _outline_web_server_enabled
+  no_log: true  # the apiUrl carries the Outline management secret
 
 - name: Extract current hostname and domain
   set_fact:
@@ -219,6 +235,7 @@
       
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: existing_dns_records
   when: effective_dns_provider == 'cloudflare'
 
@@ -232,6 +249,7 @@
       
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ existing_dns_records.json.result | default([]) }}"
   when:
     - effective_dns_provider == 'cloudflare'
@@ -296,9 +314,10 @@
     body_format: json
     body:
       hostname: "{{ dns_hostname }}"
-    validate_certs: yes
+    validate_certs: "{{ current_working_api_validate_certs }}"
     status_code: 204
   register: hostname_update_result
+  no_log: true  # the apiUrl carries the Outline management secret
 
 - name: Display hostname update result
   debug:
@@ -307,6 +326,9 @@
 # ============================================================================
 # STEP 8: Update Caddy domain via Outline API
 # ============================================================================
+# Only when the embedded web-server is enabled — a bare Outline server (no WSS,
+# no FCP API proxy) has no Caddy to re-point, and enabling it here could steal
+# port 443 from the Shadowsocks keys listener.
 - name: Set effective Caddy domain
   set_fact:
     effective_caddy_domain: "{{ outline_caddy_domain | default(dns_hostname, true) }}"
@@ -322,13 +344,16 @@
       email: "{{ outline_caddy_email }}"
       domain: "{{ effective_caddy_domain }}"
       apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
-    validate_certs: yes
+    validate_certs: "{{ current_working_api_validate_certs }}"
     status_code: 204
   register: caddy_update_result
+  no_log: true  # the apiUrl carries the Outline management secret
+  when: _outline_web_server_enabled
 
 - name: Display Caddy update result
   debug:
     msg: "Caddy domain updated to: {{ effective_caddy_domain }}"
+  when: _outline_web_server_enabled
 
 # ============================================================================
 # STEP 9: Update local configuration files
@@ -347,13 +372,20 @@
   become: yes
   when: old_hostname != ''
 
+- name: Check if the embedded Caddy config exists
+  stat:
+    path: /opt/outline/persisted-state/outline-caddy/config.yaml
+  register: outline_caddy_config_file
+
 - name: Update hostname in Caddy config
   ansible.builtin.replace:
     path: /opt/outline/persisted-state/outline-caddy/config.yaml
     regexp: '{{ old_hostname | regex_escape }}'
     replace: '{{ dns_hostname }}'
   become: yes
-  when: old_hostname != ''
+  when:
+    - old_hostname != ''
+    - outline_caddy_config_file.stat.exists
 
 - name: Display local files updated
   debug:
@@ -374,29 +406,30 @@
 
 - name: Build new API URL for health check
   set_fact:
-    # Construct proper URL: https://hostname/api/secret (no port, uses Caddy proxy path)
-    new_api_url: "https://{{ dns_hostname }}{{ outline_api_proxy_path | default('') }}/{{ api_random_string }}"
-
-- name: Debug new API URL
-  debug:
-    msg:
-      - "Old API URL: {{ outline_api_info.apiUrl }}"
-      - "New API URL: {{ new_api_url }}"
+    # Caddy-proxied URL when the web-server is enabled; otherwise the raw
+    # management URL on its self-signed port (with the new hostname).
+    new_api_url: >-
+      {{ ('https://' ~ dns_hostname ~ (outline_api_proxy_path | default('')) ~ '/' ~ api_random_string)
+         if _outline_web_server_enabled
+         else ('https://' ~ dns_hostname
+               ~ (':' ~ _outline_mgmt_port if (_outline_mgmt_port | default('') | length > 0) else '')
+               ~ '/' ~ api_random_string) }}
 
 - name: Wait for container to be healthy
   uri:
     url: "{{ new_api_url }}/server"
     method: GET
-    validate_certs: yes
+    validate_certs: "{{ current_working_api_validate_certs }}"
     status_code: 200
   register: health_check
   retries: 10
   delay: 5
   until: health_check.status == 200
+  no_log: true  # the apiUrl carries the Outline management secret
 
 - name: Display container restart complete
   debug:
-    msg: "Container restarted and API accessible at: {{ new_api_url }}"
+    msg: "Container restarted and API accessible at: https://{{ dns_hostname }}/<secret>"
 
 # ============================================================================
 # STEP 11: Re-register rotated server with FCP
@@ -407,6 +440,19 @@
 - name: Re-register Outline server with FCP (hostname rotated)
   include_tasks: ../providers/fcp/register_server.yml
   when: fcp_enabled | default(false) | bool
+
+# Delete the stale pre-rotation FCP row (registered under the OLD hostname's
+# slug) so FCP stops health-checking and issuing against the retired hostname.
+# No-ops when the slug is absent; skipped when the hostname didn't change.
+# Mirrors migrate mode's source-row cleanup.
+- name: Delete the stale pre-rotation Outline server row from FCP
+  include_tasks: ../providers/fcp/delete_server.yml
+  vars:
+    fcp_delete_slug: "{{ old_random_hostname }}"
+  when:
+    - fcp_enabled | default(false) | bool
+    - old_random_hostname | length > 0
+    - old_random_hostname != random_hostname
 
 # ============================================================================
 # STEP 12: Clean up old DNS records (optional)
@@ -423,6 +469,7 @@
           
         status_code: 200
       delegate_to: localhost
+      no_log: true  # carries the Cloudflare API token in the Authorization header
       register: old_dns_records
 
     - name: Delete old DNS records
@@ -432,9 +479,10 @@
         headers:
           Content-Type: "application/json"
           Authorization: "Bearer {{ cf_token }}"
-          
+
         status_code: 200
       delegate_to: localhost
+      no_log: true  # carries the Cloudflare API token in the Authorization header
       loop: "{{ old_dns_records.json.result }}"
       when: old_dns_records.json.result | length > 0
   when:

@@ -2,14 +2,18 @@
 # tasks/migrate/remnawave_containers.yml - Container management during
 # Remnawave migration.
 
-# Source: tear down the old container.
+# Source: tear down the old container. The source install dir was renamed to
+# <dir>.migrated by transfer_remnawave.yml BEFORE this runs, so a compose_v2
+# `state: absent` against that path derives the wrong project name and silently
+# no-ops (leaving a split-brain node running with the same identity as the
+# destination). Stop the container by its hardcoded name instead.
 - name: Stop and remove remnanode container on source
-  community.docker.docker_compose_v2:
-    project_src: "{{ remnawave_node_install_dir }}.migrated"
+  community.docker.docker_container:
+    name: remnanode
     state: absent
   become: yes
   when: inventory_hostname == source_hostname
-  failed_when: false   # If the path is gone (e.g. previous failed run), don't block.
+  failed_when: false   # If it is already gone (e.g. previous failed run), don't block.
 
 # Destination: pull image (in case it was never seen here) and bring up.
 - name: Pull image on destination

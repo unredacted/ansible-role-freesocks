@@ -266,6 +266,7 @@
       Authorization: "Bearer {{ cf_token }}"
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: old_dns_records
   when:
     - change_delete_old_dns | default(true) | bool
@@ -280,6 +281,7 @@
       Authorization: "Bearer {{ cf_token }}"
     status_code: [200, 404]
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ old_dns_records.json.result | default([]) }}"
   loop_control:
     label: "{{ item.name }} ({{ item.type }})"

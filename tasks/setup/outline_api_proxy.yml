@@ -39,6 +39,7 @@
   retries: 10
   delay: 5
   until: api_check.status == 200
+  no_log: true  # the apiUrl carries the Outline management secret
 
 - name: Enable Caddy web server + API proxy (auto HTTPS, no WSS)
   uri:
@@ -53,6 +54,7 @@
       apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
     validate_certs: no
     status_code: 204
+  no_log: true  # the apiUrl carries the Outline management secret
   when: outline_caddy_auto_https | default(true) | bool
 
 - name: Enable Caddy web server + API proxy (no auto HTTPS, no WSS)
@@ -67,6 +69,7 @@
       apiProxyPath: "{{ outline_api_proxy_path | default(omit) }}"
     validate_certs: no
     status_code: 204
+  no_log: true  # the apiUrl carries the Outline management secret
   when: not (outline_caddy_auto_https | default(true) | bool)
 
 - name: Display API proxy configuration

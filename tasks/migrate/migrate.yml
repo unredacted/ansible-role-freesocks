@@ -52,6 +52,26 @@
 # ============================================================================
 # Set destination hostname facts
 # ============================================================================
+# base_domain drives dns_hostname + DNS + Fastly derivation below — fail loudly
+# when it can't be resolved instead of crashing on an undefined var mid-migration.
+- name: Fail if base_domain is not configured in domain_providers (migrate)
+  fail:
+    msg: >-
+      base_domain ('{{ base_domain | default('(unset)') }}') is not present in
+      domain_providers. Migrate mode needs it to update DNS records (and Fastly,
+      when fronted) for {{ destination_kv_hostname }}.<base_domain>. Set
+      base_domain via --extra-vars.
+  when:
+    - inventory_hostname == destination_hostname
+    - base_domain is not defined or base_domain not in domain_providers
+
+- name: Derive the destination DNS provider (migrate)
+  set_fact:
+    effective_dns_provider: "{{ domain_providers[base_domain].dns_provider | default('cloudflare') }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - base_domain is defined and base_domain in domain_providers
+
 - name: Set variables for destination installation
   set_fact:
     random_hostname: "{{ destination_kv_hostname }}"
@@ -125,7 +145,111 @@
 # ============================================================================
 - name: Include DNS record management tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/migrate/dns_records.yml
-  when: dns_provider == 'cloudflare'
+  when:
+    - inventory_hostname == destination_hostname
+    - effective_dns_provider | default('') == 'cloudflare'
+
+# ============================================================================
+# Fastly re-point on the destination (Outline only)
+# ============================================================================
+# Migrate transfers /opt/outline wholesale, so a fronted source's
+# fastly_service_id file arrives with it — but that Fastly service still points
+# its backend at the SOURCE hostname (fronted WSS would die). Rotate the edge
+# exactly like change mode: delete the old service, create a fresh one backed
+# at the destination. Gated on the transferred service-id file so a never-
+# fronted server is untouched. Runs BEFORE the FCP re-register below so
+# register_server.yml picks up fastly_websocket_domain for the new row.
+- name: Check for a transferred Fastly service-id file (Outline)
+  stat:
+    path: /opt/outline/fastly_service_id
+  register: outline_migrate_fastly_id_file
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+
+- name: Derive destination CDN provider (Outline migrate)
+  set_fact:
+    effective_cdn_provider: "{{ domain_providers[base_domain].cdn_provider | default('none') }}"
+    effective_fastly_domain_mode: "{{ domain_providers[base_domain].fastly_domain_mode | default('shared') }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - base_domain in domain_providers
+
+- name: Set Fastly facts for the destination rotation (Outline)
+  set_fact:
+    fastly_service_id_dir: /opt/outline
+    fastly_token: "{{ domain_providers[base_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+
+- name: Delete OLD Fastly service (from transferred service-id file, Outline)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+
+- name: Create NEW Fastly service on the destination (Outline)
+  include_tasks: ../providers/fastly/service.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+
+- name: Fastly TLS subscription (custom mode, destination, Outline)
+  include_tasks: ../providers/fastly/tls.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Fastly edge CNAME (custom mode, destination, Outline)
+  include_tasks: ../providers/fastly/dns.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - effective_dns_provider | default('') == 'cloudflare'
+
+# ============================================================================
+# Re-read the transferred Outline API info (destination, Outline only)
+# ============================================================================
+# The fresh Outline installer's apiUrl (outline_api_info) is STALE here:
+# transfer_config overwrote the destination's /opt/outline with the source's
+# state, so the running shadowbox serves the SOURCE's management secret.
+# Re-read access.txt (already hostname-rewritten by transfer_config) so the
+# FCP registration below uses the LIVE secret — otherwise the registered
+# apiUrl 404s and the fcp_verify_connectivity probe fails the play AFTER the
+# migration has otherwise completed.
+- name: Re-read the transferred Outline API info (destination)
+  slurp:
+    src: /opt/outline/access.txt
+  register: outline_access_raw
+  become: yes
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+
+- name: Rebuild outline_api_info from the transferred access.txt
+  set_fact:
+    outline_api_info:
+      apiUrl: "{{ (outline_access_raw.content | b64decode) | regex_search('apiUrl:(.+)', '\\1') | first | trim }}"
+      certSha256: "{{ (outline_access_raw.content | b64decode) | regex_search('certSha256:(.+)', '\\1') | first | default('') | trim }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_access_raw.content is defined
 
 # ============================================================================
 # Control-plane update (FCP) — re-register the destination Outline server
@@ -224,11 +348,17 @@
     - migrate_component == 'remnawave'
     - remnawave_caddy_enabled | default(false) | bool
 
+- name: Set the old hostname fact for Host cleanup (all Remnawave migrates)
+  set_fact:
+    old_random_hostname: "{{ source_kv_hostname }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
 - name: Set Fastly facts for the destination rotation (Remnawave)
   set_fact:
     fastly_service_id_dir: "{{ remnawave_node_install_dir }}"
     fastly_token: "{{ domain_providers[base_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
-    old_random_hostname: "{{ source_kv_hostname }}"
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
@@ -272,7 +402,7 @@
     - migrate_component == 'remnawave'
     - effective_cdn_provider | default('none') == 'fastly'
     - effective_fastly_domain_mode | default('shared') == 'custom'
-    - dns_provider == 'cloudflare'
+    - effective_dns_provider | default('') == 'cloudflare'
 
 - name: Create NEW Remnawave Hosts on the destination
   include_tasks: ../providers/remnawave/create_hosts.yml

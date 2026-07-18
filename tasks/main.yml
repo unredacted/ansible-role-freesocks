@@ -577,9 +577,11 @@
     - name: Add this node's squads to FCP mode placements
       include_tasks: providers/fcp/bind_placements.yml
       vars:
-        _evade_entry: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
-        _privacy_entry: "{{ {'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+        _fcp_placement_modes: >-
+          {{ ({'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
+              if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {})
+             | combine({'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
+              if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {}) }}
       when:
         - component_install_success | bool
         - fcp_enabled | default(false) | bool
@@ -1073,8 +1075,10 @@
     - name: Bind the shared squads to FCP mode placements
       include_tasks: providers/fcp/bind_placements.yml
       vars:
-        _privacy_entry: "{{ {'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
+        _fcp_placement_modes: >-
+          {{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}}
+             | combine({'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}}
+              if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {}) }}
       when:
         - fcp_enabled | default(false) | bool
         - remnawave_bootstrap_shared_squads | default(false) | bool
@@ -1103,8 +1107,8 @@
 
           {% if remnawave_bootstrap_shared_squads | default(false) | bool %}
           Shared squads (legacy single-unit topology):
-            fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ remnawave_fronted_squad_uuid | default('(none)') }}
-            reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ remnawave_reality_squad_uuid | default('(disabled)') }}
+            fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ 'uuid resolved' if (remnawave_fronted_squad_uuid | default('') | length > 0) else '(none)' }}
+            reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ 'uuid resolved' if (remnawave_reality_squad_uuid | default('') | length > 0) else '(disabled)' }}
           {% if fcp_enabled | default(false) | bool %}
           FCP mode placements bound (evade -> fronted pool, privacy -> reality pool).
           {% endif %}

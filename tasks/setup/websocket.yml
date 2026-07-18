@@ -73,6 +73,7 @@
   retries: 10
   delay: 5
   until: api_check.status == 200
+  no_log: true  # the apiUrl carries the Outline management secret
 
 - name: Configure listeners for access keys (WebSocket-only)
   uri:
@@ -89,6 +90,7 @@
     validate_certs: no
     status_code: 204
   register: listeners_result
+  no_log: true  # the apiUrl carries the Outline management secret
 
 - name: Debug listeners configuration
   debug:
@@ -108,6 +110,7 @@
     validate_certs: no
     status_code: 204
   register: caddy_result
+  no_log: true  # the apiUrl carries the Outline management secret
   when: outline_caddy_auto_https
 
 - name: Enable Caddy web server without auto HTTPS
@@ -123,6 +126,7 @@
     validate_certs: no
     status_code: 204
   register: caddy_result_no_https
+  no_log: true  # the apiUrl carries the Outline management secret
   when: not outline_caddy_auto_https
 
 - name: Display WSS configuration success

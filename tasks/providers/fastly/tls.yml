@@ -40,6 +40,7 @@
                 id: "{{ fastly_websocket_domain }}"
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_sub_result
 
 - name: Extract TLS subscription ID
@@ -64,6 +65,7 @@
       Accept: "application/vnd.api+json"
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_details
 
 - name: Extract ACME challenge info
@@ -114,6 +116,7 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   when:
     - effective_dns_provider == 'cloudflare'
     - fastly_acme_challenge_record is defined
@@ -137,6 +140,7 @@
       Accept: "application/vnd.api+json"
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_status
   retries: 30
   delay: 10
@@ -163,6 +167,7 @@
       Accept: "application/vnd.api+json"
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_activations
 
 - name: Extract Fastly CNAME target
@@ -172,11 +177,16 @@
     fastly_cname_target: "{{ fastly_tls_activations.json.data[0].attributes.cname_target | default('') }}"
   when: fastly_tls_activations.json.data | length > 0
 
-# Fallback: if the activation doesn't include cname_target directly,
-# use the standard Fastly mapping
-- name: Set fallback CNAME target
-  set_fact:
-    fastly_cname_target: "dualstack.{{ fastly_websocket_domain | regex_replace('[^a-z0-9]', '') | truncate(10, False, '') }}.sni.global.fastly.net"
+# The CNAME target is NOT derivable from the domain name (Fastly assigns it per
+# subscription) — never guess it. Fail loudly so the operator checks the
+# subscription instead of writing a silently-broken edge CNAME.
+- name: Fail if Fastly did not report a CNAME target
+  fail:
+    msg: >-
+      Fastly's /tls/activations returned no cname_target for TLS subscription
+      {{ fastly_tls_subscription_id }} ({{ fastly_websocket_domain }}). The edge
+      CNAME cannot be written without it — check the subscription state in the
+      Fastly dashboard/API, then re-run.
   when: fastly_cname_target is not defined or fastly_cname_target == ''
 
 - name: Display TLS setup summary

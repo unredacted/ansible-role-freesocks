@@ -27,12 +27,13 @@
   no_log: true
   register: _rw_profiles_list
 
+- name: Normalize the Config Profiles list payload
+  set_fact:
+    _rw_profiles: "{{ _rw_profiles_list.json.response['configProfiles'] if (_rw_profiles_list.json.response is mapping and 'configProfiles' in _rw_profiles_list.json.response) else _rw_profiles_list.json.response }}"
+
 - name: Determine whether the FreeSocks Config Profile already exists
   set_fact:
-    _rw_profile_exists: "{{ remnawave_bootstrap_config_profile_name in (_profiles | map(attribute='name') | list) }}"
-  vars:
-    _resp: "{{ _rw_profiles_list.json.response }}"
-    _profiles: "{{ _resp['configProfiles'] if (_resp is mapping and 'configProfiles' in _resp) else _resp }}"
+    _rw_profile_exists: "{{ remnawave_bootstrap_config_profile_name in (_rw_profiles | map(attribute='name') | list) }}"
 
 - name: Build the Reality inbound (inject the generated x25519 private key)
   set_fact:
@@ -115,12 +116,13 @@
   no_log: true
   register: _rw_profiles_list2
 
+- name: Normalize the re-listed Config Profiles payload
+  set_fact:
+    _rw_profiles2: "{{ _rw_profiles_list2.json.response['configProfiles'] if (_rw_profiles_list2.json.response is mapping and 'configProfiles' in _rw_profiles_list2.json.response) else _rw_profiles_list2.json.response }}"
+
 - name: Resolve the Config Profile UUID by name
   set_fact:
-    remnawave_panel_config_profile_uuid: "{{ (_profiles | selectattr('name', 'equalto', remnawave_bootstrap_config_profile_name) | map(attribute='uuid') | list | first) | default('', true) }}"
-  vars:
-    _resp: "{{ _rw_profiles_list2.json.response }}"
-    _profiles: "{{ _resp['configProfiles'] if (_resp is mapping and 'configProfiles' in _resp) else _resp }}"
+    remnawave_panel_config_profile_uuid: "{{ (_rw_profiles2 | selectattr('name', 'equalto', remnawave_bootstrap_config_profile_name) | map(attribute='uuid') | list | first) | default('', true) }}"
 
 - name: Assert the Config Profile UUID resolved
   assert:
@@ -143,18 +145,19 @@
   no_log: true
   register: _rw_inbounds_list
 
+- name: Normalize the inbounds list payload
+  set_fact:
+    _rw_inbounds: "{{ _rw_inbounds_list.json.response['inbounds'] if (_rw_inbounds_list.json.response is mapping and 'inbounds' in _rw_inbounds_list.json.response) else _rw_inbounds_list.json.response }}"
+
 # Map tag -> uuid. Our tags (VLESS_WS_CDN / VLESS_REALITY) are
 # FreeSocks-specific, so matching by tag across all returned inbounds is safe;
 # when the panel scopes inbounds by profile we still only read our two tags.
 - name: Map inbound tag -> uuid
   set_fact:
     remnawave_bootstrap_inbound_uuids: "{{ remnawave_bootstrap_inbound_uuids | default({}) | combine({ item.tag: item.uuid }) }}"
-  loop: "{{ _inbounds }}"
+  loop: "{{ _rw_inbounds }}"
   loop_control:
     label: "{{ item.tag | default('?') }}"
-  vars:
-    _resp: "{{ _rw_inbounds_list.json.response }}"
-    _inbounds: "{{ _resp['inbounds'] if (_resp is mapping and 'inbounds' in _resp) else _resp }}"
   when:
     - item.tag is defined
     - item.uuid is defined

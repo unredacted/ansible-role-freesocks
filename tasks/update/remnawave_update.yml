@@ -84,6 +84,17 @@
           {{ remnawave_node_uuid | default('(unknown)') }} from
           {{ remnawave_panel_url | default('(no panel url)') }}.
 
+    # Tear down the per-node placement FIRST: detaches this node's squad(s)
+    # from FCP's mode pools (so issuance stops homing NEW keys to this dying
+    # node), then deletes the per-node squads and strips the cloned inbounds.
+    # Reads .squad_uuids from the install dir (still present here) with a panel
+    # name fallback. Must run before delete_node and the dir removal below.
+    - name: Tear down the per-node placement (FCP pool detach + squad/inbound cleanup)
+      include_tasks: ../providers/remnawave/teardown_node_placement.yml
+      when:
+        - remnawave_per_node_placement | default(true) | bool
+        - remnawave_panel_api_token | default('') | length > 0
+
     - name: Delete node on Panel (when uuid + token known)
       include_tasks: ../providers/remnawave/delete_node.yml
       when:

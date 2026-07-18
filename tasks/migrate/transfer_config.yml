@@ -47,13 +47,20 @@
   when: inventory_hostname == destination_hostname
   register: extract_completed
 
-- name: Clean up archive files
+- name: Clean up archive files (both hosts)
   file:
-    path: "{{ item }}"
+    path: "/tmp/outline.tar.gz"
     state: absent
-  loop:
-    - "/tmp/outline.tar.gz"
   become: yes
+  when: inventory_hostname in [source_hostname, destination_hostname]
+
+# The fetched copy on the controller carries the Outline management secret too.
+- name: Clean up the controller-side migration archive
+  file:
+    path: "/tmp/outline-migration-{{ source_kv_hostname }}.tar.gz"
+    state: absent
+  delegate_to: localhost
+  run_once: true
   when: inventory_hostname == destination_hostname
 
 # Update configuration files

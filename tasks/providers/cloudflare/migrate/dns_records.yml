@@ -16,10 +16,31 @@
 
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: existing_dns_records
   run_once: true
 
-# Update base domain DNS A records if they exist
+# Cloudflare returns record `name` as the FQDN. Match BOTH the destination
+# FQDN (idempotent re-runs) and the source FQDN (first migrate — records still
+# carry the source name) so the update path actually fires and the create path
+# below doesn't pile up duplicates on every re-run.
+- name: Match existing A/AAAA records for this migration
+  set_fact:
+    _mig_dest_a: "{{ existing_dns_records.json.result | default([]) | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', destination_kv_hostname ~ '.' ~ base_domain) | list }}"
+    _mig_dest_aaaa: "{{ existing_dns_records.json.result | default([]) | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', destination_kv_hostname ~ '.' ~ base_domain) | list }}"
+    _mig_source_a: "{{ existing_dns_records.json.result | default([]) | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname ~ '.' ~ base_domain) | list }}"
+    _mig_source_aaaa: "{{ existing_dns_records.json.result | default([]) | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname ~ '.' ~ base_domain) | list }}"
+  when: inventory_hostname == destination_hostname
+
+# Prefer destination-named records (re-run); fall back to source-named (first
+# migrate — the update renames + repoints them in one PUT).
+- name: Select which existing records to update
+  set_fact:
+    _mig_a_to_update: "{{ _mig_dest_a if (_mig_dest_a | length > 0) else _mig_source_a }}"
+    _mig_aaaa_to_update: "{{ _mig_dest_aaaa if (_mig_dest_aaaa | length > 0) else _mig_source_aaaa }}"
+  when: inventory_hostname == destination_hostname
+
+# Update records pairwise with the desired IPs (zip stops at the shorter list).
 - name: Update existing DNS A records for IPv4 addresses
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item[0].id }}"
@@ -37,8 +58,9 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  with_nested:
-    - "{{ existing_dns_records.json.result | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname) | list }}"
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  with_together:
+    - "{{ _mig_a_to_update }}"
     - "{{ envoy_mappings[inventory_hostname].ipv4 }}"
   when:
     - inventory_hostname == destination_hostname
@@ -46,8 +68,9 @@
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv4 is defined
 
-# Create new A records if they don't exist
-- name: Create new DNS A records for IPv4 addresses
+# Create one record per desired IP beyond what the update covered (this is
+# also the no-existing-records path).
+- name: Create new DNS A records for remaining IPv4 addresses
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
@@ -64,15 +87,34 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  loop: "{{ envoy_mappings[inventory_hostname].ipv4 }}"
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ envoy_mappings[inventory_hostname].ipv4[(_mig_a_to_update | length):] }}"
   when:
     - inventory_hostname == destination_hostname
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv4 is defined
-    - existing_dns_records.json.result | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0
 
-# Update base domain DNS AAAA records if they exist
+# Delete surplus records beyond the desired IP count (e.g. stale source-IP
+# records when the destination has fewer IPs than the source had).
+- name: Delete surplus DNS A records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _mig_a_to_update[(envoy_mappings[inventory_hostname].ipv4 | length):] }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv4 is defined
+
 - name: Update existing DNS AAAA records for IPv6 addresses
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item[0].id }}"
@@ -90,8 +132,9 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  with_nested:
-    - "{{ existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list }}"
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  with_together:
+    - "{{ _mig_aaaa_to_update }}"
     - "{{ envoy_mappings[inventory_hostname].ipv6 }}"
   when:
     - inventory_hostname == destination_hostname
@@ -99,8 +142,7 @@
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv6 is defined
 
-# Create new AAAA records if they don't exist
-- name: Create new DNS AAAA records for IPv6 addresses
+- name: Create new DNS AAAA records for remaining IPv6 addresses
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
@@ -117,13 +159,31 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
-  loop: "{{ envoy_mappings[inventory_hostname].ipv6 }}"
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ envoy_mappings[inventory_hostname].ipv6[(_mig_aaaa_to_update | length):] }}"
   when:
     - inventory_hostname == destination_hostname
     - envoy_mappings is defined
     - envoy_mappings[inventory_hostname] is defined
     - envoy_mappings[inventory_hostname].ipv6 is defined
-    - existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0
+
+- name: Delete surplus DNS AAAA records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _mig_aaaa_to_update[(envoy_mappings[inventory_hostname].ipv6 | length):] }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - envoy_mappings is defined
+    - envoy_mappings[inventory_hostname] is defined
+    - envoy_mappings[inventory_hostname].ipv6 is defined
 
 # Cleanup API and Prometheus domain records
 - name: Get existing DNS records for API domain cleanup
@@ -136,6 +196,7 @@
 
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   register: api_dns_records
   when:
     - inventory_hostname == destination_hostname
@@ -152,6 +213,7 @@
 
     status_code: 200
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ api_dns_records.json.result }}"
   when:
     - inventory_hostname == destination_hostname
@@ -160,7 +222,32 @@
     - (item.name == source_kv_hostname + api_hostname_suffix + '.' + api_domain or item.name == source_kv_hostname + prom_hostname_suffix + '.' + prom_domain)
   run_once: true
 
-# Fallback DNS records if no existing records found and no envoy mappings
+# Fallback DNS records if no envoy mappings: update the first existing record
+# in place, create only when none exist, and drop any extras.
+- name: Update fallback DNS A record using server IP
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ _mig_a_to_update[0].id }}"
+    method: PUT
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+
+    body_format: json
+    body:
+      type: A
+      name: "{{ destination_kv_hostname }}"
+      content: '{{ ansible_facts["default_ipv4"]["address"] }}'
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  when:
+    - inventory_hostname == destination_hostname
+    - _mig_a_to_update | length > 0
+    - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
+    - ansible_facts['default_ipv4']['address'] is defined
+
 - name: Add fallback DNS A record using server IP
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
@@ -178,11 +265,53 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   when:
     - inventory_hostname == destination_hostname
-    - (existing_dns_records.json.result | selectattr('type', 'equalto', 'A') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0)
+    - _mig_a_to_update | length == 0
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
     - ansible_facts['default_ipv4']['address'] is defined
+
+- name: Delete surplus fallback DNS A records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _mig_a_to_update[1:] }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined)
+    - ansible_facts['default_ipv4']['address'] is defined
+
+- name: Update fallback DNS AAAA record using server IP
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ _mig_aaaa_to_update[0].id }}"
+    method: PUT
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+
+    body_format: json
+    body:
+      type: AAAA
+      name: "{{ destination_kv_hostname }}"
+      content: '{{ ansible_facts["default_ipv6"]["address"] }}'
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  when:
+    - inventory_hostname == destination_hostname
+    - _mig_aaaa_to_update | length > 0
+    - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
+    - ansible_facts['default_ipv6']['address'] is defined
 
 - name: Add fallback DNS AAAA record using server IP
   uri:
@@ -201,8 +330,26 @@
       proxied: false
     status_code: [200, 201]
   delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
   when:
     - inventory_hostname == destination_hostname
-    - (existing_dns_records.json.result | selectattr('type', 'equalto', 'AAAA') | selectattr('name', 'equalto', source_kv_hostname) | list | length == 0)
+    - _mig_aaaa_to_update | length == 0
+    - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
+    - ansible_facts['default_ipv6']['address'] is defined
+
+- name: Delete surplus fallback DNS AAAA records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _mig_aaaa_to_update[1:] }}"
+  when:
+    - inventory_hostname == destination_hostname
     - (envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined)
     - ansible_facts['default_ipv6']['address'] is defined

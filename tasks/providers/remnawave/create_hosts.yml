@@ -44,9 +44,13 @@
   no_log: true
   register: remnawave_hosts_list
 
+- name: Normalize the Hosts list payload (bare array or hosts-wrapped)
+  set_fact:
+    _remnawave_hosts: "{{ remnawave_hosts_list.json.response['hosts'] if (remnawave_hosts_list.json.response is mapping and 'hosts' in remnawave_hosts_list.json.response) else (remnawave_hosts_list.json.response | default([])) }}"
+
 - name: Compute existing Host remarks
   set_fact:
-    _existing_host_remarks: "{{ remnawave_hosts_list.json.response | default([]) | map(attribute='remark') | list }}"
+    _existing_host_remarks: "{{ _remnawave_hosts | map(attribute='remark') | list }}"
 
 - name: Create a Remnawave Host per enabled CDN transport
   uri:

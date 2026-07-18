@@ -25,12 +25,14 @@
   become: "{{ remnawave_persist_become | default(true) }}"
   failed_when: false
 
+- name: Materialize the persisted squad file lines
+  set_fact:
+    _td_lines: "{{ ((_td_squad_file.content | default('') | b64decode) if (_td_squad_file.content is defined) else '') | split('\n') }}"
+
 - name: Parse the persisted squad UUIDs
   set_fact:
-    _td_fronted_uuid: "{{ _lines | select('match', '^fronted=') | map('regex_replace', '^fronted=', '') | list | first | default('') }}"
-    _td_reality_uuid: "{{ _lines | select('match', '^reality=') | map('regex_replace', '^reality=', '') | list | first | default('') }}"
-  vars:
-    _lines: "{{ ((_td_squad_file.content | default('') | b64decode) if (_td_squad_file.content is defined) else '') | split('\n') }}"
+    _td_fronted_uuid: "{{ _td_lines | select('match', '^fronted=') | map('regex_replace', '^fronted=', '') | list | first | default('') }}"
+    _td_reality_uuid: "{{ _td_lines | select('match', '^reality=') | map('regex_replace', '^reality=', '') | list | first | default('') }}"
 
 # Fallback: resolve by the deterministic per-node names when the file is gone.
 - name: Resolve per-node squads by name (fallback)
@@ -75,9 +77,9 @@
   # this file runs via include_role tasks_from=….
   include_tasks: providers/fcp/bind_placements.yml
   vars:
-    _evade_entry: "{{ {'evade': {'removeSquadUuids': [_td_fronted_uuid]}} if (_td_fronted_uuid | length > 0) else {} }}"
-    _privacy_entry: "{{ {'privacy': {'removeSquadUuids': [_td_reality_uuid]}} if (_td_reality_uuid | length > 0) else {} }}"
-    _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+    _fcp_placement_modes: >-
+      {{ ({'evade': {'removeSquadUuids': [_td_fronted_uuid]}} if (_td_fronted_uuid | length > 0) else {})
+         | combine({'privacy': {'removeSquadUuids': [_td_reality_uuid]}} if (_td_reality_uuid | length > 0) else {}) }}
   when:
     - fcp_enabled | default(false) | bool
     - (_td_fronted_uuid | length > 0) or (_td_reality_uuid | length > 0)
@@ -96,6 +98,9 @@
   no_log: true
 
 # --- 3. Strip the node's cloned inbounds from the Config Profile -------------
+# Skipped when remnawave_panel_config_profile_uuid wasn't re-supplied (e.g. a
+# bare force-wipe run) — squads + FCP pools are already cleaned above; leaving
+# orphaned inbound clones is harmless by comparison and shouldn't fail the run.
 - name: List Config Profiles
   uri:
     url: "{{ remnawave_panel_url }}/api/config-profiles"
@@ -108,6 +113,7 @@
   delegate_to: localhost
   no_log: true
   register: _td_profiles_list
+  when: remnawave_panel_config_profile_uuid | default('') | length > 0
 
 - name: Resolve the Config Profile + the node's inbound tags
   set_fact:
@@ -119,6 +125,7 @@
           | list | first) | default({}, true) }}
     _td_tag_suffix: "{{ random_hostname | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
   no_log: true
+  when: remnawave_panel_config_profile_uuid | default('') | length > 0
 
 - name: Remove the node's inbounds from the Config Profile (full-replace PATCH)
   uri:
@@ -138,8 +145,18 @@
   delegate_to: localhost
   no_log: true
   when:
+    - remnawave_panel_config_profile_uuid | default('') | length > 0
     - _td_profile.config is defined
     - (_td_profile.config.inbounds | default([]) | selectattr('tag', 'search', '_' ~ _td_tag_suffix ~ '$') | list | length) > 0
+
+- name: Note skipped inbound strip (no profile UUID supplied)
+  debug:
+    msg: >-
+      remnawave_panel_config_profile_uuid not supplied — skipped stripping
+      {{ random_hostname }}'s cloned inbounds from the Config Profile. Remove
+      the VLESS_*_{{ random_hostname | regex_replace('[^A-Za-z0-9]', '_') | upper }}
+      tags manually in the Panel UI if they exist.
+  when: remnawave_panel_config_profile_uuid | default('') | length == 0
 
 - name: Summarize teardown
   debug:

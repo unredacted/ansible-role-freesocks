@@ -38,6 +38,10 @@
   no_log: true
   register: remnawave_reality_hosts_list
 
+- name: Normalize the Hosts list payload (Reality; bare array or hosts-wrapped)
+  set_fact:
+    _remnawave_hosts: "{{ remnawave_reality_hosts_list.json.response['hosts'] if (remnawave_reality_hosts_list.json.response is mapping and 'hosts' in remnawave_reality_hosts_list.json.response) else (remnawave_reality_hosts_list.json.response | default([])) }}"
+
 - name: Create the Reality Host
   uri:
     url: "{{ remnawave_panel_url }}/api/hosts"
@@ -63,7 +67,7 @@
   delegate_to: localhost
   no_log: true
   register: remnawave_reality_host_result
-  when: (random_hostname ~ '-reality') not in (remnawave_reality_hosts_list.json.response | default([]) | map(attribute='remark') | list)
+  when: (random_hostname ~ '-reality') not in (_remnawave_hosts | map(attribute='remark') | list)
 
 - name: Summarize Reality Host creation
   debug:

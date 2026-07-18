@@ -26,12 +26,13 @@
   no_log: true
   register: _rw_squads_list
 
+- name: Normalize the internal squads list payload
+  set_fact:
+    _rw_squads: "{{ _rw_squads_list.json.response['internalSquads'] if (_rw_squads_list.json.response is mapping and 'internalSquads' in _rw_squads_list.json.response) else _rw_squads_list.json.response }}"
+
 - name: Compute existing squad names
   set_fact:
-    _rw_squad_names: "{{ _squads | map(attribute='name') | list }}"
-  vars:
-    _resp: "{{ _rw_squads_list.json.response }}"
-    _squads: "{{ _resp['internalSquads'] if (_resp is mapping and 'internalSquads' in _resp) else _resp }}"
+    _rw_squad_names: "{{ _rw_squads | map(attribute='name') | list }}"
 
 - name: Compose the fronted squad inbound set (WS, dropping any unbound)
   set_fact:
@@ -100,13 +101,14 @@
   no_log: true
   register: _rw_squads_list2
 
+- name: Normalize the re-listed internal squads payload
+  set_fact:
+    _rw_squads2: "{{ _rw_squads_list2.json.response['internalSquads'] if (_rw_squads_list2.json.response is mapping and 'internalSquads' in _rw_squads_list2.json.response) else _rw_squads_list2.json.response }}"
+
 - name: Resolve the squad UUIDs by name
   set_fact:
-    remnawave_fronted_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
-    remnawave_reality_squad_uuid: "{{ (_squads | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
-  vars:
-    _resp: "{{ _rw_squads_list2.json.response }}"
-    _squads: "{{ _resp['internalSquads'] if (_resp is mapping and 'internalSquads' in _resp) else _resp }}"
+    remnawave_fronted_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+    remnawave_reality_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
 
 - name: Assert the fronted squad UUID resolved
   assert:
@@ -117,5 +119,5 @@
 - name: Summarize squad creation
   debug:
     msg:
-      - "Fronted squad '{{ remnawave_bootstrap_fronted_squad_name }}': {{ remnawave_fronted_squad_uuid }}"
-      - "Reality squad '{{ remnawave_bootstrap_reality_squad_name }}': {{ remnawave_reality_squad_uuid | default('(disabled)') }}"
+      - "Fronted squad '{{ remnawave_bootstrap_fronted_squad_name }}': {{ 'uuid resolved' if (remnawave_fronted_squad_uuid | length > 0) else '(none)' }}"
+      - "Reality squad '{{ remnawave_bootstrap_reality_squad_name }}': {{ 'uuid resolved' if (remnawave_reality_squad_uuid | default('') | length > 0) else '(disabled)' }}"

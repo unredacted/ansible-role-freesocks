@@ -22,13 +22,17 @@
   no_log: true
   register: _rw_x25519
 
+- name: Materialize the x25519 response payload
+  set_fact:
+    _rw_x25519_resp: "{{ _rw_x25519.json.response | default(_rw_x25519.json, true) }}"
+  no_log: true
+
 - name: Capture the x25519 private key (tolerate flat or keypairs[] shapes)
   set_fact:
-    remnawave_reality_private_key: "{{ _pk if (_pk | length > 0) else _pk_kp }}"
-  vars:
-    _resp: "{{ _rw_x25519.json.response | default(_rw_x25519.json, true) }}"
-    _pk: "{{ _resp.privateKey | default('') }}"
-    _pk_kp: "{{ (_resp.keypairs | default([]) | first | default({})).privateKey | default('') }}"
+    remnawave_reality_private_key: >-
+      {{ (_rw_x25519_resp.privateKey | default(''))
+         if ((_rw_x25519_resp.privateKey | default('')) | length > 0)
+         else ((_rw_x25519_resp.keypairs | default([]) | first | default({})).privateKey | default('')) }}
   no_log: true
 
 - name: Assert an x25519 private key was returned
