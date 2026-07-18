@@ -136,6 +136,41 @@
     dns_proxied: false
   when: effective_cdn_provider | default('none') == 'fastly'
 
+- name: Override dns_proxied for Reality (direct raw-TLS — no proxy)
+  set_fact:
+    dns_proxied: false
+  when: remnawave_reality_enabled | default(false) | bool
+
+# Pre-delete any existing records for the NEW hostname (re-run / custom_hostname
+# reuse would otherwise 400 on duplicates) — mirrors outline_change.yml.
+- name: Get existing DNS records for new hostname (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ effective_zone_id }}/dns_records?name={{ dns_hostname }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: existing_dns_records
+  when: effective_dns_provider == 'cloudflare'
+
+- name: Delete existing DNS records for new hostname (Cloudflare)
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ effective_zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ existing_dns_records.json.result | default([]) }}"
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - existing_dns_records.json.result | default([]) | length > 0
+
 - name: Include DNS tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/dns.yml
   when: effective_dns_provider == 'cloudflare'
@@ -171,9 +206,12 @@
 # STEP 4b: Fastly service rotation + Host re-pointing (Fastly-fronted only)
 # ============================================================================
 # The rotated hostname changes the Fastly edge domain, so the old Fastly service
-# and the old Hosts are stale. Delete the old Host entries + old Fastly service,
-# create a fresh service for the new hostname, then create new Hosts pointing at
-# the new edge. Mirrors the Outline change-mode Fastly block.
+# and the old Hosts are stale. NEW objects are created BEFORE the old ones are
+# deleted — a mid-run failure then leaves the OLD edge/Hosts serving instead of
+# a void. Exception: a shared-mode service pinned to a stable fastly_edge_label
+# reuses the SAME service name, so the old service must be deleted first (the
+# create would otherwise reuse it with a stale backend) — a documented brief
+# edge gap, self-healed by re-running.
 - name: Set Fastly service-id persistence dir (Remnawave)
   set_fact:
     fastly_service_id_dir: "{{ remnawave_node_install_dir }}"
@@ -184,15 +222,43 @@
     fastly_token: "{{ domain_providers[change_target_domain].fastly_api_token | default(fastly_api_token | default('')) }}"
   when: effective_cdn_provider | default('none') == 'fastly'
 
-- name: Clean up OLD Remnawave Hosts on the panel
-  include_tasks: ../providers/remnawave/cleanup_hosts.yml
-  when:
-    - remnawave_panel_register_node | default(false) | bool
-    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
-
-- name: Delete OLD Fastly service
-  include_tasks: ../providers/fastly/cleanup.yml
+# Capture the OLD service id BEFORE service.yml overwrites the id file below.
+- name: Read the OLD Fastly service id (pre-rotation)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/fastly_service_id"
+  register: _old_fastly_service_id_raw
+  become: yes
+  failed_when: false
   when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set the OLD Fastly service id fact
+  set_fact:
+    old_fastly_service_id: "{{ _old_fastly_service_id_raw.content | b64decode | trim }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_service_id_raw.content is defined
+    - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
+
+- name: Note same-name Fastly rotation (stable shared label)
+  set_fact:
+    _fastly_same_name_rotation: true
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'shared'
+    - fastly_edge_label | default('') | length > 0
+
+- name: Set the OLD Fastly edge domain for TLS cleanup (custom mode)
+  set_fact:
+    fastly_cleanup_domain: "{{ old_dns_hostname }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Delete OLD Fastly service (same-name rotation must go first)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _fastly_same_name_rotation | default(false) | bool
 
 - name: Create NEW Fastly service for the rotated hostname
   include_tasks: ../providers/fastly/service.yml
@@ -226,6 +292,19 @@
     - remnawave_panel_register_node | default(false) | bool
     - remnawave_reality_enabled | default(false) | bool
 
+# Old objects come down only after their replacements exist.
+- name: Clean up OLD Remnawave Hosts on the panel
+  include_tasks: ../providers/remnawave/cleanup_hosts.yml
+  when:
+    - remnawave_panel_register_node | default(false) | bool
+    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
+
+- name: Delete OLD Fastly service (after the NEW one is live)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - not (_fastly_same_name_rotation | default(false) | bool)
+
 # ============================================================================
 # STEP 5: Update Panel-side address
 # ============================================================================
@@ -258,12 +337,19 @@
 # Note: Remnawave hostname rotation does NOT touch FCP. FCP holds only the panel
 # (baseUrl+apiToken), which is unchanged; the node's NEW address is pushed to the
 # panel via the update_node PATCH in STEP 5, and the panel feeds FCP.
+# The OLD domain may live in a different Cloudflare account than the NEW one —
+# resolve its own credentials (falling back to the new domain's token).
+- name: Set OLD-domain Cloudflare credentials
+  set_fact:
+    old_cf_token: "{{ domain_providers[old_base_domain].cloudflare_api_token | default(cf_token) }}"
+  when: old_base_domain in domain_providers
+
 - name: Get OLD-domain DNS records
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records?name={{ old_dns_hostname }}"
     method: GET
     headers:
-      Authorization: "Bearer {{ cf_token }}"
+      Authorization: "Bearer {{ old_cf_token }}"
     status_code: 200
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header
@@ -278,7 +364,7 @@
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records/{{ item.id }}"
     method: DELETE
     headers:
-      Authorization: "Bearer {{ cf_token }}"
+      Authorization: "Bearer {{ old_cf_token }}"
     status_code: [200, 404]
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header

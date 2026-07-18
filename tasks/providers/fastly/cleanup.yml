@@ -88,14 +88,55 @@
   no_log: true  # carries the Fastly API token in the Fastly-Key header
   when: old_fastly_service_id is defined and old_fastly_service_id != ''
 
+# ============================================================================
+# Delete the TLS subscription for the OLD edge domain (custom mode only)
+# ============================================================================
+# Caller sets fastly_cleanup_domain to the OLD edge FQDN (the retired hostname
+# in custom mode). Without this, every rotation orphans a subscription.
+- name: Look up TLS subscriptions for the old edge domain
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions?filter[tls_domains.id]={{ fastly_cleanup_domain | urlencode }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: _fastly_cleanup_tls
+  when:
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - fastly_cleanup_domain | default('') | length > 0
+
+- name: Delete TLS subscriptions for the old edge domain
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ item.id }}"
+    method: DELETE
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: [200, 204, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  loop: "{{ _fastly_cleanup_tls.json.data | default([]) }}"
+  loop_control:
+    label: "{{ item.id }}"
+  when:
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+    - fastly_cleanup_domain | default('') | length > 0
+
 - name: Debug Fastly service deletion
   debug:
     msg: "Old Fastly service {{ old_fastly_service_id | default('N/A') }} deleted (or not found)"
   when: old_fastly_service_id is defined
 
+# Only remove the id file when it still points at the service just deleted —
+# after a create-before-delete rotation the file holds the NEW service's id.
 - name: Remove old Fastly service ID file
   file:
     path: "{{ fastly_service_id_dir }}/fastly_service_id"
     state: absent
   become: yes
-  when: fastly_service_id_file.stat.exists
+  when:
+    - fastly_service_id_file.stat.exists
+    - ((fastly_service_id_raw.content | default('') | b64decode | trim) == (old_fastly_service_id | default('')))

@@ -16,8 +16,8 @@
 - name: Validate Host-creation prerequisites
   assert:
     that:
-      - remnawave_panel_api_token | length > 0
-      - remnawave_panel_config_profile_uuid | length > 0
+      - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid is defined and remnawave_panel_config_profile_uuid | length > 0
       - dns_hostname is defined and dns_hostname | length > 0
     fail_msg: >-
       Host creation requires remnawave_panel_api_token,

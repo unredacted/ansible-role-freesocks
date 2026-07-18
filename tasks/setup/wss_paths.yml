@@ -1,0 +1,70 @@
+---
+# tasks/setup/wss_paths.yml - Resolve the effective WSS listener paths.
+#
+# Precedence (last wins):
+#   1. randomized dictionary paths   (outline_wss_random_paths, default true)
+#   2. configured paths              (outline_wss_tcp_path / _udp_path)
+#   3. FCP-forced /tcp + /udp        (fcp_enabled — FCP issues keys with FIXED
+#      client paths and has no per-server path field, so the server's listener
+#      paths MUST match or issued keys point at paths Caddy isn't serving)
+#
+# Split out of setup/websocket.yml so tests/test_wss_paths.yml can exercise the
+# resolution offline (with outline_wss_random_paths=false the apt/shell tasks
+# are skipped).
+
+- name: Install wamerican package for word list (WSS paths)
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random word count for TCP path
+  set_fact:
+    _wss_tcp_path_word_count: "{{ range(outline_wss_random_path_min_words, outline_wss_random_path_max_words + 1) | random }}"
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random word count for UDP path
+  set_fact:
+    _wss_udp_path_word_count: "{{ range(outline_wss_random_path_min_words, outline_wss_random_path_max_words + 1) | random }}"
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random words for TCP path
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ _wss_tcp_path_word_count }}'
+  register: _wss_tcp_path_words
+  when: outline_wss_random_paths | default(true)
+
+- name: Generate random words for UDP path
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ _wss_udp_path_word_count }}'
+  register: _wss_udp_path_words
+  when: outline_wss_random_paths | default(true)
+
+- name: Set random WebSocket paths from dictionary words
+  set_fact:
+    effective_wss_tcp_path: "/{{ _wss_tcp_path_words.stdout_lines | join('-') }}"
+    effective_wss_udp_path: "/{{ _wss_udp_path_words.stdout_lines | join('-') }}"
+  when: outline_wss_random_paths | default(true)
+
+- name: Use configured WebSocket paths
+  set_fact:
+    effective_wss_tcp_path: "{{ outline_wss_tcp_path }}"
+    effective_wss_udp_path: "{{ outline_wss_udp_path }}"
+  when: not (outline_wss_random_paths | default(true))
+
+# FCP issues Outline WSS keys with FIXED client paths /tcp and /udp and has no
+# per-server path field. So when registering with FCP, the server's listener
+# paths MUST be /tcp + /udp, or issued keys point at paths Caddy isn't serving.
+# Override here (winning over randomization). Path obfuscation adds ~nothing
+# behind a real-cert TLS endpoint. (Long-term fix: make the path configurable in FCP.)
+- name: Force /tcp + /udp WSS paths for FCP-managed Outline
+  set_fact:
+    effective_wss_tcp_path: "/tcp"
+    effective_wss_udp_path: "/udp"
+  when: fcp_enabled | default(false) | bool
+
+- name: Note WSS path override for FCP
+  debug:
+    msg: >-
+      fcp_enabled=true → WSS listener paths forced to /tcp + /udp to match FCP's
+      fixed client paths (path randomization disabled for this Outline server).
+  when: fcp_enabled | default(false) | bool

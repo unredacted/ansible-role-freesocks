@@ -30,7 +30,7 @@
     body_format: json
     body:
       uuid: "{{ remnawave_node_uuid }}"
-      address: "{{ dns_hostname }}"
+      address: "{{ remnawave_node_address | default(dns_hostname, true) }}"
       port: "{{ remnawave_node_port | int }}"
     status_code: 200
     return_content: yes
@@ -40,4 +40,4 @@
 
 - name: Log node update
   debug:
-    msg: "Updated node uuid={{ remnawave_node_uuid }} address={{ dns_hostname }} port={{ remnawave_node_port }}"
+    msg: "Updated node uuid={{ remnawave_node_uuid }} address={{ remnawave_node_address | default(dns_hostname, true) }} port={{ remnawave_node_port }}"

@@ -85,3 +85,22 @@
     - "/opt/outline/persisted-state/shadowbox_server_config.json"
   become: yes
   when: inventory_hostname == destination_hostname
+
+# The embedded Caddy config (present when the source had the web-server
+# enabled) carries the old FQDN too — patch it or the destination's Caddy
+# keeps serving the source domain.
+- name: Check for the embedded Caddy config on the destination
+  stat:
+    path: /opt/outline/persisted-state/outline-caddy/config.yaml
+  register: dest_caddy_config_file
+  when: inventory_hostname == destination_hostname
+
+- name: Replace source KV hostnames in the embedded Caddy config
+  replace:
+    path: /opt/outline/persisted-state/outline-caddy/config.yaml
+    regexp: "{{ source_kv_hostname }}"
+    replace: "{{ destination_kv_hostname }}"
+  become: yes
+  when:
+    - inventory_hostname == destination_hostname
+    - dest_caddy_config_file.stat.exists

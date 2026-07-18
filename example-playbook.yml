@@ -684,7 +684,10 @@
 
     # Fastly API configuration
     fastly_api_token: "your-fastly-api-token"
-    fastly_service_name_prefix: "fs"        # Results in fs-{hostname}.global.ssl.fastly.net
+    # Shared mode REQUIRES exactly one edge-name selector: fastly_edge_label
+    # (stable name) or fastly_edge_random (fs-{hostname} name). Asserted up front.
+    fastly_edge_random: true
+    fastly_service_name_prefix: "fs"        # Random edge = fs-{hostname}.global.ssl.fastly.net
 
     # Cloudflare for DNS (origin A/AAAA records)
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
@@ -763,6 +766,9 @@
 
     # Fastly API configuration
     fastly_api_token: "your-fastly-api-token"
+    # Shared mode REQUIRES exactly one edge-name selector (fastly_edge_label
+    # or fastly_edge_random).
+    fastly_edge_random: true
     fastly_service_name_prefix: "fs"
 
     # Cloudflare for DNS (origin A/AAAA records)
@@ -993,9 +999,11 @@
 # CHANGE MODE: Rotate hostname with Fastly CDN
 ###############################################################################
 # Rotates the hostname for a Fastly-fronted server. Handles:
-# 1. Old Fastly service cleanup
-# 2. New Fastly service creation + WebSocket enablement
-# 3. DNS updates (shared: none needed, custom: new CNAME + TLS)
+# 1. New Fastly service creation + WebSocket enablement (old service is deleted
+#    AFTER the new one is live — a stable fastly_edge_label flips this to
+#    delete-first since the name is reused)
+# 2. DNS updates (shared: none needed, custom: new CNAME + TLS)
+# 3. Old Fastly service + TLS subscription cleanup
 # 4. FCP registration update with new Fastly domain
 - name: "Change: Rotate hostname with Fastly CDN"
   hosts: fastly_shared_servers
@@ -1014,6 +1022,9 @@
         fastly_domain_mode: shared
 
     fastly_api_token: "your-fastly-api-token"
+    # Shared mode REQUIRES exactly one edge-name selector (fastly_edge_label
+    # or fastly_edge_random).
+    fastly_edge_random: true
     fastly_service_name_prefix: "fs"
 
     cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
@@ -1036,7 +1047,7 @@
 #   ansible-playbook -i hosts playbook.yml \
 #     --extra-vars "operation_mode=deploy environment_mode=prod" \
 #     --extra-vars "deploy_target_domain=example.com" \
-#     --extra-vars "outline_wss_enabled=true"
+#     --extra-vars "outline_wss_enabled=true fastly_edge_random=true"
 #
 # Deploy with Fastly custom domain:
 #   ansible-playbook -i hosts playbook.yml \

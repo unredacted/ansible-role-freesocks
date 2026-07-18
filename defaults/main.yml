@@ -231,8 +231,11 @@ fcp_max_keys: ""
 fcp_priority: ""
 # Post-registration health gate (opt-in): poll GET /api/v1/admin/status until
 # this server's slug reports healthy (needs admin:status:read on the token).
-# Bounded by fcp_verify_retries * fcp_verify_delay like the connectivity probe.
+# Bounded by fcp_status_gate_retries * fcp_status_gate_delay (default ~15 min —
+# FCP's healthcheck cron runs every ~10 min, so the gate must outwait a cycle).
 fcp_status_gate: false
+fcp_status_gate_retries: 45
+fcp_status_gate_delay: 20
 
 # Additional required variables for migration mode:
 # source_hostname: "outline1-jfk"      # Hostname of the source server

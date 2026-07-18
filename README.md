@@ -39,7 +39,8 @@ role, or the run fails (or, if you skip Remnawave Phase 0, silently issues dead 
 
 **Control plane (FCP)** — stand it up (see the FCP repo's deploy runbook), then:
 
-- Seed tiers/settings and confirm the `member` tier exists.
+- Confirm the admin API is reachable; node deploys append their per-node squads
+  to FCP's per-mode placement pools (no tier seeding needed — tier binding was removed).
 - Mint a headless automation token on the FCP host and store the printed `fsv1_…`
   value in your vault as `fcp_api_token`:
   ```sh
@@ -190,7 +191,9 @@ environment_mode: "prod"  # or "dev"
 # Operation Mode
 operation_mode: "deploy"  # deploy | migrate | change | update | bootstrap
 # bootstrap = one-time, panel-only: create the Remnawave Config Profile +
-# inbounds + squads and bind them to FCP connection profiles (no host touched).
+# inbounds (no host touched). Per-node squads are created at node deploy time;
+# the legacy panel-wide squads + FCP mode-placement binding are opt-in via
+# remnawave_bootstrap_shared_squads=true.
 
 # Cloudflare Configuration (for the DNS provider)
 cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
@@ -388,7 +391,7 @@ slipstream_resolver_backup: "77.88.8.1:53"
 
 # Version and repository
 slipstream_version: "main"
-slipstream_repo_url: "https://github.com/Mygod/slipstream-rust.git"
+slipstream_repo_url: "https://github.com/unredacted/slipstream-rust.git"
 
 # DNS listen port (default: 53)
 slipstream_dns_port: 53
@@ -562,7 +565,7 @@ remnawave_reality_fingerprint: "chrome"
 
 1. Create a long-lived API token via Panel UI → Tokens. Store as `remnawave_panel_api_token` in vault.
 2. Set `remnawave_secret_key_source: panel_api` (so the role fetches the key automatically) and/or `remnawave_panel_register_node: true` (so the role creates the panel-side node entry).
-3. When `register_node` is true, also supply `remnawave_panel_config_profile_uuid` and `remnawave_panel_active_inbounds`. The role calls `POST /api/nodes`, captures the returned UUID, and persists it locally to `/opt/remnanode/.node_uuid` for use by future change/migrate flows (which then `PATCH /api/nodes` to keep the panel in sync with the new hostname).
+3. When `register_node` is true, also supply `remnawave_panel_config_profile_uuid` (from the `bootstrap` mode output). The active inbounds are derived from `remnawave_cdn_transports[].inbound_uuid` (+ the Reality inbound when enabled). The role calls `POST /api/nodes`, captures the returned UUID, and persists it locally to `/opt/remnanode/.node_uuid` for use by future change/migrate flows (which then `PATCH /api/nodes` to keep the panel in sync with the new hostname).
 
 #### Caddy + Fastly coordination
 
@@ -802,10 +805,15 @@ ansible-playbook playbook.yml --ask-vault-pass \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `outline_enabled` | `true` | Deploy Outline Shadowsocks server (mutually exclusive with `remnawave_enabled`) |
-| `outline_wss_enabled` | `false` | Enable WebSocket transport (requires Outline) |
+| `outline_wss_enabled` | `false` | Enable WebSocket transport (requires Outline; also requires `outline_keys_port != 443`) |
 | `remnawave_enabled` | `false` | Deploy Remnawave Xray-core node (mutually exclusive with `outline_enabled`) |
 | `remnawave_panel_register_node` | `false` | Auto-register node on the Panel via `POST /api/nodes` |
 | `remnawave_caddy_enabled` | `false` | Install standalone Caddy (TLS terminator + WS proxy) — required for Fastly fronting |
+| `remnawave_reality_enabled` | `false` | VLESS+Vision+Reality direct node (no Caddy/CDN; requires `remnawave_reality_inbound_uuid` + `_sni`) |
+| `remnawave_per_node_placement` | `true` | Per-node inbound clones + squads, appended to FCP's mode pools |
+| `force_reinstall_remnawave` | `false` | Re-template compose + recreate the node container |
+| `force_wipe_remnawave` | `false` | **Destructive**: tear down placement, delete panel node + install dir |
+| `fcp_enabled` | `false` | Register the server (Outline) / panel (Remnawave, opt-in) with the control plane |
 | `slipstream_enabled` | `false` | Deploy slipstream DNS tunnel |
 | `slipstream_mode` | `shadowsocks` | `shadowsocks` (tunnel to SS) or `raw` (direct SOCKS5) |
 | `slipstream_base_domain` | **required** | Base domain for DNS (must be in domain_providers) |
@@ -853,22 +861,22 @@ outline_wss_enabled: false    # WebSocket transport (requires Outline)
 ```bash
 # Default: Outline only
 ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy deploy_target_domain=example.com"
+  --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com"
 
 # Outline + slipstream (shadowsocks mode)
 ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy deploy_target_domain=example.com" \
+  --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com" \
   --extra-vars "slipstream_enabled=true slipstream_base_domain=your-dns.com"
 
 # slipstream only (raw mode - no Outline needed)
 ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy deploy_target_domain=example.com" \
+  --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com" \
   --extra-vars "outline_enabled=false slipstream_enabled=true slipstream_mode=raw"
 ```
 
 ### Migrate Mode
 
-Migrates an existing Outline server to a new location:
+Migrates an existing Outline or Remnawave server to a new location:
 1. Verifies the source server state
 2. Verifies /opt/outline doesn't exist on destination
 3. Installs new Outline server
@@ -982,6 +990,7 @@ tasks/
 │   ├── outline.yml          # Outline server setup
 │   ├── outline_api_proxy.yml # Caddy API proxy (no-WSS path for FCP)
 │   ├── websocket.yml        # WebSocket (WSS) configuration
+│   ├── wss_paths.yml        # WSS listener path resolution (random/configured/FCP-forced)
 │   ├── docker.yml           # Docker CE install (Remnawave)
 │   ├── remnawave.yml        # Remnawave node container deployment
 │   ├── caddy.yml            # Standalone Caddy (Remnawave) + decoy
@@ -995,7 +1004,8 @@ tasks/
 │   ├── migrate.yml          # Migration orchestration
 │   ├── transfer_config.yml  # Outline config transfer
 │   ├── transfer_remnawave.yml # Remnawave config transfer
-│   └── containers.yml       # Container management
+│   ├── containers.yml       # Outline container management
+│   └── remnawave_containers.yml # Remnawave container management
 ├── update/
 │   └── remnawave_update.yml # Update mode for Remnawave hosts
 └── providers/
@@ -1010,18 +1020,19 @@ tasks/
     │   ├── delete_node.yml        # DELETE /api/nodes/{uuid}
     │   ├── create_hosts.yml       # POST /api/hosts per enabled CDN transport
     │   ├── create_reality_host.yml # POST /api/hosts for the Reality node
-    │   └── cleanup_hosts.yml      # DELETE old Hosts (by remark prefix)
+    │   ├── cleanup_hosts.yml      # DELETE old Hosts (exact remark match)
+    │   ├── gen_x25519.yml         # Reality x25519 keypair (bootstrap)
+    │   ├── create_config_profile.yml # Config Profile + inbounds (bootstrap)
+    │   ├── create_squad.yml       # Shared squads (bootstrap, legacy topology)
+    │   ├── create_node_placement.yml  # Per-node inbound clones + squads
+    │   └── teardown_node_placement.yml # Undo per-node placement
     └── fcp/                 # FreeSocks Control Plane registration (REST API)
         ├── register_server.yml          # Outline backendServers row
         ├── register_remnawave_panel.yml # Remnawave panel record
-        └── delete_server.yml            # DELETE a backendServers row by slug (migrate)
-
-templates/
-├── slipstream-server.service.j2     # slipstream systemd service
-├── remnanode-docker-compose.yml.j2  # Remnawave compose
-├── remnanode-caddyfile.j2           # Multi-transport Caddy + decoy fallback
-├── remnanode-logrotate.j2           # Remnawave log rotation
-└── decoy-index.html.j2              # Decoy/camouflage landing page
+        ├── delete_server.yml            # DELETE a backendServers row by slug
+        ├── bind_placements.yml          # PATCH per-mode squad pools
+        ├── bind_default_mode.yml        # PATCH default connection mode (opt-in)
+        └── status_gate.yml              # Post-deploy health gate (opt-in)
 ```
 
 > The `cloudflare/` provider no longer contains `install.yml` (cloudflared), `tunnel.yml`, or `kv.yml` — Cloudflare Tunnel and KV have been removed.

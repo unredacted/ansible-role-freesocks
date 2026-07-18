@@ -17,8 +17,27 @@
 #   - effective_dns_provider == 'cloudflare' (for ACME challenge DNS)
 
 # ============================================================================
-# Create TLS subscription
+# Get-or-create the TLS subscription (idempotent)
 # ============================================================================
+# A re-run after a mid-run failure must reuse the existing subscription for the
+# domain — POSTing a duplicate is rejected by Fastly and used to wedge the run.
+- name: Look up an existing TLS subscription for the domain
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions?filter[tls_domains.id]={{ fastly_websocket_domain | urlencode }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: _fastly_tls_existing
+
+- name: Reuse the existing TLS subscription id
+  set_fact:
+    fastly_tls_subscription_id: "{{ _fastly_tls_existing.json.data | map(attribute='id') | list | first }}"
+  when: _fastly_tls_existing.json.data | default([]) | length > 0
+
 - name: Create Fastly TLS subscription
   uri:
     url: "{{ fastly_api_endpoint }}/tls/subscriptions"
@@ -42,10 +61,12 @@
   delegate_to: localhost
   no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_sub_result
+  when: _fastly_tls_existing.json.data | default([]) | length == 0
 
 - name: Extract TLS subscription ID
   set_fact:
     fastly_tls_subscription_id: "{{ fastly_tls_sub_result.json.data.id }}"
+  when: _fastly_tls_existing.json.data | default([]) | length == 0
 
 - name: Debug TLS subscription creation
   debug:
@@ -100,6 +121,21 @@
   set_fact:
     cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
 
+- name: Check for an existing ACME challenge CNAME
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records?type=CNAME&name={{ fastly_acme_challenge_record.record_name }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _acme_dns_existing
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - fastly_acme_challenge_record is defined
+
 - name: Create ACME challenge CNAME record in Cloudflare
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
@@ -121,6 +157,7 @@
     - effective_dns_provider == 'cloudflare'
     - fastly_acme_challenge_record is defined
     - fastly_acme_challenge_record.values | default([]) | length > 0
+    - _acme_dns_existing.json.result | default([]) | length == 0
   register: acme_dns_result
 
 - name: Debug ACME DNS record creation

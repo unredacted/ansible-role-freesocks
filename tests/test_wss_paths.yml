@@ -1,0 +1,43 @@
+---
+# tests/test_wss_paths.yml
+#
+# Offline test for tasks/setup/wss_paths.yml — the WSS listener path resolution
+# (configured paths vs the FCP-forced /tcp+/udp override). With
+# outline_wss_random_paths=false the apt/shell tasks are skipped, so the file
+# runs against localhost with no host mutation.
+#
+# Run: ansible-playbook tests/test_wss_paths.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    outline_wss_random_paths: false
+    outline_wss_tcp_path: "/custom-tcp"
+    outline_wss_udp_path: "/custom-udp"
+    fcp_enabled: false
+  tasks:
+    - name: Case 1 — configured paths win when FCP is off
+      include_tasks: "{{ playbook_dir | dirname }}/tasks/setup/wss_paths.yml"
+
+    - name: Assert configured paths
+      assert:
+        that:
+          - effective_wss_tcp_path == "/custom-tcp"
+          - effective_wss_udp_path == "/custom-udp"
+        success_msg: "Configured WSS paths used when fcp_enabled=false."
+
+    - name: Case 2 — FCP forces /tcp + /udp
+      include_tasks: "{{ playbook_dir | dirname }}/tasks/setup/wss_paths.yml"
+      vars:
+        fcp_enabled: true
+
+    - name: Assert FCP forcing wins over configured paths
+      assert:
+        that:
+          - effective_wss_tcp_path == "/tcp"
+          - effective_wss_udp_path == "/udp"
+        success_msg: "FCP forcing overrides configured WSS paths."
+
+    - name: All WSS path tests passed
+      debug:
+        msg: "OK"

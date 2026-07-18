@@ -142,6 +142,24 @@
       {{ plan }}
   no_log: true
 
+- name: Assert every enabled transport resolved a base inbound
+  assert:
+    that:
+      - _np_unresolved | length == 0
+    fail_msg: >-
+      These enabled remnawave_cdn_transports resolved NO base inbound on the
+      panel (empty inbound_uuid, or a uuid the panel does not know):
+      {{ _np_unresolved | join(', ') }}. Continuing would silently keep the
+      node on the SHARED base inbound, defeating per-node placement. Re-run
+      operation_mode=bootstrap and reload its output vars file.
+  vars:
+    _np_unresolved: >-
+      {{ remnawave_cdn_transports | default([])
+         | selectattr('enabled')
+         | map(attribute='name') | list
+         | reject('in', _np_plan | selectattr('kind', 'equalto', 'ws') | map(attribute='transport') | list) | list }}
+  when: remnawave_caddy_enabled | default(false) | bool
+
 - name: Assert something is planned
   assert:
     that:

@@ -263,10 +263,47 @@
 # ============================================================================
 # STEP 5: Create new DNS records (provider-specific)
 # ============================================================================
-# Clean up old Fastly service before creating new one
-- name: Include Fastly cleanup tasks
-  include_tasks: ../providers/fastly/cleanup.yml
+# Fastly rotation creates the NEW service BEFORE deleting the old one, so a
+# mid-run failure leaves the OLD edge serving instead of a void. Exception: a
+# stable shared-mode fastly_edge_label reuses the SAME service name — the old
+# service must go first (the create would otherwise reuse it with a stale
+# backend) — a documented brief edge gap, self-healed by re-running.
+- name: Read the OLD Fastly service id (pre-rotation)
+  slurp:
+    src: "{{ fastly_service_id_dir }}/fastly_service_id"
+  register: _old_fastly_service_id_raw
+  become: yes
+  failed_when: false
   when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set the OLD Fastly service id fact
+  set_fact:
+    old_fastly_service_id: "{{ _old_fastly_service_id_raw.content | b64decode | trim }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_service_id_raw.content is defined
+    - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
+
+- name: Note same-name Fastly rotation (stable shared label)
+  set_fact:
+    _fastly_same_name_rotation: true
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'shared'
+    - fastly_edge_label | default('') | length > 0
+
+- name: Set the OLD Fastly edge domain for TLS cleanup (custom mode)
+  set_fact:
+    fastly_cleanup_domain: "{{ old_hostname }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Delete OLD Fastly service (same-name rotation must go first)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _fastly_same_name_rotation | default(false) | bool
 
 # Override dns_proxied when Fastly is CDN (avoid double-CDN)
 - name: Override dns_proxied for Fastly CDN (change mode)
@@ -301,6 +338,12 @@
     - effective_cdn_provider | default('none') == 'fastly'
     - effective_fastly_domain_mode | default('shared') == 'custom'
     - effective_dns_provider == 'cloudflare'
+
+- name: Delete OLD Fastly service (after the NEW one is live)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - not (_fastly_same_name_rotation | default(false) | bool)
 
 # ============================================================================
 # STEP 7: Update server hostname (internal)
@@ -422,8 +465,10 @@
     validate_certs: "{{ current_working_api_validate_certs }}"
     status_code: 200
   register: health_check
-  retries: 10
-  delay: 5
+  # Wait out fresh DNS propagation + Caddy's first Let's Encrypt issuance for
+  # the rotated domain (50s was too short and false-failed good rotations).
+  retries: 18
+  delay: 10
   until: health_check.status == 200
   no_log: true  # the apiUrl carries the Outline management secret
 
@@ -459,14 +504,20 @@
 # ============================================================================
 - name: Delete old DNS A records (Cloudflare)
   block:
+    # The OLD domain may live in a different Cloudflare account than the NEW
+    # one — resolve its own credentials (falling back to the new domain's).
+    - name: Set OLD-domain Cloudflare credentials
+      set_fact:
+        old_cf_token: "{{ domain_providers[old_domain].cloudflare_api_token | default(cf_token) }}"
+
     - name: Get existing DNS records
       uri:
         url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records?name={{ old_hostname }}"
         method: GET
         headers:
           Content-Type: "application/json"
-          Authorization: "Bearer {{ cf_token }}"
-          
+          Authorization: "Bearer {{ old_cf_token }}"
+
         status_code: 200
       delegate_to: localhost
       no_log: true  # carries the Cloudflare API token in the Authorization header
@@ -478,7 +529,7 @@
         method: DELETE
         headers:
           Content-Type: "application/json"
-          Authorization: "Bearer {{ cf_token }}"
+          Authorization: "Bearer {{ old_cf_token }}"
 
         status_code: 200
       delegate_to: localhost

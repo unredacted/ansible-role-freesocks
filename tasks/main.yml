@@ -191,6 +191,28 @@
     effective_zone_id: "{{ domain_providers[change_target_domain].zone_id }}"
   when: operation_mode == 'change'
 
+- name: Validate Cloudflare credentials (change)
+  fail:
+    msg: |
+      A Cloudflare API token is required for DNS on '{{ change_target_domain }}'.
+      Set cloudflare_api_token (vault-encrypted) or a per-domain
+      domain_providers['{{ change_target_domain }}'].cloudflare_api_token.
+      Failing here beats rotating DNS first and 403ing mid-change.
+  when:
+    - operation_mode == 'change'
+    - effective_dns_provider | default('') == 'cloudflare'
+    - (domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token | default(''))) | length == 0
+
+- name: Validate Fastly configuration (change)
+  fail:
+    msg: |
+      Fastly API token is required when cdn_provider is 'fastly'.
+      Set fastly_api_token globally or fastly_api_token in domain_providers[{{ change_target_domain }}].
+  when:
+    - operation_mode == 'change'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - domain_providers[change_target_domain].fastly_api_token | default(fastly_api_token | default('')) == ''
+
 - name: Debug configuration
   debug:
     msg:
@@ -270,6 +292,50 @@
       when:
         - remnawave_reality_enabled | default(false) | bool
         - (remnawave_caddy_enabled | default(false) | bool) or (effective_cdn_provider | default('none') == 'fastly')
+
+    - name: Validate WSS does not collide with the Shadowsocks keys port
+      fail:
+        msg: |
+          outline_wss_enabled=true requires outline_keys_port != 443 — Caddy
+          binds 443 for WSS/TLS, so the Shadowsocks keys listener must move
+          (e.g. outline_keys_port=8388).
+      when:
+        - outline_enabled | default(true) | bool
+        - outline_wss_enabled | default(false) | bool
+        - outline_keys_port | default(443) | int == 443
+
+    - name: Validate ACME email for the Caddy cert (WSS)
+      fail:
+        msg: |
+          outline_caddy_email must be set when outline_wss_enabled=true (with
+          auto-HTTPS) so Caddy can register a Let's Encrypt cert.
+      when:
+        - outline_enabled | default(true) | bool
+        - outline_wss_enabled | default(false) | bool
+        - outline_caddy_auto_https | default(true) | bool
+        - outline_caddy_email | default('') | length == 0
+
+    - name: Validate FCP credentials before any host mutation
+      fail:
+        msg: |
+          fcp_enabled=true requires fcp_api_url and fcp_api_token (an fsv1_
+          service token with admin:servers:read + admin:servers:write). Failing
+          here beats installing the server first and failing registration after.
+      when:
+        - fcp_enabled | default(false) | bool
+        - (fcp_api_url | default('') | length == 0) or (fcp_api_token | default('') | length == 0)
+
+    - name: Validate the Config Profile UUID for node registration
+      fail:
+        msg: |
+          remnawave_panel_register_node=true requires
+          remnawave_panel_config_profile_uuid (from operation_mode=bootstrap's
+          output). Failing here beats installing Docker + DNS first and failing
+          registration after.
+      when:
+        - remnawave_enabled | default(false) | bool
+        - remnawave_panel_register_node | default(false) | bool
+        - remnawave_panel_config_profile_uuid | default('') | length == 0
 
     # Check for existing installation (cross-check requested vs detected component)
     - name: Check if /opt/outline already exists
@@ -720,6 +786,16 @@
   set_fact:
     update_base_domain: "{{ slipstream_base_domain if (slipstream_enabled | default(false) | bool) else base_domain }}"
   when: operation_mode == 'update'
+
+- name: Fail if the update mode domain is not configured
+  fail:
+    msg: |
+      Update mode cannot resolve its domain: '{{ update_base_domain | default('(unset)') }}'
+      is not in domain_providers. Set base_domain (or slipstream_base_domain for
+      slipstream updates) via --extra-vars to a domain present in domain_providers.
+  when:
+    - operation_mode == 'update'
+    - update_base_domain is not defined or update_base_domain not in domain_providers
 
 - name: Set providers from domain_providers (update mode)
   set_fact:

@@ -150,9 +150,9 @@
           - _mocks.results[0].json.pools.privacy | length == 1
           - (_mocks.results[0].json.pools.evade | default([])) | length == 0
           - "'ci-panel' in _mocks.results[0].json.servers"
-          # the mock CF holds the A record the deploy created
+          # the mock CF holds the A record the deploy created (written as the FQDN)
           - _mocks.results[1].json.records | dict2items | map(attribute='value')
-            | selectattr('name', 'equalto', 'ci-real-node') | selectattr('type', 'equalto', 'A') | list | length >= 1
+            | selectattr('name', 'equalto', 'ci-real-node.ci.example.test') | selectattr('type', 'equalto', 'A') | list | length >= 1
         fail_msg: "FCP registration/placement or the DNS record is missing"
 
     - name: Real-deploy phase passed

@@ -53,70 +53,70 @@
       - "Envoy Mappings Available: {{ envoy_mappings[inventory_hostname] is defined }}"
 
 # Base domain DNS records
-- name: Add DNS A records for IPv4 addresses from envoy mappings
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      Authorization: "Bearer {{ cf_token }}"
-
-    body_format: json
-    body:
-      type: A
-      name: "{{ random_hostname }}"
-      content: "{{ item }}"
-      ttl: 1
-      proxied: "{{ dns_proxied | default(false) }}"
-    status_code: [200, 201]
-  delegate_to: localhost
-  loop: "{{ envoy_mappings[inventory_hostname].ipv4 }}"
-  when:
-    - envoy_mappings is defined
-    - envoy_mappings[inventory_hostname] is defined
-    - envoy_mappings[inventory_hostname].ipv4 is defined
-  no_log: true  # carries the Cloudflare API token in the Authorization header
-  register: dns_a_records_result
-
-- name: Debug DNS A records results
-  debug:
-    var: dns_a_records_result
-  when: dns_a_records_result is defined
-
-- name: Add DNS AAAA records for IPv6 addresses from envoy mappings
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      Authorization: "Bearer {{ cf_token }}"
-
-    body_format: json
-    body:
-      type: AAAA
-      name: "{{ random_hostname }}"
-      content: "{{ item }}"
-      ttl: 1
-      proxied: "{{ dns_proxied | default(false) }}"
-    status_code: [200, 201]
-  delegate_to: localhost
-  loop: "{{ envoy_mappings[inventory_hostname].ipv6 }}"
-  when:
-    - envoy_mappings is defined
-    - envoy_mappings[inventory_hostname] is defined
-    - envoy_mappings[inventory_hostname].ipv6 is defined
-  no_log: true  # carries the Cloudflare API token in the Authorization header
-  register: dns_aaaa_records_result
-
-- name: Debug DNS AAAA records results
-  debug:
-    var: dns_aaaa_records_result
-  when: dns_aaaa_records_result is defined
 
 # Only single-domain DNS setup is supported (base_domain)
 
-# Fallback to server's own IPs if no envoy mappings are found
-- name: Add DNS A record using server IP
+# ============================================================================
+# A/AAAA records — idempotent: GET-first, delete + recreate only on drift
+# ============================================================================
+# Names are written as the FQDN (dns_hostname) so the GET-before-write matches
+# what the API stores (Cloudflare normalizes short names to FQDN; the CI mock
+# stores verbatim). An empty desired list is treated as "leave existing alone"
+# (facts unavailable) rather than a delete signal.
+- name: Resolve desired record addresses
+  set_fact:
+    _dns_ipv4s: >-
+      {{ envoy_mappings[inventory_hostname].ipv4
+         if (envoy_mappings is defined and envoy_mappings[inventory_hostname] is defined and envoy_mappings[inventory_hostname].ipv4 is defined)
+         else ([ansible_facts['default_ipv4']['address']] if (ansible_facts['default_ipv4']['address'] is defined) else []) }}
+    _dns_ipv6s: >-
+      {{ envoy_mappings[inventory_hostname].ipv6
+         if (envoy_mappings is defined and envoy_mappings[inventory_hostname] is defined and envoy_mappings[inventory_hostname].ipv6 is defined)
+         else ([ansible_facts['default_ipv6']['address']] if (ansible_facts['default_ipv6']['address'] is defined) else []) }}
+
+- name: Get existing A records for the hostname
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records?type=A&name={{ dns_hostname }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _dns_existing_a
+
+- name: Get existing AAAA records for the hostname
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records?type=AAAA&name={{ dns_hostname }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _dns_existing_aaaa
+
+- name: Detect record drift
+  set_fact:
+    _dns_a_drift: "{{ (_dns_ipv4s | length > 0) and ((_dns_existing_a.json.result | default([]) | map(attribute='content') | list | sort) != (_dns_ipv4s | sort)) }}"
+    _dns_aaaa_drift: "{{ (_dns_ipv6s | length > 0) and ((_dns_existing_aaaa.json.result | default([]) | map(attribute='content') | list | sort) != (_dns_ipv6s | sort)) }}"
+
+- name: Delete drifted A records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _dns_existing_a.json.result | default([]) }}"
+  when: _dns_a_drift | bool
+
+- name: Create A records
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
@@ -127,24 +127,31 @@
     body_format: json
     body:
       type: A
-      name: "{{ random_hostname }}"
-      content: '{{ ansible_facts["default_ipv4"]["address"] }}'
+      name: "{{ dns_hostname }}"
+      content: "{{ item }}"
       ttl: 1
       proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
-  when:
-    - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv4 is not defined
-    - ansible_facts['default_ipv4']['address'] is defined
+  loop: "{{ _dns_ipv4s }}"
+  when: _dns_a_drift | bool
   no_log: true  # carries the Cloudflare API token in the Authorization header
-  register: fallback_dns_a_record_result
+  register: dns_a_records_result
 
-- name: Debug fallback DNS A record result
-  debug:
-    var: fallback_dns_a_record_result
-  when: fallback_dns_a_record_result is defined
+- name: Delete drifted AAAA records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _dns_existing_aaaa.json.result | default([]) }}"
+  when: _dns_aaaa_drift | bool
 
-- name: Add DNS AAAA record using server IP
+- name: Create AAAA records
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
     method: POST
@@ -155,19 +162,19 @@
     body_format: json
     body:
       type: AAAA
-      name: "{{ random_hostname }}"
-      content: '{{ ansible_facts["default_ipv6"]["address"] }}'
+      name: "{{ dns_hostname }}"
+      content: "{{ item }}"
       ttl: 1
       proxied: "{{ dns_proxied | default(false) }}"
     status_code: [200, 201]
   delegate_to: localhost
-  when:
-    - envoy_mappings is not defined or envoy_mappings[inventory_hostname] is not defined or envoy_mappings[inventory_hostname].ipv6 is not defined
-    - ansible_facts['default_ipv6']['address'] is defined
+  loop: "{{ _dns_ipv6s }}"
+  when: _dns_aaaa_drift | bool
   no_log: true  # carries the Cloudflare API token in the Authorization header
-  register: fallback_dns_aaaa_record_result
+  register: dns_aaaa_records_result
 
-- name: Debug fallback DNS AAAA record result
+- name: Debug DNS record state
   debug:
-    var: fallback_dns_aaaa_record_result
-  when: fallback_dns_aaaa_record_result is defined
+    msg:
+      - "A records for {{ dns_hostname }}: {{ 'recreated (drift)' if (_dns_a_drift | bool) else 'unchanged' }} — {{ _dns_ipv4s | join(', ') | default('none', true) }}"
+      - "AAAA records for {{ dns_hostname }}: {{ 'recreated (drift)' if (_dns_aaaa_drift | bool) else 'unchanged' }} — {{ _dns_ipv6s | join(', ') | default('none', true) }}"

@@ -187,13 +187,59 @@
     - outline_migrate_fastly_id_file.stat.exists
     - effective_cdn_provider | default('none') == 'fastly'
 
-- name: Delete OLD Fastly service (from transferred service-id file, Outline)
+# Capture the OLD service id BEFORE service.yml overwrites the id file below.
+- name: Read the OLD Fastly service id (Outline)
+  slurp:
+    src: /opt/outline/fastly_service_id
+  register: _old_fastly_service_id_raw
+  become: yes
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+
+- name: Set the OLD Fastly service id fact (Outline)
+  set_fact:
+    old_fastly_service_id: "{{ _old_fastly_service_id_raw.content | b64decode | trim }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
+
+# A stable shared-mode label reuses the SAME service name — the old service
+# must be deleted first (the create would otherwise reuse it with a stale
+# backend). Every other mode creates NEW first, so a mid-run failure leaves
+# the OLD edge serving.
+- name: Note same-name Fastly rotation (Outline migrate, stable shared label)
+  set_fact:
+    _fastly_same_name_rotation: true
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'shared'
+    - fastly_edge_label | default('') | length > 0
+
+- name: Set the OLD Fastly edge domain for TLS cleanup (Outline migrate, custom mode)
+  set_fact:
+    fastly_cleanup_domain: "{{ source_kv_hostname }}.{{ base_domain }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Delete OLD Fastly service (same-name rotation must go first, Outline)
   include_tasks: ../providers/fastly/cleanup.yml
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'outline'
     - outline_migrate_fastly_id_file.stat.exists
     - effective_cdn_provider | default('none') == 'fastly'
+    - _fastly_same_name_rotation | default(false) | bool
 
 - name: Create NEW Fastly service on the destination (Outline)
   include_tasks: ../providers/fastly/service.yml
@@ -221,6 +267,15 @@
     - effective_cdn_provider | default('none') == 'fastly'
     - effective_fastly_domain_mode | default('shared') == 'custom'
     - effective_dns_provider | default('') == 'cloudflare'
+
+- name: Delete OLD Fastly service (after the NEW one is live, Outline)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+    - effective_cdn_provider | default('none') == 'fastly'
+    - not (_fastly_same_name_rotation | default(false) | bool)
 
 # ============================================================================
 # Re-read the transferred Outline API info (destination, Outline only)
@@ -364,20 +419,59 @@
     - migrate_component == 'remnawave'
     - effective_cdn_provider | default('none') == 'fastly'
 
-- name: Clean up OLD Remnawave Hosts (source hostname)
-  include_tasks: ../providers/remnawave/cleanup_hosts.yml
+# Capture the OLD service id (transferred with the install dir) BEFORE
+# service.yml overwrites the id file below.
+- name: Read the OLD Fastly service id (Remnawave)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/fastly_service_id"
+  register: _old_fastly_service_id_raw
+  become: yes
+  failed_when: false
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_panel_register_node | default(false) | bool
-    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
+    - effective_cdn_provider | default('none') == 'fastly'
 
-- name: Delete OLD Fastly service (from transferred service-id file)
+- name: Set the OLD Fastly service id fact (Remnawave)
+  set_fact:
+    old_fastly_service_id: "{{ _old_fastly_service_id_raw.content | b64decode | trim }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_service_id_raw.content is defined
+    - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
+
+# A stable shared-mode label reuses the SAME service name — the old service
+# must be deleted first (the create would otherwise reuse it with a stale
+# backend). Every other mode creates NEW first, so a mid-run failure leaves
+# the OLD edge/Hosts serving.
+- name: Note same-name Fastly rotation (Remnawave migrate, stable shared label)
+  set_fact:
+    _fastly_same_name_rotation: true
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'shared'
+    - fastly_edge_label | default('') | length > 0
+
+- name: Set the OLD Fastly edge domain for TLS cleanup (Remnawave migrate, custom mode)
+  set_fact:
+    fastly_cleanup_domain: "{{ source_kv_hostname }}.{{ base_domain }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - effective_fastly_domain_mode | default('shared') == 'custom'
+
+- name: Delete OLD Fastly service (same-name rotation must go first)
   include_tasks: ../providers/fastly/cleanup.yml
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
     - effective_cdn_provider | default('none') == 'fastly'
+    - _fastly_same_name_rotation | default(false) | bool
 
 - name: Create NEW Fastly service on the destination
   include_tasks: ../providers/fastly/service.yml
@@ -420,3 +514,20 @@
     - migrate_component == 'remnawave'
     - remnawave_panel_register_node | default(false) | bool
     - remnawave_reality_enabled | default(false) | bool
+
+# Old objects come down only after their replacements exist.
+- name: Clean up OLD Remnawave Hosts (source hostname)
+  include_tasks: ../providers/remnawave/cleanup_hosts.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - remnawave_panel_register_node | default(false) | bool
+    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
+
+- name: Delete OLD Fastly service (after the NEW one is live)
+  include_tasks: ../providers/fastly/cleanup.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - not (_fastly_same_name_rotation | default(false) | bool)

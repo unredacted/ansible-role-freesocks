@@ -166,6 +166,21 @@
     msg: "Reusing existing Fastly service '{{ fastly_service_name }}' ({{ fastly_service_id }}); skipping create + configure."
   when: fastly_service_exists
 
+# A reused service was configured by a previous run, but ensure the WebSocket
+# products toggle is on anyway (idempotent) — an externally-created service may
+# never have had it enabled, and the return(upgrade) VCL needs it.
+- name: Ensure WebSocket passthrough on the reused Fastly service
+  uri:
+    url: "{{ fastly_api_endpoint }}/enabled-products/v1/websockets/services/{{ fastly_service_id }}"
+    method: PUT
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  when: fastly_service_exists
+
 # ============================================================================
 # Create Fastly service  (only when it does not already exist)
 # ============================================================================
