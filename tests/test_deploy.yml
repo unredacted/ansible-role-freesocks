@@ -148,10 +148,11 @@
     - name: Assert FCP registration + placement and the DNS record
       assert:
         that:
-          # Shared model: pools were bound ONCE at bootstrap; a node deploy
-          # appends nothing.
-          - _mocks.results[0].json.pools.privacy | length == 1
-          - _mocks.results[0].json.pools.evade | length == 1
+          # Shared model: a node deploy appends NOTHING to the pools (they are
+          # bound once at bootstrap; this harness restarts the mock FCP clean
+          # for the deploy phase, so both pools stay absent here).
+          - (_mocks.results[0].json.pools.privacy | default([])) | length == 0
+          - (_mocks.results[0].json.pools.evade | default([])) | length == 0
           - "'ci-panel' in _mocks.results[0].json.servers"
           # the mock CF holds the A record the deploy created (written as the FQDN)
           - _mocks.results[1].json.records | dict2items | map(attribute='value')
@@ -162,5 +163,5 @@
       debug:
         msg: >-
           Real deploy OK: full role path, node container up + panel-connected,
-          shared-model Reality Host (no per-node residue), FCP registration +
-          bound pools, mock DNS record.
+          shared-model Reality Host (no per-node residue, no pool appends),
+          FCP registration, mock DNS record.
