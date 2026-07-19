@@ -20,7 +20,6 @@
 - name: Set domain-specific Cloudflare credentials
   set_fact:
     cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
-    cf_account_id: "{{ domain_providers[change_target_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
 
 # Set Fastly credentials if CDN provider is Fastly
 - name: Set Fastly credentials for change mode
@@ -220,7 +219,7 @@
     msg:
       - "New random hostname: {{ random_hostname }}"
       - "New full DNS hostname: {{ dns_hostname }}"
-      - "New KV hostname: {{ kv_hostname }}"
+      - "New bare hostname (kv_hostname): {{ kv_hostname }}"
 
 # ============================================================================
 # STEP 4: Delete any existing DNS records for the new hostname (prevent conflicts)

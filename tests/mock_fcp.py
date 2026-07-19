@@ -16,9 +16,17 @@ production:
   PATCH  /api/v1/admin/connection-modes                 ({default} only)
   GET    /api/v1/admin/status                           (registered slugs, healthy)
   GET    /__state                                       (test hook: full mock state)
+  POST   /__mint {token, scopes}                        (test hook: register a
+                                                         restricted token)
 
 Every request must carry `Authorization: Bearer fsv1_...` or it 401s, mirroring
-resolveAdmin. Errors use FCP's {"error": {"code", "message"}} envelope.
+resolveAdmin. Each route also enforces its real FCP scope (403 auth.forbidden):
+by-slug PUT/DELETE + mode-placements need admin:servers:write; test-connection
+and node-stats need admin:servers:read; connection-modes needs
+admin:settings:write; status needs admin:status:read. Tokens registered via
+/__mint carry only their listed scopes; unregistered fsv1_ tokens get all
+scopes (backward compatible). Errors use FCP's {"error": {"code", "message"}}
+envelope.
 
 Run:  python3 tests/mock_fcp.py [port]     (default 8811)
 """
@@ -31,12 +39,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 MODE_IDS = ("evade", "privacy")
 TESTCONN_FIELDS = {"backend", "id", "baseUrl", "apiToken", "apiUrl", "websocketEnabled", "websocketDomain"}
+ALL_SCOPES = {"admin:servers:read", "admin:servers:write", "admin:settings:write", "admin:status:read"}
 
 STATE = {
     "servers": {},        # slug -> row
     "pools": {},          # modeId -> [squadUuid]
     "defaultMode": None,
     "requests": [],       # [{method, path}] audit trail for assertions
+    "tokens": {},         # token -> [scopes] (only /__mint-registered; others get ALL_SCOPES)
 }
 
 
@@ -59,10 +69,16 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("content-length") or 0)
         return json.loads(self.rfile.read(n).decode() or "{}") if n else {}
 
-    def _authed(self):
+    def _scoped(self, scope):
+        """401 without an fsv1_ bearer; 403 when the token lacks the route's scope."""
         auth = self.headers.get("authorization") or ""
         if not auth.startswith("Bearer fsv1_"):
             self._error(401, "auth.unauthenticated", "missing/invalid fsv1_ bearer token")
+            return False
+        token = auth[len("Bearer "):]
+        granted = STATE["tokens"].get(token, ALL_SCOPES)
+        if scope not in granted:
+            self._error(403, "auth.forbidden", f"token missing required scope: {scope}")
             return False
         return True
 
@@ -75,9 +91,9 @@ class Handler(BaseHTTPRequestHandler):
         self._record()
         if self.path == "/__state":
             return self._send(200, STATE)
-        if not self._authed():
-            return
         if self.path == "/api/v1/admin/status":
+            if not self._scoped("admin:status:read"):
+                return
             return self._send(200, {
                 "users": {"active": 0, "grace": 0, "disabled": 0, "deleted": 0, "inactive": 0},
                 "backendDrift": 0,
@@ -89,6 +105,8 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             })
         if self.path == "/api/v1/admin/remnawave/node-stats":
+            if not self._scoped("admin:servers:read"):
+                return
             return self._send(200, {
                 "nodes": [],
                 "placements": [{"modeId": m, "boundCount": len(STATE["pools"].get(m, []))}
@@ -98,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self._record()
-        if not self._authed():
+        if not self._scoped("admin:servers:write"):
             return
         m = re.match(r"^/api/v1/admin/backend-servers/by-slug/(.+)$", self.path)
         if not m:
@@ -134,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._record()
-        if not self._authed():
+        if not self._scoped("admin:servers:write"):
             return
         m = re.match(r"^/api/v1/admin/backend-servers/by-slug/(.+)$", self.path)
         if not m:
@@ -144,7 +162,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._record()
-        if not self._authed():
+        # Test hook (unauthenticated, like /__state): register a restricted token.
+        if self.path == "/__mint":
+            body = self._body()
+            token = body.get("token")
+            scopes = body.get("scopes")
+            if not (isinstance(token, str) and token.startswith("fsv1_") and isinstance(scopes, list)):
+                return self._error(400, "validation", "__mint needs {token: 'fsv1_...', scopes: [...]}")
+            bad = [s for s in scopes if s not in ALL_SCOPES]
+            if bad:
+                return self._error(400, "validation", f"unknown scopes: {bad}")
+            STATE["tokens"][token] = list(scopes)
+            return self._send(200, {"ok": True})
+        if not self._scoped("admin:servers:read"):
             return
         if self.path == "/api/v1/admin/backend-servers/test-connection":
             body = self._body()
@@ -160,9 +190,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         self._record()
-        if not self._authed():
-            return
         if self.path == "/api/v1/admin/remnawave/mode-placements":
+            if not self._scoped("admin:servers:write"):
+                return
             body = self._body()
             modes = body.get("modes")
             if not isinstance(modes, dict):
@@ -209,6 +239,8 @@ class Handler(BaseHTTPRequestHandler):
                                for m in MODE_IDS],
             })
         if self.path == "/api/v1/admin/connection-modes":
+            if not self._scoped("admin:settings:write"):
+                return
             body = self._body()
             default = body.get("default")
             if default is not None and default not in MODE_IDS:

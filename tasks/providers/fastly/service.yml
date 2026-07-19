@@ -271,7 +271,8 @@
 #   - TCP keepalives enabled to maintain long-lived connections
 #   - connect/first_byte timeouts tuned for TLS + WebSocket upgrade handshake
 #   - between_bytes_timeout is irrelevant (ignored for WebSocket connections)
-#   - max_conn left at default (0 = unlimited) to avoid blocking connection bursts
+#   - max_conn omitted (Fastly's default, 1000 — note 0 does NOT mean
+#     unlimited in Fastly; omitting keeps the default)
 #   - keepalive_time disabled (0) since WebSocket connections aren't pooled
 # We always use a DNS name as the origin address (not raw IP) so that:
 #   1. TLS SNI works correctly with Caddy's Let's Encrypt certificate
@@ -295,7 +296,6 @@
       override_host: "{{ dns_hostname }}"
       ssl_sni_hostname: "{{ dns_hostname }}"
       ssl_cert_hostname: "{{ dns_hostname }}"
-      max_conn: "1000"
       connect_timeout: "{{ fastly_backend_connect_timeout }}"
       first_byte_timeout: "{{ fastly_backend_first_byte_timeout }}"
       keepalive_time: "0"

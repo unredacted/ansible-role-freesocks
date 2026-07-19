@@ -84,7 +84,7 @@
     msg:
       - "Random Hostname: {{ random_hostname }}"
       - "DNS Hostname: {{ dns_hostname }}"
-      - "KV Hostname: {{ kv_hostname }}"
+      - "Bare Hostname (kv_hostname): {{ kv_hostname }}"
   when: inventory_hostname == destination_hostname
 
 # ============================================================================

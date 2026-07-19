@@ -16,7 +16,7 @@
     headers:
       Authorization: "Bearer {{ remnawave_panel_api_token }}"
       Accept: "application/json"
-    status_code: [200, 201]
+    status_code: [200]
     return_content: yes
   delegate_to: localhost
   no_log: true

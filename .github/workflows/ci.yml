@@ -7,15 +7,24 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Cheap structural checks: every YAML parses + the test playbooks pass
   # ansible's own syntax check.
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+      # Pinned: the role has known landmines on ansible-core 2.19+ lazy
+      # templating (see CLAUDE.md) and is verified against 2.21.x — don't let a
+      # floating latest break CI (or worse, pass with different templating).
       - name: Install ansible-core
-        run: pipx install ansible-core
+        run: pipx install 'ansible-core~=2.21.2'
       - name: YAML-parse every role file
         run: |
           python3 - <<'EOF'
@@ -34,25 +43,25 @@ jobs:
           EOF
       - name: Syntax-check the test playbooks
         run: |
-          ansible-playbook --syntax-check tests/test_bootstrap.yml
-          ansible-playbook --syntax-check tests/test_caddyfile_render.yml
-          ANSIBLE_ROLES_PATH="$(dirname "$PWD")" \
-            ansible-playbook --syntax-check tests/test_integration.yml
           # test_deploy.yml loads the bootstrap output via vars_files, which the
           # syntax check also resolves — provide a placeholder.
           mkdir -p /tmp/role-ci && printf 'remnawave_panel_config_profile_uuid: ""\n' > /tmp/role-ci/bootstrap-vars.yml
-          ANSIBLE_ROLES_PATH="$(dirname "$PWD")" \
-            ansible-playbook --syntax-check tests/test_deploy.yml
+          export ANSIBLE_ROLES_PATH="$(dirname "$PWD")"
+          for f in tests/test_*.yml; do
+            echo "== $f"
+            ansible-playbook --syntax-check "$f"
+          done
 
   # The self-asserting expression tests (pure filter logic, no network):
   # bootstrap/placement body building, per-node plan+clone expressions, and
   # the Caddyfile render.
   unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       - name: Install ansible-core
-        run: pipx install ansible-core
+        run: pipx install 'ansible-core~=2.21.2'
       - name: Run the offline expression tests
         run: tests/run.sh
 
@@ -71,7 +80,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install ansible-core + collections + docker SDK
         run: |
-          pipx install ansible-core
+          pipx install 'ansible-core~=2.21.2'
           pipx inject ansible-core docker requests
           ansible-galaxy collection install -r requirements.yml
       - name: Run the integration harness (incl. the real-deploy phase)

@@ -14,6 +14,13 @@ services:
     hostname: remnanode
     network_mode: host
     restart: always
+    # Container stdout logs: bounded (the xray file logs under remnawave_log_dir
+    # are covered separately by logrotate).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cap_add:
       - NET_ADMIN
     ulimits:

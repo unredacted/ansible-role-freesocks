@@ -28,4 +28,4 @@
 
 - name: Log node deletion
   debug:
-    msg: "Deleted node uuid={{ remnawave_node_uuid }} (response status: {{ remnawave_delete_response.status }})"
+    msg: "Deleted the panel node (response status: {{ remnawave_delete_response.status }})"

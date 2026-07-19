@@ -251,7 +251,7 @@
   register: slipstream_cert_raw
   become: yes
 
-- name: Store cert in fact for KV storage
+- name: Store cert in a fact for downstream consumers
   set_fact:
     slipstream_cert_pem: "{{ slipstream_cert_raw.content | b64decode }}"
 

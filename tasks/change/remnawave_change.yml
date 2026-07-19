@@ -22,7 +22,6 @@
 - name: Set domain-specific Cloudflare credentials
   set_fact:
     cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
-    cf_account_id: "{{ domain_providers[change_target_domain].cloudflare_account_id | default(cloudflare_account_id) }}"
 
 # ============================================================================
 # STEP 1: Read existing state

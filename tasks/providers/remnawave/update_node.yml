@@ -40,4 +40,4 @@
 
 - name: Log node update
   debug:
-    msg: "Updated node uuid={{ remnawave_node_uuid }} address={{ remnawave_node_address | default(dns_hostname, true) }} port={{ remnawave_node_port }}"
+    msg: "Updated the panel node address={{ remnawave_node_address | default(dns_hostname, true) }} port={{ remnawave_node_port }}"

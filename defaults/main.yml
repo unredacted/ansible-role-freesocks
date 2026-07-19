@@ -81,6 +81,10 @@ force_wipe_remnawave: false
 #     cdn_provider: fastly
 #     fastly_domain_mode: shared
 #     zone_id: "another-zone-id"
+#
+# cdn_provider accepts 'fastly' or 'none' (default). 'cloudflare' is still
+# accepted for backward compatibility but configures NO fronting by itself —
+# for orange-cloud proxying set dns_proxied: true manually.
 domain_providers: {}
 
 # Whether to delete old DNS records after hostname change

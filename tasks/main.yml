@@ -25,6 +25,17 @@
          | map(attribute='key') | list }}
   when: _undecrypted_secrets | length > 0
 
+# Same check for per-domain credentials inside domain_providers (a vault blob
+# in domain_providers[*].cloudflare_api_token / fastly_api_token surfaces only
+# later as an opaque 401 mid-run).
+- name: Fail if per-domain provider secrets are not decrypted
+  fail:
+    msg: |
+      A domain_providers entry carries an undecrypted vault blob (e.g. a
+      per-domain cloudflare_api_token or fastly_api_token).
+      Please run the playbook with --ask-vault-pass or a vault password file.
+  when: (domain_providers | default({}) | to_json) is search('\$ANSIBLE_VAULT;')
+
 # ============================================================================
 # VALIDATION: Operation Mode
 # ============================================================================
@@ -108,9 +119,21 @@
     msg: |
       Domain '{{ deploy_target_domain }}' not found in domain_providers mapping.
       Available domains: {{ domain_providers.keys() | list | join(', ') }}
-  when: 
+  when:
     - operation_mode == 'deploy'
     - deploy_target_domain not in domain_providers
+
+- name: Fail if the deploy target domain lacks dns_provider/zone_id
+  fail:
+    msg: |
+      domain_providers['{{ deploy_target_domain }}'] must define dns_provider and
+      zone_id — otherwise DNS operations fail later with an opaque templating
+      error.
+  when:
+    - operation_mode == 'deploy'
+    - deploy_target_domain in domain_providers
+    - domain_providers[deploy_target_domain].dns_provider is not defined
+      or domain_providers[deploy_target_domain].zone_id is not defined
 
 # ============================================================================
 # SETUP: Deploy Mode Configuration
@@ -178,9 +201,21 @@
     msg: |
       Domain '{{ change_target_domain }}' not found in domain_providers mapping.
       Available domains: {{ domain_providers.keys() | list | join(', ') }}
-  when: 
+  when:
     - operation_mode == 'change'
     - change_target_domain not in domain_providers
+
+- name: Fail if the change target domain lacks dns_provider/zone_id
+  fail:
+    msg: |
+      domain_providers['{{ change_target_domain }}'] must define dns_provider and
+      zone_id — otherwise DNS operations fail later with an opaque templating
+      error.
+  when:
+    - operation_mode == 'change'
+    - change_target_domain in domain_providers
+    - domain_providers[change_target_domain].dns_provider is not defined
+      or domain_providers[change_target_domain].zone_id is not defined
 
 - name: Set provider configuration for change target domain
   set_fact:
@@ -414,7 +449,7 @@
         dns_hostname: "{{ random_hostname }}.{{ base_domain }}"
       when: dns_hostname is not defined
 
-    - name: Set KV store hostname
+    - name: Set bare hostname (kv_hostname — legacy name, reused as the default FCP slug)
       set_fact:
         kv_hostname: "{{ random_hostname }}"
       when: kv_hostname is not defined
@@ -424,7 +459,7 @@
         msg:
           - "Random Hostname: {{ random_hostname }}"
           - "DNS Hostname: {{ dns_hostname }}"
-          - "KV Hostname: {{ kv_hostname }}"
+          - "Bare Hostname (kv_hostname): {{ kv_hostname }}"
           - "Components:"
           - "  - Outline: {{ outline_enabled | default(true) | bool }}"
           - "  - Remnawave: {{ remnawave_enabled | default(false) | bool }}"
@@ -896,7 +931,20 @@
       set_fact:
         random_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^.]+)', '\\1') | first | trim }}"
         dns_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^/]+)', '\\1') | first | trim | regex_replace(':[0-9]+$', '') }}"
-      when: outline_path.stat.exists
+      when:
+        - outline_path.stat.exists
+        - not (outline_api_info.apiUrl | regex_search('https://[0-9]+\.'))
+
+    # An IP-addressed apiUrl has no hostname to extract — the naive regex would
+    # pull junk facts ('1' from '1.2.3.4'). Skip and note it instead.
+    - name: Note IP-addressed Outline server (hostname facts skipped)
+      debug:
+        msg: >-
+          Outline apiUrl is IP-addressed — hostname facts not extracted.
+          DNS-dependent steps (slipstream) and FCP re-registration may not apply.
+      when:
+        - outline_path.stat.exists
+        - outline_api_info.apiUrl | regex_search('https://[0-9]+\.')
 
     # =========================================================================
     # Detect existing components (to avoid re-deploying)

@@ -36,7 +36,7 @@
     dns_hostname: "{{ random_hostname }}.{{ base_domain }}"
   when: dns_hostname is not defined
 
-- name: Set KV store hostname
+- name: Set bare hostname (kv_hostname — legacy name, reused as the default FCP slug)
   set_fact:
     kv_hostname: "{{ random_hostname }}"
   when: kv_hostname is not defined
@@ -46,7 +46,7 @@
     msg:
       - "Random Hostname: {{ random_hostname }}"
       - "DNS Hostname: {{ dns_hostname }}"
-      - "KV Hostname: {{ kv_hostname }}"
+      - "Bare Hostname (kv_hostname): {{ kv_hostname }}"
       - "Inventory Hostname: {{ inventory_hostname }}"
       - "API Endpoint: {{ cloudflare_api_endpoint }}"
       - "Zone ID: {{ domain_providers[base_domain].zone_id }}"

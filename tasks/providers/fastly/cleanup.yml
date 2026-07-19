@@ -1,13 +1,13 @@
 ---
 # tasks/providers/fastly/cleanup.yml - Clean up Fastly service
 #
-# Deletes a Fastly service when rotating hostnames or cleaning up.
-# Used during hostname changes to remove the old Fastly service
-# before creating a new one for the new hostname.
+# Deletes a Fastly service when rotating hostnames or migrating. Used during
+# hostname changes to remove the old Fastly service (before or after creating
+# the new one — the caller chooses the ordering).
 #
 # Reads the service ID from:
-#   1. {{ fastly_service_id_dir }}/fastly_service_id (local file on server)
-#   2. Existing KV data (via fastlyServiceId field)
+#   1. the caller (old_fastly_service_id fact, preferred), or
+#   2. {{ fastly_service_id_dir }}/fastly_service_id (local file on server)
 #
 # Requires:
 #   - fastly_token (set by caller)

@@ -77,9 +77,9 @@
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0
 
-- name: Log node UUID
+- name: Log node registration
   debug:
-    msg: "Registered node uuid={{ remnawave_node_uuid }} address={{ remnawave_node_address }} port={{ remnawave_node_port }}"
+    msg: "Registered node (uuid persisted to {{ remnawave_node_install_dir }}/.node_uuid) address={{ remnawave_node_address }} port={{ remnawave_node_port }}"
   when:
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0

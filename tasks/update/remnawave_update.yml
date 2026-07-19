@@ -2,8 +2,8 @@
 # tasks/update/remnawave_update.yml - Update mode tasks for Remnawave hosts.
 #
 # Triggered when update_component == 'remnawave' (set in tasks/main.yml).
-# Reads existing state from /opt/remnanode/, re-templates / recreates the
-# container if force_reinstall_remnawave is set, and re-syncs KV.
+# Reads existing state from /opt/remnanode/ and re-templates / recreates the
+# container if force_reinstall_remnawave is set.
 
 # === Read existing state ===
 - name: Stat persisted hostname file
@@ -71,8 +71,8 @@
 # === DESTRUCTIVE: force_wipe_remnawave — decommission this node entirely ===
 # Removes the panel-side node (when uuid + token known), tears down the
 # container, and deletes the install dir, then ends the play for THIS host so
-# the re-template / KV-resync / slipstream tasks below (and in main.yml) are
-# skipped. Gated on a default-false flag, so this is a no-op unless requested.
+# the re-template / slipstream tasks below (and in main.yml) are skipped.
+# Gated on a default-false flag, so this is a no-op unless requested.
 - name: Wipe Remnawave node (destructive decommission)
   when: force_wipe_remnawave | default(false) | bool
   block:

@@ -8,13 +8,15 @@
 #   1. operation_mode=bootstrap creates the Config Profile with the no-log
 #      posture + base inbounds, and sets the FCP default mode.
 #   2. Per-node placement (node 1, WS + Reality): inbound clones + squads on
-#      the panel, pool append in FCP, node registration, panel registration
-#      with maxKeys/priority + the strict test-connection probe.
+#      the panel, pool append in FCP, node registration, a PATCH /api/nodes
+#      round-trip (the change/migrate contract), panel registration with
+#      maxKeys/priority + the strict test-connection probe, and mock-FCP scope
+#      enforcement (a read-only token 403s on the by-slug PUT).
 #   3. Idempotent re-run: no duplicate inbounds/squads.
 #   4. Node 2 (WS only): a SECOND same-port inbound clone in the same profile
 #      (the duplicate-port VERIFY item) + append-only pool growth.
-#   5. Teardown (node 1): pool detach, squad delete, inbound strip — node 2
-#      untouched.
+#   5. Teardown (node 1): pool detach, squad delete, inbound strip, node
+#      DELETE /api/nodes/{uuid} — node 2 untouched.
 
 # --- shared expressions ------------------------------------------------------
 - name: Integration — phase 1 (panel bootstrap through the role)
@@ -150,9 +152,11 @@
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/fcp/bind_placements
       vars:
-        _evade_entry: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
-        _privacy_entry: "{{ {'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+        _fcp_placement_modes: >-
+          {{ ({'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
+              if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {})
+             | combine({'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
+              if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {}) }}
     - name: Derive active inbounds + register the node (as setup/remnawave.yml does)
       set_fact:
         remnawave_panel_active_inbounds: >-
@@ -163,10 +167,57 @@
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/remnawave/register_node
+
+    # PATCH /api/nodes round-trip (uuid in body, collection root) — the contract
+    # change/migrate rely on, pinned here so a panel drift breaks CI, not prod.
+    - name: PATCH node 1's address on the panel (update_node round-trip)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/update_node
+      vars:
+        remnawave_node_address: "ci-node-one-moved.example.test"
+
+    - name: Read back node 1's patched address
+      uri:
+        url: "{{ remnawave_panel_url }}/api/nodes"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t2_nodes_after_patch
+    - name: Materialize the patched node row
+      set_fact:
+        _t2_patched: >-
+          {{ ((_t2_nodes_after_patch.json.response['nodes']
+               if (_t2_nodes_after_patch.json.response is mapping and 'nodes' in _t2_nodes_after_patch.json.response)
+               else _t2_nodes_after_patch.json.response)
+             | selectattr('name', 'equalto', 'ci-node-one') | list | first) }}
+    - name: Assert the PATCH landed
+      assert:
+        that:
+          - _t2_patched.address == 'ci-node-one-moved.example.test'
+        fail_msg: "PATCH /api/nodes did not update the node address (contract drift)"
+
     - name: Register the panel with FCP (maxKeys/priority + strict probe)
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/fcp/register_remnawave_panel
+
+    # The mock FCP enforces per-route scopes like the real one — a token
+    # without admin:servers:write must 403 on the by-slug PUT.
+    - name: Mint a read-only token on the mock FCP
+      uri:
+        url: "{{ fcp_api_url }}/__mint"
+        method: POST
+        body_format: json
+        body: { token: "fsv1_ci-readonly", scopes: ["admin:servers:read"] }
+        status_code: [200]
+    - name: Assert the by-slug PUT is forbidden without admin:servers:write
+      uri:
+        url: "{{ fcp_api_url }}/api/v1/admin/backend-servers/by-slug/ci-scope-probe"
+        method: PUT
+        headers: { Authorization: "Bearer fsv1_ci-readonly", Content-Type: "application/json" }
+        body_format: json
+        body: { backend: "outline", apiUrl: "https://ci-scope-probe.example.test" }
+        status_code: [403]
     - name: Read panel nodes + mock FCP state
       uri:
         url: "{{ item }}"
@@ -274,7 +325,25 @@
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/remnawave/teardown_node_placement
-    - name: Read back profile + squads + mock FCP state
+
+    # DELETE /api/nodes/{uuid} — the force_wipe path's contract, pinned here.
+    - name: Read node 1's persisted UUID
+      slurp:
+        src: "{{ remnawave_node_install_dir }}/.node_uuid"
+      register: _t4_uuid_raw
+      failed_when: false
+    - name: Set the node UUID fact
+      set_fact:
+        remnawave_node_uuid: "{{ _t4_uuid_raw.content | b64decode | trim }}"
+      when:
+        - _t4_uuid_raw.content is defined
+        - (_t4_uuid_raw.content | b64decode | trim) | length > 0
+    - name: Delete node 1 from the panel
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/delete_node
+
+    - name: Read back profile + squads + nodes + mock FCP state
       uri:
         url: "{{ item }}"
         headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
@@ -283,12 +352,14 @@
         - "{{ remnawave_panel_url }}/api/config-profiles"
         - "{{ remnawave_panel_url }}/api/internal-squads"
         - "{{ fcp_api_url }}/__state"
+        - "{{ remnawave_panel_url }}/api/nodes"
       register: _phase4
     - name: Materialize the phase-4 panel state
       set_fact:
         _t4_tags: "{{ (_phase4.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
         _t4_squads: "{{ _phase4.results[1].json.response.internalSquads | map(attribute='name') | list }}"
         _t4_state: "{{ _phase4.results[2].json }}"
+        _t4_nodes: "{{ _phase4.results[3].json.response['nodes'] if (_phase4.results[3].json.response is mapping and 'nodes' in _phase4.results[3].json.response) else _phase4.results[3].json.response }}"
     - name: Assert node 1 fully detached and node 2 intact
       assert:
         that:
@@ -298,7 +369,8 @@
           - _t4_squads | select('equalto', 'FreeSocks-Fronted-ci-node-two') | list | length == 1
           - _t4_state.pools.evade | length == 1
           - _t4_state.pools.privacy | length == 0
+          - _t4_nodes | selectattr('name', 'equalto', 'ci-node-one') | list | length == 0
         fail_msg: "Teardown left node-1 residue or disturbed node 2"
     - name: All integration phases passed
       debug:
-        msg: "Integration OK: bootstrap, per-node placement (x2, idempotent, duplicate-port), pool append/detach, teardown."
+        msg: "Integration OK: bootstrap, per-node placement (x2, idempotent, duplicate-port), pool append/detach, node PATCH/DELETE, teardown."

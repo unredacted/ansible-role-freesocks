@@ -46,7 +46,7 @@ services:
   # Reverse proxy injecting X-Forwarded-Proto/For (the panel's ProxyCheck
   # middleware requires them) — same topology as a real deployment.
   rw-test-proxy:
-    image: caddy:2-alpine
+    image: caddy:2.10-alpine
     container_name: role-rw-test-proxy
     hostname: rw-test-proxy
     restart: 'no'
@@ -76,7 +76,7 @@ services:
       retries: 10
 
   rw-test-redis:
-    image: valkey/valkey:9-alpine
+    image: valkey/valkey:9.0-alpine
     container_name: role-rw-test-redis
     hostname: rw-test-redis
     restart: 'no'
