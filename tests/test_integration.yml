@@ -140,6 +140,21 @@
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/remnawave/register_node
 
+    # Re-run registration: the GET-first reuse path must NOT re-POST (the panel
+    # answers a duplicate POST with 400) and must resolve the SAME uuid.
+    - name: Capture the registered UUID for the reuse check
+      set_fact:
+        _t2_first_uuid: "{{ remnawave_node_uuid }}"
+    - name: Re-register node 1 (GET-first reuse — no duplicate create)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/register_node
+    - name: Assert the re-run reused the same node
+      assert:
+        that:
+          - remnawave_node_uuid == _t2_first_uuid
+        fail_msg: "Re-registering an existing node did not reuse its UUID (duplicate POST?)"
+
     # PATCH /api/nodes round-trip (uuid in body, collection root) — the contract
     # change/migrate rely on, pinned here so a panel drift breaks CI, not prod.
     - name: PATCH node 1's address on the panel (update_node round-trip)

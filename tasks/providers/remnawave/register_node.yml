@@ -7,7 +7,9 @@
 #
 # We capture the uuid into remnawave_node_uuid and persist it to
 # /opt/remnanode/.node_uuid so update/change/migrate modes can find it later
-# without re-querying the panel.
+# without re-querying the panel. Idempotent: GET-first by name — an existing
+# node is reused (its UUID captured), no POST is made (the panel answers a
+# duplicate POST with 400, not 409).
 
 - name: Validate node registration prerequisites
   assert:
@@ -28,6 +30,38 @@
       The node name is the hostname ('{{ random_hostname | default('(unset)') }}') and
       the panel caps node names at 30 chars — shorten custom_hostname /
       hostname_word_count.
+
+# Idempotent: GET first and reuse the existing node with this name (re-runs,
+# e.g. resuming a failed deploy). The panel answers a duplicate POST with 400
+# (unique constraint), NOT 409 — and a GET-first also captures the UUID, which
+# the 409 path could not. Address/config drift on an existing node is
+# change/migrate's job (update_node.yml).
+- name: List existing nodes (idempotency check)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/nodes"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rn_nodes_list
+
+- name: Materialize the existing node with this name
+  set_fact:
+    _rn_existing_node: >-
+      {{ (((_rn_nodes_list.json.response['nodes']
+            if (_rn_nodes_list.json.response is mapping and 'nodes' in _rn_nodes_list.json.response)
+            else _rn_nodes_list.json.response))
+          | selectattr('name', 'equalto', random_hostname) | list | first) | default({}, true) }}
+  no_log: true
+
+- name: Note the node already exists on the panel (reuse its UUID)
+  set_fact:
+    remnawave_node_uuid: "{{ _rn_existing_node.uuid }}"
+  when: (_rn_existing_node.uuid | default('')) | length > 0
 
 - name: Register node with Panel
   uri:
@@ -57,6 +91,7 @@
   register: remnawave_register_response
   delegate_to: localhost
   no_log: true   # request carries the panel API bearer token
+  when: (_rn_existing_node.uuid | default('')) | length == 0
 
 - name: Warn that node already exists on Panel (409)
   debug:
@@ -65,12 +100,12 @@
       Skipping UUID capture. If this is a re-deploy, run update mode instead, or
       write the node's UUID to {{ remnawave_node_install_dir }}/.node_uuid
       manually so change/migrate can PATCH the panel.
-  when: remnawave_register_response.status == 409
+  when: remnawave_register_response.status | default(0) == 409
 
 - name: Capture node UUID from registration response
   set_fact:
     remnawave_node_uuid: "{{ remnawave_register_response.json.response.uuid }}"
-  when: remnawave_register_response.status in [200, 201]
+  when: remnawave_register_response.status | default(0) in [200, 201]
 
 - name: Persist node UUID to /opt/remnanode/.node_uuid
   copy:
