@@ -58,6 +58,39 @@
     - (fastly_fronting_domains | default([]) | length + fastly_fronting_zones | default([]) | length) > 0
     - (fastly_edge_label | default('') | length > 0) or (fastly_edge_random | default(false) | bool)
 
+# --- Resume support (deploy re-runs) -----------------------------------------
+# A re-run of deploy against an already-installed node (e.g. resuming after a
+# mid-run failure via force_reinstall_remnawave=true) MUST reuse the persisted
+# identity — a fresh suffix would orphan the previous origin record and leave
+# the reused Fastly service pointing at the old origin, and fresh edge labels
+# would orphan the previous edges' subscriptions/CNAMEs. Rotation
+# (change/migrate) intentionally regenerates instead.
+- name: Set the Fastly persistence dir (component-aware)
+  set_fact:
+    _fastly_persist_dir: "{{ '/opt/outline' if (outline_enabled | default(true) | bool) else (remnawave_node_install_dir | default('/opt/remnanode')) }}"
+
+- name: Read the persisted origin FQDN (deploy re-runs)
+  slurp:
+    src: "{{ _fastly_persist_dir }}/fastly_origin_fqdn"
+  register: _persisted_origin_raw
+  failed_when: false
+  when:
+    - operation_mode | default('deploy') == 'deploy'
+    - fastly_origin_suffix is not defined
+
+- name: Materialize the persisted origin FQDN
+  set_fact:
+    _persisted_origin: "{{ (_persisted_origin_raw.content | b64decode | trim) if (_persisted_origin_raw.content is defined) else '' }}"
+  when: operation_mode | default('deploy') == 'deploy'
+
+- name: Reuse the persisted origin suffix when it belongs to this hostname
+  set_fact:
+    fastly_origin_suffix: "{{ _persisted_origin | regex_replace('^' ~ (random_hostname | regex_escape) ~ '-', '') | regex_replace('\\.' ~ (base_domain | regex_escape) ~ '$', '') }}"
+  when:
+    - operation_mode | default('deploy') == 'deploy'
+    - fastly_origin_suffix is not defined
+    - _persisted_origin is search('^' ~ (random_hostname | regex_escape) ~ '-[a-z0-9]{8}\\.' ~ (base_domain | regex_escape) ~ '$')
+
 - name: Generate the Fastly origin suffix (8 lowercase alnum)
   set_fact:
     fastly_origin_suffix: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_lowercase', 'digits'], length=8) }}"
@@ -142,6 +175,21 @@
     - fastly_fronting_zones | default([]) | length > 0
     - fastly_fronting_labels is not defined
 
+- name: Read the persisted generated edges (deploy re-runs)
+  slurp:
+    src: "{{ _fastly_persist_dir }}/fastly_edge_domains"
+  register: _persisted_edges_raw
+  failed_when: false
+  when:
+    - operation_mode | default('deploy') == 'deploy'
+    - fastly_fronting_zones | default([]) | length > 0
+    - fastly_fronting_labels is not defined
+
+- name: Materialize the persisted edge list
+  set_fact:
+    _persisted_edges: "{{ ((_persisted_edges_raw.content | default('') | b64decode) if (_persisted_edges_raw.content is defined) else '') | split('\n') | select('string') | reject('equalto', '') | list }}"
+  when: operation_mode | default('deploy') == 'deploy'
+
 - name: Draw words for the edge labels
   shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ (fastly_fronting_zones | length) * (fastly_fronting_label_words | default(2) | int) }}'
   register: _fastly_edge_words
@@ -150,9 +198,25 @@
     - fastly_fronting_zones | default([]) | length > 0
     - fastly_fronting_labels is not defined
 
+# Per zone: reuse the persisted edge's label when one exists for that zone
+# (idempotent deploy re-runs), else take a fresh word-pair (rotation / first
+# deploy / newly added zone).
 - name: Build the edge labels (one per fronting zone)
   set_fact:
-    fastly_fronting_labels: "{{ _fastly_edge_words.stdout_lines | default([]) | batch(fastly_fronting_label_words | default(2) | int) | map('join', '-') | list }}"
+    fastly_fronting_labels: >-
+      {%- set labels = [] -%}
+      {%- set fresh = _fastly_edge_words.stdout_lines | default([])
+           | batch(fastly_fronting_label_words | default(2) | int) | map('join', '-') | list -%}
+      {%- for z in fastly_fronting_zones -%}
+        {%- set match = _persisted_edges | default([])
+             | select('search', '\\.' ~ (z | regex_escape) ~ '$') | list | first | default('') -%}
+        {%- if match | length > 0 -%}
+          {%- set _ = labels.append(match | regex_replace('\\.' ~ (z | regex_escape) ~ '$', '')) -%}
+        {%- else -%}
+          {%- set _ = labels.append(fresh[loop.index0] | default('')) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ labels }}
   when:
     - fastly_fronting_zones | default([]) | length > 0
     - fastly_fronting_labels is not defined

@@ -338,6 +338,59 @@
       debug:
         msg: "All origin-identity tests passed."
 
+# --- 7b. resume support: persisted suffix + edge-label reuse expressions --------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "xray1-front-mci1-fs-ce"
+    base_domain: "freesocks.org"
+    _fresh: ["mild-stone", "cold-brook", "dry-creek"]
+    _zones: ["quick-cdn.net", "video-streams.org", "static.net"]
+  pre_tasks:
+    - name: Re-establish this play's state (earlier plays leak these facts)
+      set_fact:
+        _persisted_origin: "xray1-front-mci1-fs-ce-pck0p16d.freesocks.org"
+        _persisted_edges: ["quiet-river.quick-cdn.net", "amber-field.video-streams.org"]
+  tasks:
+    - name: Suffix extraction from the persisted origin FQDN
+      vars:
+        _suffix: "{{ _persisted_origin | regex_replace('^' ~ (random_hostname | regex_escape) ~ '-', '') | regex_replace('\\.' ~ (base_domain | regex_escape) ~ '$', '') }}"
+      assert:
+        that:
+          - _suffix == 'pck0p16d'
+        success_msg: "persisted origin -> suffix pck0p16d."
+
+    - name: The reuse predicate accepts this hostname and rejects others
+      assert:
+        that:
+          - _persisted_origin is search('^' ~ (random_hostname | regex_escape) ~ '-[a-z0-9]{8}\\.' ~ (base_domain | regex_escape) ~ '$')
+          - ('other-host-pck0p16d.freesocks.org' is not search('^' ~ (random_hostname | regex_escape) ~ '-[a-z0-9]{8}\\.' ~ (base_domain | regex_escape) ~ '$'))
+          - ('xray1-front-mci1-fs-ce-pck0p16d.example.com' is not search('^' ~ (random_hostname | regex_escape) ~ '-[a-z0-9]{8}\\.' ~ (base_domain | regex_escape) ~ '$'))
+        success_msg: "reuse predicate: own hostname+zone only."
+
+    - name: Per-zone label preference (persisted match wins, else fresh)
+      vars:
+        _labels: >-
+          {%- set labels = [] -%}
+          {%- for z in _zones -%}
+            {%- set match = _persisted_edges | select('search', '\\.' ~ (z | regex_escape) ~ '$') | list | first | default('') -%}
+            {%- if match | length > 0 -%}
+              {%- set _ = labels.append(match | regex_replace('\\.' ~ (z | regex_escape) ~ '$', '')) -%}
+            {%- else -%}
+              {%- set _ = labels.append(_fresh[loop.index0] | default('')) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ labels }}
+      assert:
+        that:
+          - _labels == ['quiet-river', 'amber-field', 'dry-creek']
+        success_msg: "persisted labels reused per zone; new zone gets a fresh label."
+
+    - name: All resume-support tests passed
+      debug:
+        msg: "All resume-support tests passed."
+
 # --- 8. dns_edge classification semantics (idempotent, non-destructive) --------
 - hosts: localhost
   connection: local
