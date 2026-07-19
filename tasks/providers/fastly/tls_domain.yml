@@ -66,6 +66,9 @@
 # ============================================================================
 # Get TLS subscription details (includes ACME challenge info)
 # ============================================================================
+# The authorization can take a moment to populate challenges after creation —
+# retry until a DNS-01 challenge appears. Fastly renamed the DNS-01 challenge
+# type to 'managed-dns' (2025; legacy name 'dns-01') — accept both.
 - name: Get TLS subscription details ({{ _tls_job.domain }})
   uri:
     url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ fastly_tls_subscription_id }}?include=tls_authorizations"
@@ -77,15 +80,34 @@
   delegate_to: localhost
   no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_details
+  retries: 6
+  delay: 10
+  until: >-
+    ((fastly_tls_details.json.included | default([])
+      | selectattr('type', 'equalto', 'tls_authorization') | list | first | default({}))
+     .attributes.challenges | default([])
+     | selectattr('type', 'in', ['dns-01', 'managed-dns']) | list | length) > 0
 
 - name: Extract ACME challenge info ({{ _tls_job.domain }})
   set_fact:
     fastly_tls_challenges: "{{ fastly_tls_details.json.included | selectattr('type', 'equalto', 'tls_authorization') | list }}"
 
+- name: Fail if Fastly offered no DNS-01 challenge ({{ _tls_job.domain }})
+  fail:
+    msg: >-
+      Fastly offered no DNS-01 challenge for {{ _tls_job.domain }} (challenges
+      present: {{ (fastly_tls_challenges | first | default({})).attributes.challenges
+      | default([]) | map(attribute='type') | join(', ') | default('none', true) }}).
+      The role expects 'managed-dns' (or legacy 'dns-01') — check the TLS
+      subscription state in the Fastly dashboard.
+  when: >-
+    (fastly_tls_challenges | length == 0) or
+    (((fastly_tls_challenges | first).attributes.challenges | default([])
+      | selectattr('type', 'in', ['dns-01', 'managed-dns']) | list | length) == 0)
+
 - name: Extract ACME challenge record name and values ({{ _tls_job.domain }})
   set_fact:
-    fastly_acme_challenge_record: "{{ fastly_tls_challenges[0].attributes.challenges | selectattr('type', 'equalto', 'dns-01') | first }}"
-  when: fastly_tls_challenges | length > 0
+    fastly_acme_challenge_record: "{{ (fastly_tls_challenges | first).attributes.challenges | selectattr('type', 'in', ['dns-01', 'managed-dns']) | first }}"
 
 # Set per-zone Cloudflare credentials for the ACME record (the fronting zone
 # may live in a different Cloudflare account than base_domain).
@@ -149,8 +171,16 @@
   retries: 30
   delay: 10
   until: >
-    fastly_tls_status.json.data.attributes.state == 'issued' or
-    fastly_tls_status.json.data.attributes.state == 'renewing'
+    fastly_tls_status.json.data.attributes.state in ['issued', 'renewing', 'failed']
+
+- name: Fail if the TLS subscription entered the failed state ({{ _tls_job.domain }})
+  fail:
+    msg: >-
+      Fastly's TLS subscription for {{ _tls_job.domain }} entered the 'failed'
+      state — domain ownership validation did not pass (check that the
+      _acme-challenge CNAME in the {{ _tls_job.zone }} zone is live and
+      unproxied, then retry the subscription in the Fastly dashboard or re-run).
+  when: fastly_tls_status.json.data.attributes.state == 'failed'
 
 # ============================================================================
 # Extract CNAME target for DNS routing
