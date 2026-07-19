@@ -273,35 +273,75 @@
 # Add domain(s) to service
 # ============================================================================
 # Fronting mode attaches EVERY fronting domain (clients fail over between
-# them); shared/legacy-custom attach the single edge name.
+# them); shared/legacy-custom attach the single edge name. Uses the modern
+# Domain Management API (/domain-management/v1/domains — unversioned domain
+# objects, shown as "Domain Management domains" in the dashboard) rather than
+# the legacy versioned service-domain attach ("Classic domains"). Idempotent:
+# an edge already attached EITHER way (Domain Management object OR classic
+# versioned attach) is skipped, so a reused service gains any missing edge
+# without disturbing existing ones.
 - name: Compute the domains to attach to the service
   set_fact:
     _fastly_domains_to_attach: "{{ fastly_fronting_edges | default([]) | map(attribute='fqdn') | list if (fastly_fronting_edges | default([]) | length > 0) else [fastly_websocket_domain] }}"
 
-- name: Add domain to Fastly service
+- name: List Domain Management domains already linked to this service
+  uri:
+    url: "{{ fastly_api_endpoint }}/domain-management/v1/domains?service_id={{ fastly_service_id }}&limit=100"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: _fastly_dm_domains
+
+- name: List the classic (versioned) domains already attached to this service
   uri:
     url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/domain"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/json"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: _fastly_classic_domains
+
+- name: Compute the edges missing from the service (either attach style)
+  set_fact:
+    _fastly_domains_missing: >-
+      {{ _fastly_domains_to_attach
+         | difference(
+             ((_fastly_dm_domains.json.data | default(_fastly_dm_domains.json.domains)) | default([]) | map(attribute='fqdn') | list)
+             + ((_fastly_classic_domains.json | default([])) | map(attribute='name') | list)) }}
+
+- name: Attach the missing domains (Domain Management API)
+  uri:
+    url: "{{ fastly_api_endpoint }}/domain-management/v1/domains"
     method: POST
     headers:
       Fastly-Key: "{{ fastly_token }}"
-      Content-Type: "application/x-www-form-urlencoded"
+      Content-Type: "application/json"
       Accept: "application/json"
-    body_format: form-urlencoded
+    body_format: json
     body:
-      name: "{{ item }}"
+      fqdn: "{{ item }}"
+      service_id: "{{ fastly_service_id }}"
+      description: "FreeSocks node {{ random_hostname }}"
     status_code: [200, 201]
   delegate_to: localhost
   no_log: true  # carries the Fastly API token in the Fastly-Key header
-  register: fastly_domain_result
-  loop: "{{ _fastly_domains_to_attach }}"
+  loop: "{{ _fastly_domains_missing }}"
   loop_control:
     label: "{{ item }}"
-  when: not fastly_service_exists
 
-- name: Debug Fastly domain addition
+- name: Debug Fastly domain attachment
   debug:
-    msg: "Domains {{ _fastly_domains_to_attach | join(', ') }} added to Fastly service"
-  when: not fastly_service_exists
+    msg: >-
+      Domains on service {{ fastly_service_name }}: {{ _fastly_domains_to_attach | join(', ') }}
+      ({{ _fastly_domains_missing | length }} newly attached via Domain Management,
+      {{ (_fastly_domains_to_attach | length) - (_fastly_domains_missing | length) }} already present)
 
 # ============================================================================
 # Add backend (origin server)

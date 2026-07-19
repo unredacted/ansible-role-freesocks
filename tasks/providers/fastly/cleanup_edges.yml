@@ -125,6 +125,34 @@
       loop: "{{ _old_edge_tls.json.data | default([]) }}"
       loop_control:
         label: "{{ item.id }}"
+
+    # Domain Management objects are independent of the service (unlike classic
+    # versioned domains, which die with it) — delete the old edge's object too.
+    - name: Look up the old edge's Domain Management object
+      uri:
+        url: "{{ fastly_api_endpoint }}/domain-management/v1/domains?fqdn={{ _edge.domain | urlencode }}&limit=10"
+        method: GET
+        headers:
+          Fastly-Key: "{{ fastly_token }}"
+          Accept: "application/json"
+        status_code: 200
+      delegate_to: localhost
+      no_log: true  # carries the Fastly API token in the Fastly-Key header
+      register: _old_edge_dm
+
+    - name: Delete the old edge's Domain Management object
+      uri:
+        url: "{{ fastly_api_endpoint }}/domain-management/v1/domains/{{ item.id }}"
+        method: DELETE
+        headers:
+          Fastly-Key: "{{ fastly_token }}"
+          Accept: "application/json"
+        status_code: [200, 204, 404]
+      delegate_to: localhost
+      no_log: true  # carries the Fastly API token in the Fastly-Key header
+      loop: "{{ (_old_edge_dm.json.data | default(_old_edge_dm.json.domains)) | default([]) }}"
+      loop_control:
+        label: "{{ item.fqdn | default(item.id) }}"
   loop: "{{ _old_edge_jobs | default([]) | rejectattr('zone', 'equalto', '') | list }}"
   loop_control:
     loop_var: _edge
