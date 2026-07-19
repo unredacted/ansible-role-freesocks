@@ -37,6 +37,23 @@
     base_domain: "{{ (existing_hostname_raw.content | b64decode | trim).split('.')[1:] | join('.') }}"
   when: hostname_file_stat.stat.exists
 
+# .hostname may hold the suffixed Fastly origin FQDN — the CLEAN node name
+# lives in .node_name (pre-persistence deploys fall back to the derived value).
+- name: Read the persisted clean node name (if present)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.node_name"
+  register: existing_node_name_raw
+  become: yes
+  failed_when: false
+
+- name: Prefer the persisted clean node name
+  set_fact:
+    random_hostname: "{{ existing_node_name_raw.content | b64decode | trim }}"
+    kv_hostname: "{{ existing_node_name_raw.content | b64decode | trim }}"
+  when:
+    - existing_node_name_raw.content is defined
+    - (existing_node_name_raw.content | b64decode | trim) | length > 0
+
 - name: Set hostname facts from dns_hostname override (no .hostname file)
   set_fact:
     random_hostname: "{{ dns_hostname.split('.')[0] }}"
@@ -84,16 +101,40 @@
           {{ remnawave_node_uuid | default('(unknown)') }} from
           {{ remnawave_panel_url | default('(no panel url)') }}.
 
-    # Tear down the per-node placement FIRST: detaches this node's squad(s)
-    # from FCP's mode pools (so issuance stops homing NEW keys to this dying
-    # node), then deletes the per-node squads and strips the cloned inbounds.
+    # Legacy per-node placement only: detach this node's squad(s) from FCP's
+    # mode pools, delete the per-node squads and strip the cloned inbounds.
+    # Default model has no per-node squads — the shared squads/pools stay.
     # Reads .squad_uuids from the install dir (still present here) with a panel
     # name fallback. Must run before delete_node and the dir removal below.
     - name: Tear down the per-node placement (FCP pool detach + squad/inbound cleanup)
       include_tasks: ../providers/remnawave/teardown_node_placement.yml
       when:
-        - remnawave_per_node_placement | default(true) | bool
+        - remnawave_per_node_placement | default(false) | bool
         - remnawave_panel_api_token | default('') | length > 0
+
+    - name: Warn that per-node placement teardown is skipped (no panel token)
+      debug:
+        msg: >-
+          Skipped per-node placement teardown — remnawave_panel_api_token is
+          empty. This node's squads and their FCP mode-pool entries are LEFT
+          pointing at a dead node. Re-run with the panel token, or detach the
+          squads from FCP (mode-placements removeSquadUuids) and delete them in
+          the Panel UI manually.
+      when:
+        - remnawave_per_node_placement | default(false) | bool
+        - remnawave_panel_api_token | default('') | length == 0
+
+    # Remove this node's Hosts from the panel. Hosts bind the SHARED base
+    # inbounds to this node's edge/origin address — leaving them behind means
+    # subscriptions keep offering a dead node's endpoint to every user.
+    - name: Set the hostname fact for Host cleanup
+      set_fact:
+        old_random_hostname: "{{ random_hostname }}"
+      when: remnawave_panel_api_token | default('') | length > 0
+
+    - name: Delete this node's Remnawave Hosts
+      include_tasks: ../providers/remnawave/cleanup_hosts.yml
+      when: remnawave_panel_api_token | default('') | length > 0
 
     - name: Delete node on Panel (when uuid + token known)
       include_tasks: ../providers/remnawave/delete_node.yml
@@ -174,6 +215,7 @@
     mode: '0640'
   become: yes
   register: compose_template_update
+  no_log: true  # the rendered compose carries the panel-wide SECRET_KEY
   when: force_reinstall_remnawave | default(false) | bool
 
 - name: Pull image (force)

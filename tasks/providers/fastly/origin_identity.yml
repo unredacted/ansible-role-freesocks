@@ -1,0 +1,127 @@
+---
+# tasks/providers/fastly/origin_identity.yml
+#
+# Derive the per-node Fastly origin identity once per deploy/change/migrate:
+#   fastly_origin_suffix   8-char [a-z0-9] random (fresh per rotation)
+#   fastly_origin_name     <hostname>-<suffix>
+#   fastly_origin_fqdn     <hostname>-<suffix>.<base_domain>
+#
+# Why: the origin A record is the ONLY DNS name that points at the node, so it
+# must be unguessable — passive-DNS / zone enumeration of base_domain would
+# otherwise map every node hostname to its origin IP. The suffix is persisted
+# (fastly_service_id_dir/fastly_origin_fqdn) so rotation can delete the old
+# origin record.
+#
+# dns_hostname shape by mode:
+#   * shared + fronting-domains: dns_hostname BECOMES the origin FQDN — the
+#     only A record is the suffixed origin (Caddy cert, Fastly SNI, panel
+#     node address, FCP apiUrl all follow). Fronting domains imply the custom
+#     flow (TLS subscription + edge CNAME per domain).
+#   * legacy same-domain custom: dns_hostname stays the clean client-facing
+#     name (CNAME to the edge + Caddy cert); the origin record is written
+#     separately by fastly/dns.yml.
+#
+# Also validates the edge-selector schemes (exactly one of: shared label /
+# shared random / fronting domains) and resolves each fronting domain's DNS
+# zone (longest-suffix match into domain_providers).
+#
+# Requires: random_hostname, base_domain, effective_cdn_provider,
+#           effective_fastly_domain_mode (domain_providers-derived).
+
+- name: Capture the declared Fastly domain mode
+  set_fact:
+    _fastly_declared_mode: "{{ effective_fastly_domain_mode | default('shared') }}"
+
+- name: Assert fronting domains are not mixed with legacy same-domain custom mode
+  fail:
+    msg: >-
+      fastly_fronting_domains and fastly_domain_mode: custom (same-domain) are
+      alternative client-edge schemes — set only one. (fronting domains already
+      imply the custom TLS + edge-CNAME flow, with the edge decoupled from the
+      origin zone.)
+  when:
+    - fastly_fronting_domains | default([]) | length > 0
+    - _fastly_declared_mode == 'custom'
+
+- name: Assert the edge selectors are mutually exclusive with fronting domains
+  fail:
+    msg: >-
+      fastly_fronting_domains is set alongside fastly_edge_label /
+      fastly_edge_random — pick ONE client-edge scheme (shared label, shared
+      random, or fronting domains).
+  when:
+    - fastly_fronting_domains | default([]) | length > 0
+    - (fastly_edge_label | default('') | length > 0) or (fastly_edge_random | default(false) | bool)
+
+- name: Generate the Fastly origin suffix (8 lowercase alnum)
+  set_fact:
+    fastly_origin_suffix: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_lowercase', 'digits'], length=8) }}"
+  when: fastly_origin_suffix is not defined
+
+- name: Derive the Fastly origin identity
+  set_fact:
+    fastly_origin_name: "{{ random_hostname }}-{{ fastly_origin_suffix }}"
+    fastly_origin_fqdn: "{{ random_hostname }}-{{ fastly_origin_suffix }}.{{ base_domain }}"
+
+- name: Fronting domains imply the custom flow
+  set_fact:
+    effective_fastly_domain_mode: "custom"
+  when: fastly_fronting_domains | default([]) | length > 0
+
+# In shared + fronting modes the node has exactly ONE public DNS name — the
+# suffixed origin. Nothing is written for the clean hostname, so a censor
+# enumerating the zone learns nothing about which hostnames exist.
+- name: dns_hostname becomes the origin FQDN (shared + fronting modes)
+  set_fact:
+    dns_hostname: "{{ fastly_origin_fqdn }}"
+  when:
+    - effective_fastly_domain_mode | default('shared') == 'shared'
+      or (fastly_fronting_domains | default([]) | length > 0)
+
+# --- Fronting-domain zone resolution ----------------------------------------
+- name: Resolve each fronting domain's DNS zone (longest-suffix match)
+  set_fact:
+    fastly_fronting_zones: >-
+      {%- set out = {} -%}
+      {%- for d in fastly_fronting_domains | default([]) -%}
+        {%- set ns = namespace(best='') -%}
+        {%- for k in domain_providers | default({}) -%}
+          {%- if (d == k or d.endswith('.' ~ k)) and (k | length > ns.best | length) -%}
+            {%- set ns.best = k -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set _ = out.update({d: ns.best}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: fastly_fronting_domains | default([]) | length > 0
+
+- name: Fail if a fronting domain has no domain_providers zone
+  fail:
+    msg: >-
+      fastly_fronting_domains entry '{{ item.key }}' is not covered by any
+      domain_providers zone. Add its registrable zone (with zone_id + optional
+      cloudflare_api_token) — the edge CNAME and ACME challenge records are
+      written there.
+  loop: "{{ fastly_fronting_zones | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value | length == 0
+
+- name: Fail if a fronting zone is not Cloudflare-managed
+  fail:
+    msg: >-
+      Fronting zone '{{ item.value }}' (covering '{{ item.key }}') has
+      dns_provider '{{ domain_providers[item.value].dns_provider | default('cloudflare') }}'
+      — only 'cloudflare' is supported for edge CNAME / ACME challenge records.
+  loop: "{{ fastly_fronting_zones | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} -> {{ item.value }}"
+  when: domain_providers[item.value].dns_provider | default('cloudflare') != 'cloudflare'
+
+- name: Debug the origin identity
+  debug:
+    msg:
+      - "Fastly origin: {{ fastly_origin_fqdn }} (suffix {{ fastly_origin_suffix }})"
+      - "dns_hostname: {{ dns_hostname }}"
+      - "Domain mode: {{ effective_fastly_domain_mode }} (declared {{ _fastly_declared_mode }})"
+      - "Fronting domains: {{ fastly_fronting_domains | default([]) | join(', ') | default('(none)', true) }}"

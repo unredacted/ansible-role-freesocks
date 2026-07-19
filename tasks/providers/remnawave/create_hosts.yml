@@ -25,11 +25,20 @@
       The Host address is the Fastly edge domain when fronted, else dns_hostname.
   no_log: true
 
-# Fastly-fronted deploys advertise the Fastly edge domain; direct (non-Fastly)
+# Fastly-fronted deploys advertise the Fastly edge domain(s); direct (non-Fastly)
 # deploys advertise the origin dns_hostname (Caddy terminates a real LE cert there).
 - name: Resolve the client-facing Host address
   set_fact:
     _remnawave_host_address: "{{ fastly_websocket_domain | default(dns_hostname, true) }}"
+
+# Fronting mode creates one Host per transport x fronting domain (subscriptions
+# then carry every edge -> client failover). With MORE THAN ONE edge domain the
+# remark gains a deterministic 6-hex domain suffix (sha256) so the Hosts stay
+# distinguishable + idempotent — the panel caps remarks at 40 chars, and
+# <hostname>-<transport>-<h6> fits a 26-char hostname with room to spare.
+- name: Compute the Host edge domains
+  set_fact:
+    _host_edge_domains: "{{ fastly_fronting_domains | default([]) if (fastly_fronting_domains | default([]) | length > 0) else [_remnawave_host_address] }}"
 
 - name: List existing Remnawave Hosts
   uri:
@@ -52,7 +61,7 @@
   set_fact:
     _existing_host_remarks: "{{ _remnawave_hosts | map(attribute='remark') | list }}"
 
-- name: Create a Remnawave Host per enabled CDN transport
+- name: Create a Remnawave Host per enabled CDN transport (x edge domain)
   uri:
     url: "{{ remnawave_panel_url }}/api/hosts"
     method: POST
@@ -64,32 +73,32 @@
     body:
       inbound:
         configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
-        configProfileInboundUuid: "{{ item.inbound_uuid }}"
-      remark: "{{ random_hostname }}-{{ item.name }}"
-      address: "{{ _remnawave_host_address }}"
+        configProfileInboundUuid: "{{ item.0.inbound_uuid }}"
+      remark: "{{ random_hostname }}-{{ item.0.name }}{{ ('-' ~ (item.1 | hash('sha256') | truncate(6, true, ''))) if (_host_edge_domains | length > 1) else '' }}"
+      address: "{{ item.1 }}"
       port: 443
-      path: "{{ item.path }}"
-      sni: "{{ _remnawave_host_address }}"
-      host: "{{ _remnawave_host_address }}"
-      alpn: "{{ item.alpn | default('http/1.1') }}"
-      fingerprint: "{{ item.fingerprint | default('chrome') }}"
+      path: "{{ item.0.path }}"
+      sni: "{{ item.1 }}"
+      host: "{{ item.1 }}"
+      alpn: "{{ item.0.alpn | default('http/1.1') }}"
+      fingerprint: "{{ item.0.fingerprint | default('chrome') }}"
       securityLayer: "TLS"
     status_code: [200, 201, 409]
     return_content: yes
   delegate_to: localhost
   no_log: true
   register: remnawave_host_results
-  loop: "{{ remnawave_cdn_transports }}"
+  loop: "{{ remnawave_cdn_transports | default([]) | product(_host_edge_domains) | list }}"
   loop_control:
-    label: "{{ item.name }}"
+    label: "{{ item.0.name }} @ {{ item.1 }}"
   when:
-    - item.enabled | default(true) | bool
-    - item.inbound_uuid | default('') | length > 0
-    - (random_hostname ~ '-' ~ item.name) not in _existing_host_remarks
+    - item.0.enabled | default(true) | bool
+    - item.0.inbound_uuid | default('') | length > 0
+    - (random_hostname ~ '-' ~ item.0.name ~ (('-' ~ (item.1 | hash('sha256') | truncate(6, true, ''))) if (_host_edge_domains | length > 1) else '')) not in _existing_host_remarks
 
 - name: Summarize Host creation
   debug:
     msg: >-
       Remnawave Hosts ensured for enabled transports
-      [{{ remnawave_cdn_transports | selectattr('enabled') | map(attribute='name') | join(', ') }}]
-      at {{ _remnawave_host_address }} (remark prefix '{{ random_hostname }}-').
+      [{{ remnawave_cdn_transports | rejectattr('enabled', 'equalto', false) | map(attribute='name') | join(', ') }}]
+      at {{ _host_edge_domains | join(', ') }} (remark prefix '{{ random_hostname }}-').

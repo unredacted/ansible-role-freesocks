@@ -21,7 +21,7 @@
 # ============================================================================
 - name: Set domain-specific Cloudflare credentials
   set_fact:
-    cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+    cf_token: "{{ domain_providers[change_target_domain].cloudflare_api_token | default(cloudflare_api_token | default('')) }}"
 
 # ============================================================================
 # STEP 1: Read existing state
@@ -55,6 +55,24 @@
     old_random_hostname: "{{ (old_hostname_raw.content | b64decode | trim).split('.')[0] }}"
     old_base_domain: "{{ (old_hostname_raw.content | b64decode | trim).split('.')[1:] | join('.') }}"
   when: old_hostname_file_stat.stat.exists
+
+# .hostname may hold the suffixed Fastly origin FQDN — the CLEAN node name
+# (Host remarks, squad names, FCP slug) lives in .node_name. Fall back to the
+# .hostname-derived value for pre-persistence deploys (whose .hostname was the
+# clean FQDN anyway).
+- name: Read OLD clean node name (if persisted)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.node_name"
+  register: old_node_name_raw
+  become: yes
+  failed_when: false
+
+- name: Prefer the persisted clean node name
+  set_fact:
+    old_random_hostname: "{{ old_node_name_raw.content | b64decode | trim }}"
+  when:
+    - old_node_name_raw.content is defined
+    - (old_node_name_raw.content | b64decode | trim) | length > 0
 
 - name: Set OLD hostname facts (from old_dns_hostname override)
   set_fact:
@@ -121,6 +139,13 @@
     api_domain: "{{ change_target_domain }}"
     prom_domain: "{{ change_target_domain }}"
 
+# Fresh per-rotation origin identity (new suffix → new origin FQDN). In shared
+# + fronting modes this RESHAPES dns_hostname before the DNS pre-delete below,
+# so the only new A record is the unguessable origin.
+- name: Derive the Fastly origin identity
+  include_tasks: ../providers/fastly/origin_identity.yml
+  when: effective_cdn_provider | default('none') == 'fastly'
+
 - name: Debug NEW hostname
   debug:
     msg:
@@ -184,6 +209,13 @@
     mode: '0640'
   become: yes
 
+- name: Persist the NEW clean node name
+  copy:
+    content: "{{ random_hostname }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.node_name"
+    mode: '0640'
+  become: yes
+
 - name: Ensure decoy site exists before re-render
   include_tasks: ../setup/decoy.yml
   when: remnawave_caddy_enabled | default(false) | bool
@@ -207,10 +239,10 @@
 # The rotated hostname changes the Fastly edge domain, so the old Fastly service
 # and the old Hosts are stale. NEW objects are created BEFORE the old ones are
 # deleted — a mid-run failure then leaves the OLD edge/Hosts serving instead of
-# a void. Exception: a shared-mode service pinned to a stable fastly_edge_label
-# reuses the SAME service name, so the old service must be deleted first (the
-# create would otherwise reuse it with a stale backend) — a documented brief
-# edge gap, self-healed by re-running.
+# a void. Exception: an UNCHANGED hostname reuses the SAME service name (the
+# service is named after the hostname), so the old service must be deleted
+# first (the create would otherwise reuse it with a stale backend) — a
+# documented brief edge gap, self-healed by re-running.
 - name: Set Fastly service-id persistence dir (Remnawave)
   set_fact:
     fastly_service_id_dir: "{{ remnawave_node_install_dir }}"
@@ -238,13 +270,35 @@
     - _old_fastly_service_id_raw.content is defined
     - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
 
-- name: Note same-name Fastly rotation (stable shared label)
+# Same for the OLD origin FQDN — service.yml rewrites the persisted file with
+# the NEW origin below; the old origin's DNS record is deleted in STEP 6.
+- name: Read the OLD Fastly origin FQDN (pre-rotation)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/fastly_origin_fqdn"
+  register: _old_fastly_origin_raw
+  become: yes
+  failed_when: false
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set the OLD Fastly origin FQDN fact
+  set_fact:
+    old_fastly_origin_fqdn: "{{ _old_fastly_origin_raw.content | b64decode | trim }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_origin_raw.content is defined
+    - (_old_fastly_origin_raw.content | b64decode | trim) | length > 0
+
+# The service is named after the hostname — a rotation to a NEW hostname is
+# always a new-name create (old service deleted AFTER). Only an unchanged
+# hostname (re-run / custom_hostname reuse) reuses the same name — then the old
+# service must be deleted first (the create would otherwise reuse it with a
+# stale backend) — a documented brief edge gap, self-healed by re-running.
+- name: Note same-name Fastly rotation (hostname unchanged)
   set_fact:
     _fastly_same_name_rotation: true
   when:
     - effective_cdn_provider | default('none') == 'fastly'
-    - effective_fastly_domain_mode | default('shared') == 'shared'
-    - fastly_edge_label | default('') | length > 0
+    - random_hostname == old_random_hostname
 
 - name: Set the OLD Fastly edge domain for TLS cleanup (custom mode)
   set_fact:
@@ -343,6 +397,18 @@
     old_cf_token: "{{ domain_providers[old_base_domain].cloudflare_api_token | default(cf_token) }}"
   when: old_base_domain in domain_providers
 
+- name: Warn when old-domain DNS cleanup is skipped (domain not managed)
+  debug:
+    msg: >-
+      change_delete_old_dns is on, but the OLD domain '{{ old_base_domain }}'
+      has no domain_providers entry — the old records for
+      {{ old_dns_hostname }} are LEFT IN PLACE. Add the zone to
+      domain_providers or delete the records manually.
+  when:
+    - change_delete_old_dns | default(true) | bool
+    - old_base_domain not in domain_providers
+    - old_dns_hostname != dns_hostname
+
 - name: Get OLD-domain DNS records
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records?name={{ old_dns_hostname }}"
@@ -375,6 +441,56 @@
     - old_base_domain in domain_providers
     - old_dns_records is defined
     - old_dns_records.json is defined
+    - old_dns_hostname != dns_hostname
+
+# The old Fastly ORIGIN record is a distinct name from old_dns_hostname in
+# legacy custom mode (origin-<old> pre-P2; <old>-<suffix> persisted post-P2) —
+# delete it too or the retired origin stays resolvable. In shared/fronting
+# mode the origin IS old_dns_hostname (deleted above) and these GETs no-op.
+- name: Compute OLD origin record candidates
+  set_fact:
+    _old_origin_candidates: >-
+      {{ ([old_fastly_origin_fqdn | default(''),
+           'origin-' ~ old_random_hostname ~ '.' ~ old_base_domain]
+         | reject('equalto', '') | unique | list)
+         | reject('equalto', old_dns_hostname) | list }}
+  when:
+    - change_delete_old_dns | default(true) | bool
+    - old_base_domain in domain_providers
+
+- name: Get OLD origin DNS records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records?name={{ item }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ old_cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _old_origin_records
+  loop: "{{ _old_origin_candidates | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - change_delete_old_dns | default(true) | bool
+    - old_base_domain in domain_providers
+    - _old_origin_candidates | default([]) | length > 0
+
+- name: Delete OLD origin DNS records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_base_domain].zone_id }}/dns_records/{{ item.1.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ old_cf_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ (_old_origin_records.results | default([])) | subelements('json.result', skip_missing=True) | list }}"
+  loop_control:
+    label: "{{ item.1.name }} ({{ item.1.type }})"
+  when:
+    - change_delete_old_dns | default(true) | bool
+    - old_base_domain in domain_providers
     - old_dns_hostname != dns_hostname
 
 - name: Display change summary

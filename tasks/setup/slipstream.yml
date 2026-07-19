@@ -262,6 +262,7 @@
   shell: ss -ulnp | grep ':53 ' | grep systemd-resolve || true
   register: systemd_resolved_check
   changed_when: false
+  become: true  # non-root can't see root-owned process names in ss -p output
 
 - name: Configure systemd-resolved to not use port 53 (if needed)
   block:

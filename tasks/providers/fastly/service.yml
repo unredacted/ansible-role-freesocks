@@ -2,12 +2,19 @@
 # tasks/providers/fastly/service.yml - Create and configure Fastly VCL service
 #
 # Creates a Fastly CDN service for WebSocket passthrough (CDN fronting).
-# Supports two domain modes:
+# The service is ALWAYS named after the node hostname; the edge scheme
+# decides which DOMAIN(S) attach:
 #   - shared: <label>.global.ssl.fastly.net. The label is an EXPLICIT choice —
 #     either operator-chosen (fastly_edge_label) or a random fs-<hostname>
 #     (fastly_edge_random). Exactly one selector MUST be set (asserted); no
 #     external DNS/TLS needed.
-#   - custom: your own domain (requires TLS subscription + DNS CNAME)
+#   - custom (legacy same-domain): your own hostname (requires TLS
+#     subscription + DNS CNAME in base_domain's zone)
+#   - fronting domains (fastly_fronting_domains): one or more decoupled edge
+#     domains (e.g. video-streams.org), each with its own TLS subscription +
+#     CNAME in its own zone. Implies the custom flow; primary = first entry.
+# The backend always dials the unguessable per-node origin FQDN
+# (<hostname>-<suffix>.<base_domain>, from origin_identity.yml).
 #
 # Idempotent: looks the service up by name first (GET /service/search) and reuses
 # it instead of POSTing a duplicate, so re-deploying a chosen stable edge name is
@@ -16,6 +23,7 @@
 # Requires:
 #   - fastly_api_token (global or per-domain in domain_providers)
 #   - random_hostname (set by main.yml or dns.yml)
+#   - fastly_origin_fqdn / fastly_origin_name (origin_identity.yml)
 
 # ============================================================================
 # Set Fastly credentials
@@ -23,7 +31,9 @@
 - name: Set Fastly API credentials
   set_fact:
     fastly_token: "{{ domain_providers[base_domain].fastly_api_token | default(fastly_api_token) }}"
-    fastly_domain_mode_effective: "{{ domain_providers[base_domain].fastly_domain_mode | default('shared') }}"
+    # Fronting domains imply the custom flow (TLS subscription + edge CNAMEs);
+    # origin_identity.yml derives + validates them before this file runs.
+    fastly_domain_mode_effective: "{{ 'custom' if (fastly_fronting_domains | default([]) | length > 0) else (domain_providers[base_domain].fastly_domain_mode | default('shared')) }}"
 
 - name: Fail if Fastly API token is not set
   fail:
@@ -40,6 +50,7 @@
 # from the origin hostname so innocuous names dodge SNI-keyword blocks) OR an
 # explicit opt-in to a random name (fastly_edge_random -> fs-<random_hostname>).
 # No silent default, so a node can never get an unintended random edge name.
+# Skipped entirely when fronting domains carry the edge instead.
 - name: Validate the Fastly shared edge-name selection (exactly one of label / random)
   assert:
     that:
@@ -49,39 +60,56 @@
       Set exactly one of fastly_edge_label (e.g. "cdn-content" ->
       cdn-content.global.ssl.fastly.net) or fastly_edge_random=true
       (fs-<random>.global.ssl.fastly.net) for a shared-mode Fastly node.
-  when: fastly_domain_mode_effective == 'shared'
+  when:
+    - fastly_domain_mode_effective == 'shared'
+    - fastly_fronting_domains | default([]) | length == 0
+
+# The service is ALWAYS named after the node hostname (ops-identifiable per
+# node; the idempotency lookup below keys off it). Only the attached DOMAIN(S)
+# differ by edge scheme.
+- name: Set Fastly service + edge names (fronting domains — primary is first)
+  set_fact:
+    fastly_service_name: "{{ random_hostname }}"
+    fastly_websocket_domain: "{{ fastly_fronting_domains | first }}"
+  when: fastly_fronting_domains | default([]) | length > 0
 
 - name: Set Fastly shared domain name (operator-chosen label)
   set_fact:
-    fastly_service_name: "{{ fastly_edge_label }}"
+    fastly_service_name: "{{ random_hostname }}"
     fastly_websocket_domain: "{{ fastly_edge_label }}.global.ssl.fastly.net"
   when:
+    - fastly_fronting_domains | default([]) | length == 0
     - fastly_domain_mode_effective == 'shared'
     - fastly_edge_label | default('') | length > 0
 
 - name: Set Fastly shared domain name (random)
   set_fact:
-    fastly_service_name: "{{ fastly_service_name_prefix }}-{{ random_hostname }}"
+    fastly_service_name: "{{ random_hostname }}"
     fastly_websocket_domain: "{{ fastly_service_name_prefix }}-{{ random_hostname }}.global.ssl.fastly.net"
   when:
+    - fastly_fronting_domains | default([]) | length == 0
     - fastly_domain_mode_effective == 'shared'
     - not (fastly_edge_label | default('') | length > 0)
     - fastly_edge_random | default(false) | bool
 
-- name: Set Fastly custom domain name
+- name: Set Fastly custom domain name (legacy same-domain)
   set_fact:
-    fastly_service_name: "{{ random_hostname }}-{{ base_domain | replace('.', '-') }}"
+    fastly_service_name: "{{ random_hostname }}"
     fastly_websocket_domain: "{{ dns_hostname }}"
-  when: fastly_domain_mode_effective == 'custom'
+  when:
+    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_domain_mode_effective == 'custom'
 
-# In custom mode the client-facing name (dns_hostname) becomes a CNAME to the
-# Fastly edge, so the backend must dial a DISTINCT origin name or the edge
-# would fetch from itself. fastly/dns.yml creates origin-<hostname> A/AAAA
-# records for this. Shared mode has no edge CNAME — the backend dials the
-# origin hostname directly.
+# The backend ALWAYS dials the per-node origin FQDN (an unguessable
+# <hostname>-<suffix> name derived by origin_identity.yml). In legacy custom
+# mode the client-facing dns_hostname CNAMEs to the edge, so the backend must
+# dial the DISTINCT origin name or the edge would fetch from itself; in shared
+# + fronting modes dns_hostname IS the origin FQDN, so SNI/override/cert
+# (dns_hostname) align with the backend address. Legacy custom keeps
+# SNI/override/cert on the clean dns_hostname (the Caddy cert's name).
 - name: Set the Fastly origin backend address
   set_fact:
-    fastly_origin_address: "{{ ('origin-' ~ random_hostname ~ '.' ~ base_domain) if fastly_domain_mode_effective == 'custom' else dns_hostname }}"
+    fastly_origin_address: "{{ fastly_origin_fqdn }}"
 
 - name: Debug Fastly configuration
   debug:
@@ -240,8 +268,14 @@
   when: not fastly_service_exists
 
 # ============================================================================
-# Add domain to service
+# Add domain(s) to service
 # ============================================================================
+# Fronting mode attaches EVERY fronting domain (clients fail over between
+# them); shared/legacy-custom attach the single edge name.
+- name: Compute the domains to attach to the service
+  set_fact:
+    _fastly_domains_to_attach: "{{ fastly_fronting_domains | default([]) if (fastly_fronting_domains | default([]) | length > 0) else [fastly_websocket_domain] }}"
+
 - name: Add domain to Fastly service
   uri:
     url: "{{ fastly_api_endpoint }}/service/{{ fastly_service_id }}/version/{{ fastly_version }}/domain"
@@ -252,16 +286,19 @@
       Accept: "application/json"
     body_format: form-urlencoded
     body:
-      name: "{{ fastly_websocket_domain }}"
+      name: "{{ item }}"
     status_code: [200, 201]
   delegate_to: localhost
   no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_domain_result
+  loop: "{{ _fastly_domains_to_attach }}"
+  loop_control:
+    label: "{{ item }}"
   when: not fastly_service_exists
 
 - name: Debug Fastly domain addition
   debug:
-    msg: "Domain {{ fastly_websocket_domain }} added to Fastly service"
+    msg: "Domains {{ _fastly_domains_to_attach | join(', ') }} added to Fastly service"
   when: not fastly_service_exists
 
 # ============================================================================
@@ -289,7 +326,7 @@
       Accept: "application/json"
     body_format: form-urlencoded
     body:
-      name: "origin-{{ random_hostname }}"
+      name: "{{ fastly_origin_name }}"
       address: "{{ fastly_origin_address }}"
       port: "443"
       use_ssl: "true"
@@ -332,7 +369,7 @@
       Accept: "application/json"
     body_format: form-urlencoded
     body:
-      name: "origin-health-{{ random_hostname }}"
+      name: "origin-health-{{ fastly_origin_name }}"
       host: "{{ fastly_origin_address }}"
       path: "/"
       method: "HEAD"
@@ -423,6 +460,15 @@
     mode: '0644'
   become: yes
 
+# Persisted so change/migrate can delete the OLD origin DNS record on the next
+# rotation (the suffix is random per rotation and not re-derivable).
+- name: Save Fastly origin FQDN to server
+  copy:
+    content: "{{ fastly_origin_fqdn }}"
+    dest: "{{ fastly_service_id_dir }}/fastly_origin_fqdn"
+    mode: '0644'
+  become: yes
+
 - name: Display Fastly service summary
   debug:
     msg: |
@@ -431,7 +477,7 @@
       Service ID: {{ fastly_service_id }}
       Service Name: {{ fastly_service_name }}
       Domain Mode: {{ fastly_domain_mode_effective }}
-      WebSocket Domain: {{ fastly_websocket_domain }}
+      Edge Domains: {{ _fastly_domains_to_attach | join(', ') }}
       Origin Backend: {{ fastly_origin_address }}:443
       WebSocket Passthrough: Enabled
       VCL Snippet: websocket_upgrade (return upgrade)
@@ -440,6 +486,6 @@
       Clients connect to: wss://{{ fastly_websocket_domain }}
       No additional DNS or TLS configuration needed.
       {% else %}
-      Clients connect to: wss://{{ fastly_websocket_domain }}
-      TLS subscription and DNS CNAME still needed (see tls.yml and dns.yml).
+      Clients connect to: wss://{{ fastly_websocket_domain }}{{ ' (+' ~ (_fastly_domains_to_attach | length - 1) ~ ' more)' if (_fastly_domains_to_attach | length > 1) else '' }}
+      TLS subscription(s) and DNS CNAME(s) still needed (see tls.yml and dns.yml).
       {% endif %}

@@ -38,6 +38,65 @@
     migrate_component: "{{ hostvars[source_hostname].migrate_component }}"
   when: inventory_hostname == destination_hostname
 
+# Remnawave capability detection on the SOURCE — the parity block below
+# re-creates Caddy/Hosts based on what the source actually runs, so a Remnawave
+# migrate does not silently lose Caddy/Hosts when the caller forgets to re-pass
+# the deploy-time flags (explicit flags still force-enable; see the
+# _migrate_*_effective facts).
+- name: Detect Caddy on source (Remnawave)
+  stat:
+    path: /etc/caddy/Caddyfile
+  register: source_caddyfile_path
+  become: yes
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Detect panel node registration on source (Remnawave)
+  stat:
+    path: "{{ remnawave_node_install_dir }}/.node_uuid"
+  register: source_node_uuid_path
+  become: yes
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Read per-node squad UUIDs on source (Reality detection)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.squad_uuids"
+  register: source_squad_uuids_raw
+  become: yes
+  failed_when: false
+  no_log: true  # content carries the per-node squad UUIDs
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Derive detected Remnawave capabilities on source
+  set_fact:
+    migrate_detected_caddy: "{{ source_caddyfile_path.stat.exists }}"
+    migrate_detected_register_node: "{{ source_node_uuid_path.stat.exists }}"
+    # Reality = a reality squad on disk, or (fallback) no Caddy on a Remnawave
+    # node — Caddy and Reality are mutually exclusive, so a Caddy-less node is
+    # a direct/Reality node for Host purposes.
+    migrate_detected_reality: >-
+      {{ ((((source_squad_uuids_raw.content | default('') | b64decode)
+            if source_squad_uuids_raw.content is defined else '')
+           is search('^reality=\S', multiline=true))
+          or (not (source_caddyfile_path.stat.exists | bool))) }}
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Propagate detected Remnawave capabilities to destination
+  set_fact:
+    migrate_detected_caddy: "{{ hostvars[source_hostname].migrate_detected_caddy | default(false) }}"
+    migrate_detected_register_node: "{{ hostvars[source_hostname].migrate_detected_register_node | default(false) }}"
+    migrate_detected_reality: "{{ hostvars[source_hostname].migrate_detected_reality | default(false) }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
 - name: Debug detected migration component
   debug:
     msg: "Migrating {{ migrate_component }} from {{ source_hostname }} to {{ destination_hostname }}"
@@ -78,6 +137,24 @@
     dns_hostname: "{{ destination_kv_hostname }}.{{ base_domain }}"
     kv_hostname: "{{ destination_kv_hostname }}"
   when: inventory_hostname == destination_hostname
+
+# Fastly origin identity for the destination: a FRESH suffix (the destination
+# is a new origin). Derived early so DNS below writes the origin record and
+# the panel address PATCH (update_node) uses it. Needs the CDN facts here;
+# the later Fastly sections re-derive the same values harmlessly.
+- name: Derive destination CDN facts early (migrate)
+  set_fact:
+    effective_cdn_provider: "{{ domain_providers[base_domain].cdn_provider | default('none') }}"
+    effective_fastly_domain_mode: "{{ domain_providers[base_domain].fastly_domain_mode | default('shared') }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - base_domain is defined and base_domain in domain_providers
+
+- name: Derive the Fastly origin identity (destination)
+  include_tasks: ../providers/fastly/origin_identity.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - effective_cdn_provider | default('none') == 'fastly'
 
 - name: Debug hostname variables
   debug:
@@ -139,6 +216,17 @@
 - name: Include container management tasks (Remnawave)
   include_tasks: remnawave_containers.yml
   when: migrate_component == 'remnawave'
+
+# The destination is a NEW node — persist its clean node name (change mode's
+# old-slug / Host-remark derivations read it; the transfer may have carried
+# the source's).
+- name: Persist the destination's clean node name
+  copy:
+    content: "{{ destination_kv_hostname }}\n"
+    dest: "{{ '/opt/outline/.node_name' if migrate_component == 'outline' else remnawave_node_install_dir ~ '/.node_name' }}"
+    mode: '0640'
+  become: yes
+  when: inventory_hostname == destination_hostname
 
 # ============================================================================
 # DNS update (provider-agnostic, both components)
@@ -207,11 +295,12 @@
     - outline_migrate_fastly_id_file.stat.exists
     - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
 
-# A stable shared-mode label reuses the SAME service name — the old service
-# must be deleted first (the create would otherwise reuse it with a stale
-# backend). Every other mode creates NEW first, so a mid-run failure leaves
-# the OLD edge serving.
-- name: Note same-name Fastly rotation (Outline migrate, stable shared label)
+# The service is named after the hostname — only an UNCHANGED hostname
+# (destination named after the source) reuses the same service name, and then
+# the old service must be deleted first (the create would otherwise reuse it
+# with a stale backend). Every other case creates NEW first, so a mid-run
+# failure leaves the OLD edge serving.
+- name: Note same-name Fastly rotation (Outline migrate, hostname unchanged)
   set_fact:
     _fastly_same_name_rotation: true
   when:
@@ -219,8 +308,7 @@
     - migrate_component == 'outline'
     - outline_migrate_fastly_id_file.stat.exists
     - effective_cdn_provider | default('none') == 'fastly'
-    - effective_fastly_domain_mode | default('shared') == 'shared'
-    - fastly_edge_label | default('') | length > 0
+    - destination_kv_hostname == source_kv_hostname
 
 - name: Set the OLD Fastly edge domain for TLS cleanup (Outline migrate, custom mode)
   set_fact:
@@ -299,7 +387,7 @@
 - name: Rebuild outline_api_info from the transferred access.txt
   set_fact:
     outline_api_info:
-      apiUrl: "{{ (outline_access_raw.content | b64decode) | regex_search('apiUrl:(.+)', '\\1') | first | trim }}"
+      apiUrl: "{{ (outline_access_raw.content | b64decode) | regex_search('apiUrl:(.+)', '\\1') | first | default('') | trim }}"
       certSha256: "{{ (outline_access_raw.content | b64decode) | regex_search('certSha256:(.+)', '\\1') | first | default('') | trim }}"
   when:
     - inventory_hostname == destination_hostname
@@ -396,12 +484,25 @@
     - migrate_component == 'remnawave'
     - base_domain in domain_providers
 
+# Caller-passed flags force-enable a capability; the source-side detection fills
+# it in when the flags sit at their default-false (Ansible cannot distinguish an
+# explicit false from an unset default — to deliberately slim a node down,
+# migrate first, then use update-mode force flags).
+- name: Resolve effective Remnawave capabilities for the destination
+  set_fact:
+    _migrate_caddy_effective: "{{ (remnawave_caddy_enabled | default(false) | bool) or (migrate_detected_caddy | default(false) | bool) }}"
+    _migrate_register_node_effective: "{{ (remnawave_panel_register_node | default(false) | bool) or (migrate_detected_register_node | default(false) | bool) }}"
+    _migrate_reality_effective: "{{ (remnawave_reality_enabled | default(false) | bool) or (migrate_detected_reality | default(false) | bool) }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
 - name: Re-install/render Caddy on the destination (restores dropped Caddyfile)
   include_tasks: ../setup/caddy.yml
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_caddy_enabled | default(false) | bool
+    - _migrate_caddy_effective | bool
 
 - name: Set the old hostname fact for Host cleanup (all Remnawave migrates)
   set_fact:
@@ -442,19 +543,19 @@
     - _old_fastly_service_id_raw.content is defined
     - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
 
-# A stable shared-mode label reuses the SAME service name — the old service
-# must be deleted first (the create would otherwise reuse it with a stale
-# backend). Every other mode creates NEW first, so a mid-run failure leaves
-# the OLD edge/Hosts serving.
-- name: Note same-name Fastly rotation (Remnawave migrate, stable shared label)
+# The service is named after the hostname — only an UNCHANGED hostname
+# (destination named after the source) reuses the same service name, and then
+# the old service must be deleted first (the create would otherwise reuse it
+# with a stale backend). Every other case creates NEW first, so a mid-run
+# failure leaves the OLD edge/Hosts serving.
+- name: Note same-name Fastly rotation (Remnawave migrate, hostname unchanged)
   set_fact:
     _fastly_same_name_rotation: true
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
     - effective_cdn_provider | default('none') == 'fastly'
-    - effective_fastly_domain_mode | default('shared') == 'shared'
-    - fastly_edge_label | default('') | length > 0
+    - destination_kv_hostname == source_kv_hostname
 
 - name: Set the OLD Fastly edge domain for TLS cleanup (Remnawave migrate, custom mode)
   set_fact:
@@ -479,7 +580,7 @@
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
     - effective_cdn_provider | default('none') == 'fastly'
-    - remnawave_caddy_enabled | default(false) | bool
+    - _migrate_caddy_effective | bool
 
 - name: Fastly TLS subscription (custom mode, destination)
   include_tasks: ../providers/fastly/tls.yml
@@ -503,8 +604,8 @@
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_panel_register_node | default(false) | bool
-    - remnawave_caddy_enabled | default(false) | bool
+    - _migrate_register_node_effective | bool
+    - _migrate_caddy_effective | bool
     - effective_cdn_provider | default('none') in ['fastly', 'none']
 
 - name: Create NEW Reality Host on the destination
@@ -512,8 +613,9 @@
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_panel_register_node | default(false) | bool
-    - remnawave_reality_enabled | default(false) | bool
+    - _migrate_register_node_effective | bool
+    - _migrate_reality_effective | bool
+    - remnawave_reality_inbound_uuid | default('') | length > 0
 
 # Old objects come down only after their replacements exist.
 - name: Clean up OLD Remnawave Hosts (source hostname)
@@ -521,8 +623,8 @@
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_panel_register_node | default(false) | bool
-    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
+    - _migrate_register_node_effective | bool
+    - (_migrate_caddy_effective | bool) or (_migrate_reality_effective | bool)
 
 - name: Delete OLD Fastly service (after the NEW one is live)
   include_tasks: ../providers/fastly/cleanup.yml

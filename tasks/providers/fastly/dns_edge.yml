@@ -1,0 +1,56 @@
+---
+# tasks/providers/fastly/dns_edge.yml - ONE edge CNAME (delete-then-create)
+#
+# Looped by dns.yml with `_edge_job: {domain, zone, target}`.
+# Deletes A/AAAA/stale-CNAME records on the edge name first (Cloudflare
+# forbids a CNAME coexisting with other records on the same name), then writes
+# the CNAME to the Fastly edge target. The zone may differ per domain
+# (fronting domains live in their own zones with their own credentials).
+
+- name: Set zone Cloudflare credentials for the edge CNAME ({{ _edge_job.zone }})
+  set_fact:
+    cf_token: "{{ domain_providers[_edge_job.zone].cloudflare_api_token | default(cloudflare_api_token) }}"
+
+- name: Get existing records for the edge name ({{ _edge_job.domain }})
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge_job.zone].zone_id }}/dns_records?name={{ _edge_job.domain }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _fastly_edge_existing
+
+- name: Delete A/AAAA/stale-CNAME records for the edge name ({{ _edge_job.domain }})
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge_job.zone].zone_id }}/dns_records/{{ item.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ _fastly_edge_existing.json.result | default([]) | selectattr('type', 'in', ['A', 'AAAA', 'CNAME']) | list }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.type }})"
+
+- name: Create the edge CNAME ({{ _edge_job.domain }} -> {{ _edge_job.target }})
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge_job.zone].zone_id }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    body_format: json
+    body:
+      type: CNAME
+      name: "{{ _edge_job.domain }}"
+      content: "{{ _edge_job.target }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header

@@ -163,6 +163,23 @@
     # Extract the old domain (everything after the first dot)
     old_domain: "{{ current_server_config.json.hostnameForAccessKeys | default('') | regex_replace('^[^.]+\\.', '') }}"
 
+# hostnameForAccessKeys may hold the suffixed Fastly origin FQDN — the CLEAN
+# node name (the FCP slug) lives in .node_name when persisted (pre-persistence
+# deploys fall back to the derived value, which was clean anyway).
+- name: Read the persisted clean node name (if present)
+  slurp:
+    src: /opt/outline/.node_name
+  register: old_node_name_raw
+  become: yes
+  failed_when: false
+
+- name: Prefer the persisted clean node name
+  set_fact:
+    old_random_hostname: "{{ old_node_name_raw.content | b64decode | trim }}"
+  when:
+    - old_node_name_raw.content is defined
+    - (old_node_name_raw.content | b64decode | trim) | length > 0
+
 - name: Display current hostname
   debug:
     msg:
@@ -221,6 +238,13 @@
       - "New full DNS hostname: {{ dns_hostname }}"
       - "New bare hostname (kv_hostname): {{ kv_hostname }}"
 
+# Fresh per-rotation origin identity (new suffix → new origin FQDN). In shared
+# + fronting modes this RESHAPES dns_hostname before the DNS work below, so the
+# only new A record is the unguessable origin.
+- name: Derive the Fastly origin identity
+  include_tasks: ../providers/fastly/origin_identity.yml
+  when: effective_cdn_provider | default('none') == 'fastly'
+
 # ============================================================================
 # STEP 4: Delete any existing DNS records for the new hostname (prevent conflicts)
 # ============================================================================
@@ -263,10 +287,10 @@
 # STEP 5: Create new DNS records (provider-specific)
 # ============================================================================
 # Fastly rotation creates the NEW service BEFORE deleting the old one, so a
-# mid-run failure leaves the OLD edge serving instead of a void. Exception: a
-# stable shared-mode fastly_edge_label reuses the SAME service name — the old
-# service must go first (the create would otherwise reuse it with a stale
-# backend) — a documented brief edge gap, self-healed by re-running.
+# mid-run failure leaves the OLD edge serving instead of a void. Exception: an
+# UNCHANGED hostname reuses the SAME service name — the old service must go
+# first (the create would otherwise reuse it with a stale backend) — a
+# documented brief edge gap, self-healed by re-running.
 - name: Read the OLD Fastly service id (pre-rotation)
   slurp:
     src: "{{ fastly_service_id_dir }}/fastly_service_id"
@@ -283,13 +307,34 @@
     - _old_fastly_service_id_raw.content is defined
     - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
 
-- name: Note same-name Fastly rotation (stable shared label)
+# Same for the OLD origin FQDN — service.yml rewrites the persisted file with
+# the NEW origin; the old origin's DNS record is deleted in STEP 12.
+- name: Read the OLD Fastly origin FQDN (pre-rotation)
+  slurp:
+    src: "{{ fastly_service_id_dir }}/fastly_origin_fqdn"
+  register: _old_fastly_origin_raw
+  become: yes
+  failed_when: false
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set the OLD Fastly origin FQDN fact
+  set_fact:
+    old_fastly_origin_fqdn: "{{ _old_fastly_origin_raw.content | b64decode | trim }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_origin_raw.content is defined
+    - (_old_fastly_origin_raw.content | b64decode | trim) | length > 0
+
+# The service is named after the hostname — only an UNCHANGED hostname (re-run
+# / custom_hostname reuse) reuses the same service name, and then the old
+# service must be deleted first (the create would otherwise reuse it with a
+# stale backend).
+- name: Note same-name Fastly rotation (hostname unchanged)
   set_fact:
     _fastly_same_name_rotation: true
   when:
     - effective_cdn_provider | default('none') == 'fastly'
-    - effective_fastly_domain_mode | default('shared') == 'shared'
-    - fastly_edge_label | default('') | length > 0
+    - random_hostname == old_random_hostname
 
 - name: Set the OLD Fastly edge domain for TLS cleanup (custom mode)
   set_fact:
@@ -400,6 +445,13 @@
 # ============================================================================
 # STEP 9: Update local configuration files
 # ============================================================================
+- name: Persist the NEW clean node name
+  copy:
+    content: "{{ random_hostname }}\n"
+    dest: /opt/outline/.node_name
+    mode: '0640'
+  become: yes
+
 - name: Update hostname in shadowbox_server_config.json
   ansible.builtin.shell: |
     jq '.hostname = "{{ dns_hostname }}" | .caddyWebServer.domain = "{{ effective_caddy_domain }}"' /opt/outline/persisted-state/shadowbox_server_config.json > /tmp/shadowbox_server_config.json.tmp && \
@@ -501,6 +553,19 @@
 # ============================================================================
 # STEP 12: Clean up old DNS records (optional)
 # ============================================================================
+- name: Warn when old-domain DNS cleanup is skipped (domain not managed)
+  debug:
+    msg: >-
+      change_delete_old_dns is on, but the OLD domain '{{ old_domain }}' has no
+      domain_providers entry — the old records for {{ old_hostname }} are LEFT
+      IN PLACE. Add the zone to domain_providers or delete them manually.
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - change_delete_old_dns | default(true) | bool
+    - old_hostname != ''
+    - old_hostname != dns_hostname
+    - old_domain not in domain_providers
+
 - name: Delete old DNS A records (Cloudflare)
   block:
     # The OLD domain may live in a different Cloudflare account than the NEW
@@ -540,6 +605,61 @@
     - change_delete_old_dns | default(true) | bool
     - old_hostname != ''
     - old_hostname != dns_hostname   # never delete the records we just wrote
+    - old_domain in domain_providers
+
+# The old Fastly ORIGIN record is a distinct name from old_hostname in legacy
+# custom mode (origin-<old> pre-P2; <old>-<suffix> persisted post-P2) — delete
+# it too. In shared/fronting mode the origin IS old_hostname (deleted above).
+- name: Compute OLD origin record candidates
+  set_fact:
+    _old_origin_candidates: >-
+      {{ ([old_fastly_origin_fqdn | default(''),
+           'origin-' ~ old_random_hostname ~ '.' ~ old_domain]
+         | reject('equalto', '') | unique | list)
+         | reject('equalto', old_hostname) | list }}
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - change_delete_old_dns | default(true) | bool
+    - old_domain in domain_providers
+
+- name: Get OLD origin DNS records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records?name={{ item }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ old_cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _old_origin_records
+  loop: "{{ _old_origin_candidates | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - change_delete_old_dns | default(true) | bool
+    - old_domain in domain_providers
+    - _old_origin_candidates | default([]) | length > 0
+
+- name: Delete OLD origin DNS records
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[old_domain].zone_id }}/dns_records/{{ item.1.id }}"
+    method: DELETE
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ old_cf_token }}"
+    status_code: [200, 404]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  loop: "{{ (_old_origin_records.results | default([])) | subelements('json.result', skip_missing=True) | list }}"
+  loop_control:
+    label: "{{ item.1.name }} ({{ item.1.type }})"
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - change_delete_old_dns | default(true) | bool
+    - old_domain in domain_providers
+    - old_hostname != dns_hostname
 
 # ============================================================================
 # COMPLETE

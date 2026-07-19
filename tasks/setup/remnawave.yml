@@ -58,16 +58,18 @@
   include_tasks: ../providers/remnawave/keygen.yml
   when: remnawave_secret_key_source == 'panel_api'
 
-# === Panel API: per-node placement (inbound clones + per-node squads) ===
-# Gives this node its own config-profile inbound(s) + internal squad(s) and
-# REPOINTS remnawave_cdn_transports[].inbound_uuid / the Reality inbound fact at
-# them, so registration + Host creation below reference the node's own inbounds.
+# === Panel API: per-node placement (LEGACY — inbound clones + per-node squads)
+# Default OFF (shared-squad model): nodes activate the shared base inbounds and
+# bootstrap's panel-wide squads span the fleet. When opted in, this gives the
+# node its own config-profile inbound(s) + internal squad(s) and REPOINTS
+# remnawave_cdn_transports[].inbound_uuid / the Reality inbound fact at them,
+# so registration + Host creation below reference the node's own inbounds.
 # Must run BEFORE the derive/register steps. The FCP pool add happens later in
 # main.yml's control-plane section.
 - name: Create per-node placement objects (inbounds + squads)
   include_tasks: ../providers/remnawave/create_node_placement.yml
   when:
-    - remnawave_per_node_placement | default(true) | bool
+    - remnawave_per_node_placement | default(false) | bool
     - remnawave_panel_register_node | default(false) | bool
 
 # Derive the panel's active inbounds from the enabled CDN transports (+ the
@@ -78,7 +80,7 @@
 - name: Collect enabled CDN-transport inbound UUIDs
   set_fact:
     _cdn_transport_inbounds: >-
-      {{ remnawave_cdn_transports | default([]) | selectattr('enabled') | map(attribute='inbound_uuid')
+      {{ remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
          | select('string') | reject('equalto', '') | list }}
 
 - name: Derive active inbounds from enabled CDN transports (+ Reality)
@@ -121,10 +123,20 @@
 
 # Persist the deployed hostname so change/migrate flows can reconstruct
 # the "old" hostname when rotating. The compose file doesn't carry this.
+# .node_name holds the CLEAN hostname (used for Host remarks, squad names, FCP
+# slugs) — it differs from .hostname whenever dns_hostname is the suffixed
+# Fastly origin FQDN.
 - name: Persist deployed hostname
   copy:
     content: "{{ dns_hostname }}\n"
     dest: "{{ remnawave_node_install_dir }}/.hostname"
+    mode: '0640'
+  become: yes
+
+- name: Persist the clean node name
+  copy:
+    content: "{{ random_hostname }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.node_name"
     mode: '0640'
   become: yes
 

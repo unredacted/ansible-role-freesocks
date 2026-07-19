@@ -18,11 +18,16 @@
       - remnawave_panel_config_profile_uuid | length > 0
       - remnawave_panel_active_inbounds is defined
       - remnawave_panel_active_inbounds | length > 0
+      - random_hostname | length >= 3
+      - random_hostname | length <= 30
     fail_msg: |
       Node registration requires:
         remnawave_panel_api_token (vault)
         remnawave_panel_config_profile_uuid (UUID of the Xray config profile to attach)
         remnawave_panel_active_inbounds (list of inbound UUIDs from that profile)
+      The node name is the hostname ('{{ random_hostname | default('(unset)') }}') and
+      the panel caps node names at 30 chars — shorten custom_hostname /
+      hostname_word_count.
 
 - name: Register node with Panel
   uri:

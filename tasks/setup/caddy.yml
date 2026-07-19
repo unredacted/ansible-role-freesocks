@@ -112,7 +112,7 @@
       (listeners: {{ caddy_port_owner.stdout | trim | default('none') }}).
       A panel-side Xray inbound is likely bound to this port. Reconfigure the
       inbounds to listen on their loopback ports
-      ({{ remnawave_cdn_transports | selectattr('enabled') | map(attribute='internal_port') | join(', ') }})
+      ({{ remnawave_cdn_transports | rejectattr('enabled', 'equalto', false) | map(attribute='internal_port') | join(', ') }})
       with plaintext WS so Caddy can own {{ remnawave_caddy_listen_port }}.
     success_msg: "Caddy owns port {{ remnawave_caddy_listen_port }}."
   when: caddy_port_owner.stdout | default('') | length > 0

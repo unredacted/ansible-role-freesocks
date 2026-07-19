@@ -1,9 +1,10 @@
 ---
 # tests/test_fastly_edge.yml
 #
-# Self-asserting tests for the Fastly shared-mode edge-name selection in
-# tasks/providers/fastly/service.yml (chosen label vs random, XOR). Pure filter
-# logic, NO API calls.
+# Self-asserting tests for the Fastly edge/service naming in
+# tasks/providers/fastly/service.yml + origin_identity.yml. Pure filter logic,
+# NO API calls. The service is ALWAYS named after the node hostname; only the
+# attached edge domain(s) vary by scheme.
 #
 # Run: ansible-playbook tests/test_fastly_edge.yml
 - hosts: localhost
@@ -13,25 +14,28 @@
     fastly_service_name_prefix: "fs"
     random_hostname: "apple-banana-cherry"
   tasks:
-    # (a) Chosen label -> service name + edge domain, decoupled from the origin.
-    - name: Chosen label derivation
+    # (a) Chosen label -> edge domain label.global.ssl.fastly.net, service = hostname.
+    - name: Chosen label derivation (service = hostname)
       vars:
         fastly_edge_label: "cdn-content"
+        fastly_service_name: "{{ random_hostname }}"
+        fastly_websocket_domain: "{{ fastly_edge_label }}.global.ssl.fastly.net"
       assert:
         that:
-          - fastly_edge_label == 'cdn-content'
-          - (fastly_edge_label ~ '.global.ssl.fastly.net') == 'cdn-content.global.ssl.fastly.net'
-        success_msg: "Chosen label -> cdn-content.global.ssl.fastly.net."
+          - fastly_service_name == 'apple-banana-cherry'
+          - fastly_websocket_domain == 'cdn-content.global.ssl.fastly.net'
+        success_msg: "Chosen label -> edge cdn-content.global.ssl.fastly.net, service = hostname."
 
-    # (b) Random selection -> fs-<hostname>.global.ssl.fastly.net
-    - name: Random derivation
+    # (b) Random selection -> fs-<hostname>.global.ssl.fastly.net, service = hostname.
+    - name: Random derivation (service = hostname)
       vars:
-        _svc: "{{ fastly_service_name_prefix }}-{{ random_hostname }}"
+        fastly_service_name: "{{ random_hostname }}"
+        fastly_websocket_domain: "{{ fastly_service_name_prefix }}-{{ random_hostname }}.global.ssl.fastly.net"
       assert:
         that:
-          - _svc == 'fs-apple-banana-cherry'
-          - (_svc ~ '.global.ssl.fastly.net') == 'fs-apple-banana-cherry.global.ssl.fastly.net'
-        success_msg: "Random -> fs-<hostname>.global.ssl.fastly.net."
+          - fastly_service_name == 'apple-banana-cherry'
+          - fastly_websocket_domain == 'fs-apple-banana-cherry.global.ssl.fastly.net'
+        success_msg: "Random -> fs-<hostname>.global.ssl.fastly.net, service = hostname."
 
     # (c) XOR selector: exactly one of label / random is valid (the exact
     #     expression from service.yml's assert, parenthesized so it binds as
@@ -50,6 +54,18 @@
         - { label: "", random: false, ok: false } # neither -> invalid
       loop_control:
         label: "label='{{ item.label }}' random={{ item.random }}"
+
+    # (d) Fronting domains -> primary edge is the FIRST entry; service = hostname.
+    - name: Fronting domains derivation (primary = first)
+      vars:
+        fastly_fronting_domains: ["video-streams.org", "cdn-static.net"]
+        fastly_service_name: "{{ random_hostname }}"
+        fastly_websocket_domain: "{{ fastly_fronting_domains | first }}"
+      assert:
+        that:
+          - fastly_service_name == 'apple-banana-cherry'
+          - fastly_websocket_domain == 'video-streams.org'
+        success_msg: "Fronting -> primary video-streams.org, service = hostname."
 
     - name: All Fastly edge-name tests passed
       debug:

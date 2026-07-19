@@ -1,12 +1,11 @@
 ---
 # tasks/providers/remnawave/create_node_placement.yml
 #
-# PER-NODE placement objects (remnawave_per_node_placement=true, the default):
-# give THIS node its own config-profile inbound(s) + its own internal squad(s),
-# so FCP's issuance-time node placement can balance keys across nodes. A squad
-# only maps to ONE node when that node is the only one activating the squad's
-# inbounds — with the panel-wide bootstrap squads every node looks like one unit
-# and the least-loaded-node picker has nothing to pick between.
+# PER-NODE placement objects (remnawave_per_node_placement=true — LEGACY opt-in,
+# default OFF): give THIS node its own config-profile inbound(s) + its own
+# internal squad(s), so FCP's issuance-time node placement can balance keys
+# across nodes. The DEFAULT model is the shared-squad topology (bootstrap's
+# panel-wide FreeSocks-Fastly / FreeSocks-Reality squads span the fleet).
 #
 # What it does (idempotent, panel-side, delegate_to: localhost):
 #   1. Clone the bootstrap base inbound(s) inside the Config Profile under a
@@ -18,8 +17,10 @@
 #      remnawave_cdn_transports[].inbound_uuid + remnawave_reality_inbound_uuid
 #      are REPLACED with the per-node UUIDs, so node registration
 #      (activeInbounds) and Host creation reference the node's own inbounds.
-#   3. Create the per-node squad(s) (<bootstrap squad name>-<hostname>) bound to
-#      those inbounds, resolve their UUIDs, and persist them to
+#   3. Create the per-node squad(s) (<prefix>-<hostname> — panel caps squad
+#      names at 30 chars, so the SHORT remnawave_node_*_squad_prefix values
+#      are used, NOT the panel-wide shared names) bound to those inbounds,
+#      resolve their UUIDs, and persist them to
 #      {{ remnawave_node_install_dir }}/.squad_uuids for later teardown.
 # The FCP pool add (addSquadUuids) happens later in main.yml's FCP section.
 #
@@ -42,6 +43,21 @@
       remnawave_panel_config_profile_uuid (run operation_mode=bootstrap first and
       load its output vars file).
   no_log: true
+
+# The panel caps squad names at 30 chars ([A-Za-z0-9_ -]). The per-node squad
+# name is <prefix>-<hostname>, so the hostname budget is 30 - len(prefix) - 1;
+# fail fast with a clear message instead of an opaque panel 400 mid-deploy.
+- name: Assert the hostname fits the per-node squad-name budget
+  assert:
+    that:
+      - (random_hostname | length) + (remnawave_node_fronted_squad_prefix | default('FSF') | length) + 1 <= 30
+      - (random_hostname | length) + (remnawave_node_reality_squad_prefix | default('FSR') | length) + 1 <= 30
+      - random_hostname | length <= 30
+    fail_msg: >-
+      Hostname '{{ random_hostname }}' is too long for per-node squad names:
+      the panel caps squad names at 30 chars and the squad name is
+      <prefix>-<hostname>. Shorten the hostname (custom_hostname /
+      hostname_word_count) or the remnawave_node_*_squad_prefix values.
 
 # Tags must be stable per node and tag-safe; the dictionary hostname can carry
 # hyphens, so normalize to A-Z0-9_ (e.g. quiet-falcon -> QUIET_FALCON).
@@ -123,7 +139,7 @@
     _np_plan: >-
       {%- set plan = [] -%}
       {%- if remnawave_caddy_enabled | default(false) | bool -%}
-        {%- for t in remnawave_cdn_transports | default([]) if (t.enabled | default(false)) and ((t.inbound_uuid | default('')) | length > 0) -%}
+        {%- for t in remnawave_cdn_transports | default([]) if (t.enabled | default(true) | bool) and ((t.inbound_uuid | default('')) | length > 0) -%}
           {%- set base_tag = _np_uuid_to_tag.get(t.inbound_uuid, '') -%}
           {%- if base_tag -%}
             {# a re-run sees the REPOINTED per-node uuid — don't re-suffix an already-node-tagged base #}
@@ -155,7 +171,7 @@
   vars:
     _np_unresolved: >-
       {{ remnawave_cdn_transports | default([])
-         | selectattr('enabled')
+         | rejectattr('enabled', 'equalto', false)
          | map(attribute='name') | list
          | reject('in', _np_plan | selectattr('kind', 'equalto', 'ws') | map(attribute='transport') | list) | list }}
   when: remnawave_caddy_enabled | default(false) | bool
@@ -285,8 +301,8 @@
 
 - name: Compute per-node squad names + existing set
   set_fact:
-    _np_fronted_squad_name: "{{ remnawave_bootstrap_fronted_squad_name }}-{{ random_hostname }}"
-    _np_reality_squad_name: "{{ remnawave_bootstrap_reality_squad_name }}-{{ random_hostname }}"
+    _np_fronted_squad_name: "{{ remnawave_node_fronted_squad_prefix | default('FSF') }}-{{ random_hostname }}"
+    _np_reality_squad_name: "{{ remnawave_node_reality_squad_prefix | default('FSR') }}-{{ random_hostname }}"
     _np_squad_names: >-
       {{ (_np_squads_list.json.response['internalSquads']
           if (_np_squads_list.json.response is mapping and 'internalSquads' in _np_squads_list.json.response)
@@ -361,6 +377,7 @@
            else _np_squads_list2.json.response)
           | selectattr('name', 'equalto', _np_reality_squad_name)
           | map(attribute='uuid') | list | first) | default('', true) }}
+  no_log: true  # per-node squad UUIDs are never logged (match the persist task)
 
 - name: Assert the planned per-node squads resolved
   assert:

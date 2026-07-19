@@ -112,6 +112,7 @@
   set_fact:
     remnawave_fronted_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
     remnawave_reality_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+  no_log: true  # squad UUIDs are never logged
 
 - name: Assert the fronted squad UUID resolved
   assert:

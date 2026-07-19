@@ -17,39 +17,39 @@
     name: wamerican
     state: present
   become: yes
-  when: outline_wss_random_paths | default(true)
+  when: outline_wss_random_paths | default(true) | bool
 
 - name: Generate random word count for TCP path
   set_fact:
     _wss_tcp_path_word_count: "{{ range(outline_wss_random_path_min_words, outline_wss_random_path_max_words + 1) | random }}"
-  when: outline_wss_random_paths | default(true)
+  when: outline_wss_random_paths | default(true) | bool
 
 - name: Generate random word count for UDP path
   set_fact:
     _wss_udp_path_word_count: "{{ range(outline_wss_random_path_min_words, outline_wss_random_path_max_words + 1) | random }}"
-  when: outline_wss_random_paths | default(true)
+  when: outline_wss_random_paths | default(true) | bool
 
 - name: Generate random words for TCP path
   shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ _wss_tcp_path_word_count }}'
   register: _wss_tcp_path_words
-  when: outline_wss_random_paths | default(true)
+  when: outline_wss_random_paths | default(true) | bool
 
 - name: Generate random words for UDP path
   shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ _wss_udp_path_word_count }}'
   register: _wss_udp_path_words
-  when: outline_wss_random_paths | default(true)
+  when: outline_wss_random_paths | default(true) | bool
 
 - name: Set random WebSocket paths from dictionary words
   set_fact:
     effective_wss_tcp_path: "/{{ _wss_tcp_path_words.stdout_lines | join('-') }}"
     effective_wss_udp_path: "/{{ _wss_udp_path_words.stdout_lines | join('-') }}"
-  when: outline_wss_random_paths | default(true)
+  when: outline_wss_random_paths | default(true) | bool
 
 - name: Use configured WebSocket paths
   set_fact:
     effective_wss_tcp_path: "{{ outline_wss_tcp_path }}"
     effective_wss_udp_path: "{{ outline_wss_udp_path }}"
-  when: not (outline_wss_random_paths | default(true))
+  when: not (outline_wss_random_paths | default(true) | bool)
 
 # FCP issues Outline WSS keys with FIXED client paths /tcp and /udp and has no
 # per-server path field. So when registering with FCP, the server's listener

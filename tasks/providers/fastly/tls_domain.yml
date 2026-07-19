@@ -1,0 +1,197 @@
+---
+# tasks/providers/fastly/tls_domain.yml - TLS subscription engine for ONE edge domain
+#
+# Looped by tls.yml with `_tls_job: {domain, zone}`. Flow:
+#   1. Get-or-create the TLS subscription for the domain
+#   2. Extract the ACME dns-01 challenge
+#   3. Create the _acme-challenge CNAME in the domain's zone (Cloudflare)
+#   4. Wait for certificate issuance
+#   5. Extract the edge CNAME target into fastly_cname_targets[domain]
+#
+# The CNAME target is NOT derivable from the domain name (Fastly assigns it
+# per subscription) — never guess it; fail loudly when Fastly reports none.
+
+# ============================================================================
+# Get-or-create the TLS subscription (idempotent)
+# ============================================================================
+# A re-run after a mid-run failure must reuse the existing subscription for the
+# domain — POSTing a duplicate is rejected by Fastly and used to wedge the run.
+- name: Look up an existing TLS subscription for {{ _tls_job.domain }}
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions?filter[tls_domains.id]={{ _tls_job.domain | urlencode }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: _fastly_tls_existing
+
+- name: Reuse the existing TLS subscription id ({{ _tls_job.domain }})
+  set_fact:
+    fastly_tls_subscription_id: "{{ _fastly_tls_existing.json.data | map(attribute='id') | list | first }}"
+  when: _fastly_tls_existing.json.data | default([]) | length > 0
+
+- name: Create Fastly TLS subscription ({{ _tls_job.domain }})
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions"
+    method: POST
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Content-Type: "application/vnd.api+json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      data:
+        type: tls_subscription
+        attributes:
+          certificate_authority: "lets-encrypt"
+        relationships:
+          tls_domains:
+            data:
+              - type: tls_domain
+                id: "{{ _tls_job.domain }}"
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: fastly_tls_sub_result
+  when: _fastly_tls_existing.json.data | default([]) | length == 0
+
+- name: Extract TLS subscription ID ({{ _tls_job.domain }})
+  set_fact:
+    fastly_tls_subscription_id: "{{ fastly_tls_sub_result.json.data.id }}"
+  when: _fastly_tls_existing.json.data | default([]) | length == 0
+
+# ============================================================================
+# Get TLS subscription details (includes ACME challenge info)
+# ============================================================================
+- name: Get TLS subscription details ({{ _tls_job.domain }})
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ fastly_tls_subscription_id }}?include=tls_authorizations"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: fastly_tls_details
+
+- name: Extract ACME challenge info ({{ _tls_job.domain }})
+  set_fact:
+    fastly_tls_challenges: "{{ fastly_tls_details.json.included | selectattr('type', 'equalto', 'tls_authorization') | list }}"
+
+- name: Extract ACME challenge record name and values ({{ _tls_job.domain }})
+  set_fact:
+    fastly_acme_challenge_record: "{{ fastly_tls_challenges[0].attributes.challenges | selectattr('type', 'equalto', 'dns-01') | first }}"
+  when: fastly_tls_challenges | length > 0
+
+# Set per-zone Cloudflare credentials for the ACME record (the fronting zone
+# may live in a different Cloudflare account than base_domain).
+- name: Set zone Cloudflare credentials for ACME ({{ _tls_job.zone }})
+  set_fact:
+    cf_token: "{{ domain_providers[_tls_job.zone].cloudflare_api_token | default(cloudflare_api_token) }}"
+
+- name: Check for an existing ACME challenge CNAME ({{ _tls_job.domain }})
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_tls_job.zone].zone_id }}/dns_records?type=CNAME&name={{ fastly_acme_challenge_record.record_name }}"
+    method: GET
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  register: _acme_dns_existing
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - fastly_acme_challenge_record is defined
+
+- name: Create ACME challenge CNAME record in Cloudflare ({{ _tls_job.domain }})
+  uri:
+    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_tls_job.zone].zone_id }}/dns_records"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{ cf_token }}"
+    body_format: json
+    body:
+      type: "CNAME"
+      name: "{{ fastly_acme_challenge_record.record_name }}"
+      content: "{{ fastly_acme_challenge_record.values | first }}"
+      ttl: 1
+      proxied: false
+    status_code: [200, 201]
+  delegate_to: localhost
+  no_log: true  # carries the Cloudflare API token in the Authorization header
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - fastly_acme_challenge_record is defined
+    - fastly_acme_challenge_record.values | default([]) | length > 0
+    - _acme_dns_existing.json.result | default([]) | length == 0
+  register: acme_dns_result
+
+# ============================================================================
+# Wait for TLS certificate issuance
+# ============================================================================
+- name: Wait for Fastly TLS certificate to be issued ({{ _tls_job.domain }})
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ fastly_tls_subscription_id }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: fastly_tls_status
+  retries: 30
+  delay: 10
+  until: >
+    fastly_tls_status.json.data.attributes.state == 'issued' or
+    fastly_tls_status.json.data.attributes.state == 'renewing'
+
+# ============================================================================
+# Extract CNAME target for DNS routing
+# ============================================================================
+# After TLS is issued, get the specific CNAME Target (e.g., x.sni.global.fastly.net)
+- name: Get TLS domain details for CNAME target ({{ _tls_job.domain }})
+  uri:
+    url: "{{ fastly_api_endpoint }}/tls/activations?filter[tls_subscription.id]={{ fastly_tls_subscription_id }}"
+    method: GET
+    headers:
+      Fastly-Key: "{{ fastly_token }}"
+      Accept: "application/vnd.api+json"
+    status_code: 200
+  delegate_to: localhost
+  no_log: true  # carries the Fastly API token in the Fastly-Key header
+  register: fastly_tls_activations
+
+- name: Extract this domain's Fastly CNAME target
+  set_fact:
+    # The CNAME target comes from the TLS configuration
+    # Format is typically: {letter}.sni.global.fastly.net
+    _tls_cname_target: "{{ fastly_tls_activations.json.data[0].attributes.cname_target | default('') }}"
+  when: fastly_tls_activations.json.data | length > 0
+
+# The CNAME target is NOT derivable from the domain name (Fastly assigns it per
+# subscription) — never guess it. Fail loudly so the operator checks the
+# subscription instead of writing a silently-broken edge CNAME.
+- name: Fail if Fastly did not report a CNAME target ({{ _tls_job.domain }})
+  fail:
+    msg: >-
+      Fastly's /tls/activations returned no cname_target for TLS subscription
+      {{ fastly_tls_subscription_id }} ({{ _tls_job.domain }}). The edge
+      CNAME cannot be written without it — check the subscription state in the
+      Fastly dashboard/API, then re-run.
+  when: _tls_cname_target is not defined or _tls_cname_target == ''
+
+- name: Record this domain's CNAME target
+  set_fact:
+    fastly_cname_targets: "{{ fastly_cname_targets | default({}) | combine({ _tls_job.domain: _tls_cname_target }) }}"
+
+- name: Set the primary CNAME target (legacy consumers)
+  set_fact:
+    fastly_cname_target: "{{ _tls_cname_target }}"
+  when: fastly_cname_target is not defined

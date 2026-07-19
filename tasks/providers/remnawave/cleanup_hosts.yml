@@ -30,15 +30,16 @@
     - old_random_hostname is defined and old_random_hostname | length > 0
     - remnawave_cleanup_hosts_list.json is defined
 
-# Anchor to the full remark shape ({hostname}-{transport}|reality) — a bare
-# prefix match would also hit a DIFFERENT node whose hostname extends this one
-# (e.g. 'quiet-falcon' would match 'quiet-falcon-2-ws').
+# Anchor to the full remark shape ({hostname}-{transport}|reality, with an
+# optional multi-edge 6-hex domain suffix) — a bare prefix match would also hit
+# a DIFFERENT node whose hostname extends this one (e.g. 'quiet-falcon' would
+# match 'quiet-falcon-2-ws').
 - name: Select OLD Host UUIDs by exact remark match
   set_fact:
     _old_host_uuids: "{{ _remnawave_cleanup_hosts | selectattr('remark', 'match', _old_remark_pattern) | map(attribute='uuid') | list }}"
   vars:
     _old_remark_pattern: >-
-      ^{{ old_random_hostname }}-({{ (remnawave_cdn_transports | default([]) | map(attribute='name') | list + ['reality']) | join('|') }})$
+      ^{{ old_random_hostname }}-(({{ (remnawave_cdn_transports | default([]) | map(attribute='name') | list + ['reality']) | join('|') }}))(-[0-9a-f]{6})?$
   when:
     - old_random_hostname is defined and old_random_hostname | length > 0
     - remnawave_cleanup_hosts_list.json is defined

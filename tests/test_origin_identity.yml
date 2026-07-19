@@ -1,0 +1,301 @@
+---
+# tests/test_origin_identity.yml
+#
+# Exercises tasks/providers/fastly/origin_identity.yml (included for real,
+# offline) + the naming expressions P2 introduced:
+#   1. suffix generation: real lookup produces 8 [a-z0-9] chars
+#   2. shared mode:      dns_hostname is RESHAPED to the suffixed origin FQDN
+#   3. legacy custom:    dns_hostname stays clean; origin is separate
+#   4. fronting domains: imply the custom flow + longest-suffix zone resolution
+#   5. mutual exclusion: fronting + shared selectors / legacy custom -> fail
+#   6. expressions: node-address fallback, multi-edge Host remark + cleanup regex
+#
+# NOTE: plays share a host, so facts set via set_fact (by the included file)
+# LEAK between plays and outrank play vars — every play after the first
+# re-establishes its full state via set_fact in pre_tasks (the same fresh-host
+# simulation test_integration.yml uses).
+#
+# Run: ansible-playbook tests/test_origin_identity.yml
+
+# --- 1. real suffix generation (MUST run first, before any suffix fact exists) -
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "apple-banana-cherry"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    effective_fastly_domain_mode: "shared"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+  pre_tasks:
+    - name: Establish a clean dns_hostname
+      set_fact:
+        dns_hostname: "apple-banana-cherry.freesocks.org"
+  tasks:
+    - name: Include origin_identity.yml (real random suffix)
+      include_tasks: ../tasks/providers/fastly/origin_identity.yml
+
+    - name: Assert the generated suffix shape
+      assert:
+        that:
+          - fastly_origin_suffix | length == 8
+          - fastly_origin_suffix is match('^[a-z0-9]{8}$')
+          - fastly_origin_fqdn == 'apple-banana-cherry-' ~ fastly_origin_suffix ~ '.freesocks.org'
+        success_msg: "generated suffix: 8 lowercase alnum chars."
+
+# --- 2. shared mode: dns_hostname becomes the origin FQDN --------------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "apple-banana-cherry"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        dns_hostname: "apple-banana-cherry.freesocks.org"
+        effective_fastly_domain_mode: "shared"
+        fastly_origin_suffix: "a1b2c3d4" # deterministic; include skips generation
+        fastly_origin_fqdn: ""
+        fastly_fronting_domains: []
+        fastly_fronting_zones: {}
+        fastly_edge_label: ""
+        fastly_edge_random: false
+  tasks:
+    - name: Include the real origin_identity.yml (shared mode)
+      include_tasks: ../tasks/providers/fastly/origin_identity.yml
+
+    - name: Assert shared-mode reshaping
+      assert:
+        that:
+          - fastly_origin_name == 'apple-banana-cherry-a1b2c3d4'
+          - fastly_origin_fqdn == 'apple-banana-cherry-a1b2c3d4.freesocks.org'
+          - dns_hostname == 'apple-banana-cherry-a1b2c3d4.freesocks.org'
+          - effective_fastly_domain_mode == 'shared'
+        success_msg: "shared: dns_hostname reshaped to the suffixed origin FQDN."
+
+# --- 3. legacy custom mode: dns_hostname stays clean --------------------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "apple-banana-cherry"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        dns_hostname: "apple-banana-cherry.freesocks.org"
+        effective_fastly_domain_mode: "custom"
+        fastly_origin_suffix: "a1b2c3d4"
+        fastly_origin_fqdn: ""
+        fastly_fronting_domains: []
+        fastly_fronting_zones: {}
+        fastly_edge_label: ""
+        fastly_edge_random: false
+  tasks:
+    - name: Include the real origin_identity.yml (legacy custom mode)
+      include_tasks: ../tasks/providers/fastly/origin_identity.yml
+
+    - name: Assert legacy-custom keeps the clean dns_hostname + separate origin
+      assert:
+        that:
+          - dns_hostname == 'apple-banana-cherry.freesocks.org'
+          - fastly_origin_fqdn == 'apple-banana-cherry-a1b2c3d4.freesocks.org'
+          - effective_fastly_domain_mode == 'custom'
+        success_msg: "legacy custom: clean dns_hostname, separate suffixed origin."
+
+# --- 4. fronting domains: custom flow + longest-suffix zone match -------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "xray1-front-mci1-fs-ce"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+      video-streams.org: { dns_provider: cloudflare, zone_id: "z2" }
+      static.net: { dns_provider: cloudflare, zone_id: "z3" }
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        dns_hostname: "xray1-front-mci1-fs-ce.freesocks.org"
+        effective_fastly_domain_mode: "shared"
+        fastly_origin_suffix: "a1b2c3d4"
+        fastly_origin_fqdn: ""
+        fastly_fronting_domains:
+          - "video-streams.org"
+          - "cdn.video-streams.org"
+          - "app.static.net"
+        fastly_fronting_zones: {}
+        fastly_edge_label: ""
+        fastly_edge_random: false
+  tasks:
+    - name: Include the real origin_identity.yml (fronting mode)
+      include_tasks: ../tasks/providers/fastly/origin_identity.yml
+
+    - name: Assert fronting implies custom + origin-shaped dns_hostname
+      assert:
+        that:
+          - effective_fastly_domain_mode == 'custom'
+          - dns_hostname == 'xray1-front-mci1-fs-ce-a1b2c3d4.freesocks.org'
+        success_msg: "fronting: custom flow, origin-shaped dns_hostname."
+
+    - name: Assert longest-suffix zone resolution per domain
+      assert:
+        that:
+          - fastly_fronting_zones['video-streams.org'] == 'video-streams.org'
+          - fastly_fronting_zones['cdn.video-streams.org'] == 'video-streams.org'
+          - fastly_fronting_zones['app.static.net'] == 'static.net'
+        success_msg: "fronting zones resolved by longest suffix."
+
+# --- 5a. mutual exclusion: fronting + shared label fails ----------------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "apple-banana-cherry"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+      video-streams.org: { dns_provider: cloudflare, zone_id: "z2" }
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        dns_hostname: "apple-banana-cherry.freesocks.org"
+        effective_fastly_domain_mode: "shared"
+        fastly_origin_suffix: "a1b2c3d4"
+        fastly_origin_fqdn: ""
+        fastly_fronting_domains: ["video-streams.org"]
+        fastly_fronting_zones: {}
+        fastly_edge_label: "cdn-content"
+        fastly_edge_random: false
+        _conflict_not_detected: ""
+  tasks:
+    - name: Expect the mutual-exclusion assert to fire
+      block:
+        - name: Include origin_identity.yml with conflicting selectors
+          include_tasks: ../tasks/providers/fastly/origin_identity.yml
+        - name: Mark that no failure occurred (should not happen)
+          set_fact:
+            _conflict_not_detected: "yes"
+      rescue:
+        - name: Assert the run failed as expected
+          debug: { msg: "fronting + edge_label correctly rejected" }
+    - name: Assert the conflict was caught
+      assert:
+        that:
+          - _conflict_not_detected != 'yes'
+        fail_msg: "fronting + fastly_edge_label should hard-fail but did not"
+
+# --- 5b. mutual exclusion: fronting + legacy custom mode fails ----------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "apple-banana-cherry"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+      video-streams.org: { dns_provider: cloudflare, zone_id: "z2" }
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        dns_hostname: "apple-banana-cherry.freesocks.org"
+        effective_fastly_domain_mode: "custom"
+        fastly_origin_suffix: "a1b2c3d4"
+        fastly_origin_fqdn: ""
+        fastly_fronting_domains: ["video-streams.org"]
+        fastly_fronting_zones: {}
+        fastly_edge_label: ""
+        fastly_edge_random: false
+        _conflict_not_detected: ""
+  tasks:
+    - name: Expect the legacy-custom conflict assert to fire
+      block:
+        - name: Include origin_identity.yml with fronting + custom mode
+          include_tasks: ../tasks/providers/fastly/origin_identity.yml
+        - name: Mark that no failure occurred (should not happen)
+          set_fact:
+            _conflict_not_detected: "yes"
+      rescue:
+        - name: Assert the run failed as expected
+          debug: { msg: "fronting + legacy custom correctly rejected" }
+    - name: Assert the conflict was caught
+      assert:
+        that:
+          - _conflict_not_detected != 'yes'
+        fail_msg: "fronting + fastly_domain_mode: custom should hard-fail but did not"
+
+# --- 6. expressions: node address, Host remark, cleanup regex ------------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "quiet-falcon"
+    dns_hostname: "quiet-falcon.freesocks.org"
+    _domains: ["video-streams.org", "cdn-static.net"]
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        dns_hostname: "quiet-falcon.freesocks.org"
+        fastly_origin_fqdn: "quiet-falcon-a1b2c3d4.freesocks.org"
+  tasks:
+    - name: Node address follows the origin when fronted (defaults expression)
+      vars:
+        remnawave_node_address: "{{ fastly_origin_fqdn | default(dns_hostname, true) }}"
+      assert:
+        that:
+          - remnawave_node_address == 'quiet-falcon-a1b2c3d4.freesocks.org'
+        success_msg: "node address = origin FQDN when fronted."
+
+    - name: Node address falls back to dns_hostname when not fronted
+      vars:
+        remnawave_node_address: "{{ _nofqdn | default(dns_hostname, true) }}"
+      assert:
+        that:
+          - remnawave_node_address == 'quiet-falcon.freesocks.org'
+        success_msg: "node address = dns_hostname when not fronted."
+
+    - name: Multi-edge Host remarks are distinct + deterministic (6-hex domain hash)
+      vars:
+        _r1: "{{ random_hostname }}-ws{{ '-' ~ (_domains[0] | hash('sha256') | truncate(6, true, '')) }}"
+        _r2: "{{ random_hostname }}-ws{{ '-' ~ (_domains[1] | hash('sha256') | truncate(6, true, '')) }}"
+      assert:
+        that:
+          - _r1 != _r2
+          - _r1 is match('^quiet-falcon-ws-[0-9a-f]{6}$')
+          - (_domains[0] | hash('sha256') | truncate(6, true, '')) == (_domains[0] | hash('sha256') | truncate(6, true, ''))
+          - _r1 | length <= 40
+        success_msg: "multi-edge remarks: distinct, deterministic, <= 40 chars."
+
+    - name: Cleanup regex matches bare + hashed remarks, rejects hostname-extension collisions
+      vars:
+        _pattern: >-
+          ^quiet-falcon-((ws|reality))(-[0-9a-f]{6})?$
+        _hit_bare: "quiet-falcon-ws"
+        _hit_hash: "quiet-falcon-ws-a1b2c3"
+        _hit_reality: "quiet-falcon-reality"
+        _miss_extended: "quiet-falcon-2-ws"
+        _miss_suffix: "quiet-falcon-ws-zzzzzz"
+      assert:
+        that:
+          - _hit_bare is match(_pattern)
+          - _hit_hash is match(_pattern)
+          - _hit_reality is match(_pattern)
+          - _miss_extended is not match(_pattern)
+          - _miss_suffix is not match(_pattern)
+        success_msg: "cleanup regex: exact remarks only, no prefix collisions."
+
+    - name: All origin-identity tests passed
+      debug:
+        msg: "All origin-identity tests passed."

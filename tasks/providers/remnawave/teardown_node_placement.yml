@@ -24,15 +24,18 @@
   register: _td_squad_file
   become: "{{ remnawave_persist_become | default(true) }}"
   failed_when: false
+  no_log: true  # content carries the per-node squad UUIDs
 
 - name: Materialize the persisted squad file lines
   set_fact:
     _td_lines: "{{ ((_td_squad_file.content | default('') | b64decode) if (_td_squad_file.content is defined) else '') | split('\n') }}"
+  no_log: true
 
 - name: Parse the persisted squad UUIDs
   set_fact:
     _td_fronted_uuid: "{{ _td_lines | select('match', '^fronted=') | map('regex_replace', '^fronted=', '') | list | first | default('') }}"
     _td_reality_uuid: "{{ _td_lines | select('match', '^reality=') | map('regex_replace', '^reality=', '') | list | first | default('') }}"
+  no_log: true
 
 # Fallback: resolve by the deterministic per-node names when the file is gone.
 - name: Resolve per-node squads by name (fallback)
@@ -57,14 +60,15 @@
           {{ ((_td_squads_list.json.response['internalSquads']
                if (_td_squads_list.json.response is mapping and 'internalSquads' in _td_squads_list.json.response)
                else _td_squads_list.json.response)
-              | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name ~ '-' ~ random_hostname)
+              | selectattr('name', 'equalto', (remnawave_node_fronted_squad_prefix | default('FSF')) ~ '-' ~ random_hostname)
               | map(attribute='uuid') | list | first) | default('', true) }}
         _td_reality_uuid: >-
           {{ ((_td_squads_list.json.response['internalSquads']
                if (_td_squads_list.json.response is mapping and 'internalSquads' in _td_squads_list.json.response)
                else _td_squads_list.json.response)
-              | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name ~ '-' ~ random_hostname)
+              | selectattr('name', 'equalto', (remnawave_node_reality_squad_prefix | default('FSR')) ~ '-' ~ random_hostname)
               | map(attribute='uuid') | list | first) | default('', true) }}
+      no_log: true  # squad UUIDs are never logged
 
 - name: Nothing to tear down?
   debug:

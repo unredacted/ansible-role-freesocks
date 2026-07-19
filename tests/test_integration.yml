@@ -5,18 +5,20 @@
 # and exports REMNAWAVE_TEST_URL / REMNAWAVE_TEST_TOKEN / FCP_MOCK_URL).
 #
 # What it proves, in order:
-#   1. operation_mode=bootstrap creates the Config Profile with the no-log
-#      posture + base inbounds, and sets the FCP default mode.
-#   2. Per-node placement (node 1, WS + Reality): inbound clones + squads on
-#      the panel, pool append in FCP, node registration, a PATCH /api/nodes
+#   1. operation_mode=bootstrap creates the Config Profile (FreeSocks-Config,
+#      no-log posture) + base inbounds + the SHARED squads (FreeSocks-Fastly /
+#      FreeSocks-Reality), binds them to FCP's mode pools, sets the default mode.
+#   2. Shared-model node (node 1): registers against the BASE inbounds — no
+#      clones, no per-node squads, no pool appends. A PATCH /api/nodes
 #      round-trip (the change/migrate contract), panel registration with
 #      maxKeys/priority + the strict test-connection probe, and mock-FCP scope
 #      enforcement (a read-only token 403s on the by-slug PUT).
-#   3. Idempotent re-run: no duplicate inbounds/squads.
-#   4. Node 2 (WS only): a SECOND same-port inbound clone in the same profile
-#      (the duplicate-port VERIFY item) + append-only pool growth.
-#   5. Teardown (node 1): pool detach, squad delete, inbound strip, node
-#      DELETE /api/nodes/{uuid} — node 2 untouched.
+#   3. Node 2 registers the same way — shared state undisturbed.
+#   4. Teardown (node 1): Host cleanup + node DELETE — the shared squads,
+#      pools, and profile are untouched; node 2 intact.
+#   5. LEGACY per-node placement (remnawave_per_node_placement=true): inbound
+#      clones + FSF-/FSR- squads, pool append, duplicate-port tolerance,
+#      teardown strips everything the legacy path created.
 
 # --- shared expressions ------------------------------------------------------
 - name: Integration — phase 1 (panel bootstrap through the role)
@@ -53,7 +55,7 @@
     # ansible-core 2.19+ (the same quirk the role files avoid).
     - name: Materialize the bootstrap profile
       set_fact:
-        _t1_profile: "{{ _profiles.json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first }}"
+        _t1_profile: "{{ _profiles.json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first }}"
     - name: Assert the profile exists with the no-log posture + base inbounds
       assert:
         that:
@@ -65,17 +67,30 @@
           - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_WS_CDN') | list | length == 1
           - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_REALITY') | list | length == 1
         fail_msg: "Bootstrap profile missing or not born with the no-log Xray posture"
-    - name: Read the mock FCP state
-      uri: { url: "{{ fcp_api_url }}/__state", return_content: yes }
-      register: _fcp1
-    - name: Assert the default mode was bound and no squads were created (per-node model)
+    - name: Read back the squads + mock FCP state
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+        - "{{ fcp_api_url }}/__state"
+      register: _t1_state
+    - name: Materialize the squad list + FCP state
+      set_fact:
+        _t1_squads: "{{ _t1_state.results[0].json.response.internalSquads | map(attribute='name') | list }}"
+        _t1_fcp: "{{ _t1_state.results[1].json }}"
+    - name: Assert the shared squads were created and bound to the pools
       assert:
         that:
-          - _fcp1.json.defaultMode == 'evade'
-          - (_fcp1.json.pools.evade | default([])) | length == 0
-        fail_msg: "Bootstrap should bind the default mode but create no shared squads by default"
+          - _t1_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
+          - _t1_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
+          - _t1_fcp.defaultMode == 'evade'
+          - _t1_fcp.pools.evade | length == 1
+          - _t1_fcp.pools.privacy | length == 1
+        fail_msg: "Bootstrap should create + bind the shared squads (FreeSocks-Fastly / FreeSocks-Reality)"
 
-- name: Integration — phase 2 (node 1 per-node placement + registration)
+- name: Integration — phase 2 (node 1, shared model — no clones/squads/appends)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -112,55 +127,12 @@
       vars:
         _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
   tasks:
-    - name: Create per-node placement objects (node 1)
-      include_role:
-        name: "{{ playbook_dir | dirname | basename }}"
-        tasks_from: providers/remnawave/create_node_placement
-    - name: Capture the profile inbound count after the first run
-      uri:
-        url: "{{ remnawave_panel_url }}/api/config-profiles"
-        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
-        return_content: yes
-      register: _profiles_a
-    - name: Re-run per-node placement (idempotency)
-      include_role:
-        name: "{{ playbook_dir | dirname | basename }}"
-        tasks_from: providers/remnawave/create_node_placement
-    - name: Read back profile + squads after the re-run
-      uri:
-        url: "{{ remnawave_panel_url }}{{ item }}"
-        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
-        return_content: yes
-      loop: ["/api/config-profiles", "/api/internal-squads"]
-      register: _panel_b
-    - name: Materialize the phase-2 panel state
-      set_fact:
-        _t2_tags: "{{ (_panel_b.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
-        _t2_tags_a: "{{ (_profiles_a.json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
-        _t2_squads: "{{ _panel_b.results[1].json.response.internalSquads | map(attribute='name') | list }}"
-    - name: Assert per-node inbounds + squads (and idempotent re-run)
-      assert:
-        that:
-          - _t2_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_ONE') | list | length == 1
-          - _t2_tags | select('equalto', 'VLESS_REALITY_CI_NODE_ONE') | list | length == 1
-          - _t2_tags | length == (_t2_tags_a | length)  # re-run added nothing
-          - _t2_squads | select('equalto', 'FreeSocks-Fronted-ci-node-one') | list | length == 1
-          - _t2_squads | select('equalto', 'FreeSocks-Reality-ci-node-one') | list | length == 1
-        fail_msg: "Per-node inbound/squad creation is wrong or not idempotent"
-    - name: Add node 1's squads to the FCP pools (as main.yml does)
-      include_role:
-        name: "{{ playbook_dir | dirname | basename }}"
-        tasks_from: providers/fcp/bind_placements
-      vars:
-        _fcp_placement_modes: >-
-          {{ ({'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
-              if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {})
-             | combine({'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
-              if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {}) }}
+    # Shared model: the node activates the BASE inbounds verbatim — this is the
+    # same derivation setup/remnawave.yml does when per-node placement is off.
     - name: Derive active inbounds + register the node (as setup/remnawave.yml does)
       set_fact:
         remnawave_panel_active_inbounds: >-
-          {{ (remnawave_cdn_transports | selectattr('enabled') | map(attribute='inbound_uuid')
+          {{ (remnawave_cdn_transports | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
               | select('string') | reject('equalto', '') | list)
              + ([remnawave_reality_inbound_uuid] if (remnawave_reality_inbound_uuid | default('') | length > 0) else []) }}
     - name: Register node 1 with the panel
@@ -218,30 +190,37 @@
         body_format: json
         body: { backend: "outline", apiUrl: "https://ci-scope-probe.example.test" }
         status_code: [403]
-    - name: Read panel nodes + mock FCP state
+    - name: Read panel nodes + squads + profile + mock FCP state
       uri:
         url: "{{ item }}"
         headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
         return_content: yes
       loop:
         - "{{ remnawave_panel_url }}/api/nodes"
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+        - "{{ remnawave_panel_url }}/api/config-profiles"
         - "{{ fcp_api_url }}/__state"
       register: _phase2
-    - name: Materialize the phase-2 node list + FCP state
+    - name: Materialize the phase-2 state
       set_fact:
         _t2_nodes: "{{ _phase2.results[0].json.response['nodes'] if (_phase2.results[0].json.response is mapping and 'nodes' in _phase2.results[0].json.response) else _phase2.results[0].json.response }}"
-        _t2_state: "{{ _phase2.results[1].json }}"
-    - name: Assert node registered + pools/panel row in FCP
+        _t2_squads: "{{ _phase2.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+        _t2_tags: "{{ (_phase2.results[2].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t2_state: "{{ _phase2.results[3].json }}"
+    - name: Assert node registered and NOTHING per-node was created
       assert:
         that:
           - _t2_nodes | selectattr('name', 'equalto', 'ci-node-one') | list | length == 1
+          # shared model: no per-node squads, no inbound clones, no pool appends
+          - _t2_squads | select('search', '-ci-node') | list | length == 0
+          - _t2_tags | select('search', '_CI_NODE') | list | length == 0
           - _t2_state.pools.evade | length == 1
           - _t2_state.pools.privacy | length == 1
           - _t2_state.servers['ci-panel'].maxKeys == 100
           - _t2_state.servers['ci-panel'].priority == 5
-        fail_msg: "Node registration / FCP pool append / panel upsert drifted"
+        fail_msg: "Shared-model node registration created per-node objects or drifted FCP state"
 
-- name: Integration — phase 3 (node 2, WS only — duplicate-port + pool append)
+- name: Integration — phase 3 (node 2, shared model — state undisturbed)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -272,30 +251,37 @@
       vars:
         _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
   tasks:
-    # THE duplicate-port VERIFY item: node 2's WS clone reuses port 8443 in the
-    # SAME profile as node 1's clone. If the panel rejects duplicate inbound
-    # ports, this include fails and CI catches it before any production deploy.
-    - name: Create per-node placement objects (node 2)
+    - name: Derive active inbounds + register node 2 (shared model)
+      set_fact:
+        remnawave_panel_active_inbounds: >-
+          {{ remnawave_cdn_transports | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+             | select('string') | reject('equalto', '') | list }}
+    - name: Register node 2 with the panel
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
-        tasks_from: providers/remnawave/create_node_placement
-    - name: Add node 2's squad to the FCP evade pool
-      include_role:
-        name: "{{ playbook_dir | dirname | basename }}"
-        tasks_from: providers/fcp/bind_placements
-      vars:
-        _fcp_placement_modes: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} }}"
-    - name: Read the mock FCP state
-      uri: { url: "{{ fcp_api_url }}/__state", return_content: yes }
-      register: _fcp3
-    - name: Assert append-only pool growth (node 1 undisturbed)
+        tasks_from: providers/remnawave/register_node
+    - name: Read the mock FCP state + squads
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ fcp_api_url }}/__state"
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+      register: _phase3
+    - name: Materialize phase-3 state
+      set_fact:
+        _t3_fcp: "{{ _phase3.results[0].json }}"
+        _t3_squads: "{{ _phase3.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+    - name: Assert the shared pools + squads are undisturbed
       assert:
         that:
-          - _fcp3.json.pools.evade | length == 2
-          - _fcp3.json.pools.privacy | length == 1
-        fail_msg: "Pool append disturbed existing membership"
+          - _t3_fcp.pools.evade | length == 1
+          - _t3_fcp.pools.privacy | length == 1
+          - _t3_squads | select('search', '-ci-node') | list | length == 0
+        fail_msg: "A shared-model node disturbed the pools or created per-node squads"
 
-- name: Integration — phase 4 (teardown node 1; node 2 untouched)
+- name: Integration — phase 4 (teardown node 1; shared state untouched)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -303,6 +289,7 @@
     <<: *ci_vars
     operation_mode: deploy
     random_hostname: "ci-node-one"
+    old_random_hostname: "ci-node-one"
     remnawave_node_install_dir: "/tmp/role-ci/node1"
   pre_tasks:
     # Each phase simulates a DIFFERENT node on the same localhost. Real deploys
@@ -321,10 +308,12 @@
       vars:
         _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
   tasks:
-    - name: Tear down node 1's placement
+    # Shared-model retire = Host cleanup + node DELETE. Squads/pools/profile
+    # belong to the fleet, not the node.
+    - name: Delete node 1's Hosts (shared-model retire)
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
-        tasks_from: providers/remnawave/teardown_node_placement
+        tasks_from: providers/remnawave/cleanup_hosts
 
     # DELETE /api/nodes/{uuid} — the force_wipe path's contract, pinned here.
     - name: Read node 1's persisted UUID
@@ -356,21 +345,191 @@
       register: _phase4
     - name: Materialize the phase-4 panel state
       set_fact:
-        _t4_tags: "{{ (_phase4.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t4_tags: "{{ (_phase4.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first).config.inbounds | map(attribute='tag') | list }}"
         _t4_squads: "{{ _phase4.results[1].json.response.internalSquads | map(attribute='name') | list }}"
         _t4_state: "{{ _phase4.results[2].json }}"
         _t4_nodes: "{{ _phase4.results[3].json.response['nodes'] if (_phase4.results[3].json.response is mapping and 'nodes' in _phase4.results[3].json.response) else _phase4.results[3].json.response }}"
-    - name: Assert node 1 fully detached and node 2 intact
+    - name: Assert node 1 is gone and the shared state is untouched
       assert:
         that:
-          - _t4_tags | select('search', '_CI_NODE_ONE$') | list | length == 0
-          - _t4_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_TWO') | list | length == 1
-          - _t4_squads | select('search', '-ci-node-one$') | list | length == 0
-          - _t4_squads | select('equalto', 'FreeSocks-Fronted-ci-node-two') | list | length == 1
-          - _t4_state.pools.evade | length == 1
-          - _t4_state.pools.privacy | length == 0
           - _t4_nodes | selectattr('name', 'equalto', 'ci-node-one') | list | length == 0
-        fail_msg: "Teardown left node-1 residue or disturbed node 2"
+          - _t4_nodes | selectattr('name', 'equalto', 'ci-node-two') | list | length == 1
+          - _t4_tags | length == 2  # the two base inbounds, nothing cloned
+          - _t4_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
+          - _t4_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
+          - _t4_state.pools.evade | length == 1
+          - _t4_state.pools.privacy | length == 1
+        fail_msg: "Shared-model teardown left node-1 residue or disturbed the fleet state"
+
+- name: "Integration — phase 5 (LEGACY per-node placement: clones, squads, pools, teardown)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    <<: *ci_vars
+    operation_mode: deploy
+    random_hostname: "ci-node-three"
+    dns_hostname: "ci-node-three.example.test"
+    remnawave_caddy_enabled: true
+    remnawave_reality_enabled: true
+    remnawave_per_node_placement: true
+    remnawave_node_install_dir: "/tmp/role-ci/node3"
+  pre_tasks:
+    - meta: clear_facts
+    - name: Ensure node 3 install dir exists
+      file: { path: "{{ remnawave_node_install_dir }}", state: directory, mode: '0755' }
+    - name: Reload node-deploy vars from the bootstrap output (fresh-host simulation)
+      set_fact:
+        remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
+        remnawave_reality_inbound_uuid: "{{ _boot.remnawave_reality_inbound_uuid }}"
+        remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
+      vars:
+        _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
+  tasks:
+    - name: Create per-node placement objects (node 3, legacy path)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_node_placement
+    - name: Re-run per-node placement (idempotency)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_node_placement
+    - name: Add node 3's squads to the FCP pools (as legacy main.yml does)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/fcp/bind_placements
+      vars:
+        _fcp_placement_modes: >-
+          {{ ({'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
+              if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {})
+             | combine({'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
+              if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {}) }}
+    - name: Read back panel + FCP after node 3's legacy creates
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ remnawave_panel_url }}/api/config-profiles"
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+        - "{{ fcp_api_url }}/__state"
+      register: _phase5
+    - name: Materialize the phase-5 state
+      set_fact:
+        _t5_tags: "{{ (_phase5.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t5_squads: "{{ _phase5.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+        _t5_state: "{{ _phase5.results[2].json }}"
+    - name: Assert legacy clones + FSF-/FSR- squads + appends (idempotent re-run)
+      assert:
+        that:
+          - _t5_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_THREE') | list | length == 1
+          - _t5_tags | select('equalto', 'VLESS_REALITY_CI_NODE_THREE') | list | length == 1
+          - _t5_squads | select('equalto', 'FSF-ci-node-three') | list | length == 1
+          - _t5_squads | select('equalto', 'FSR-ci-node-three') | list | length == 1
+          - _t5_state.pools.evade | length == 2   # shared + node3
+          - _t5_state.pools.privacy | length == 2 # shared + node3
+        fail_msg: "Legacy per-node placement (clones/squads/appends/idempotency) drifted"
+
+- name: "Integration — phase 6 (LEGACY node 4: duplicate-port, then tear down node 3)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    <<: *ci_vars
+    operation_mode: deploy
+    random_hostname: "ci-node-four"
+    dns_hostname: "ci-node-four.example.test"
+    remnawave_caddy_enabled: true
+    remnawave_reality_enabled: false
+    remnawave_per_node_placement: true
+    remnawave_node_install_dir: "/tmp/role-ci/node4"
+  pre_tasks:
+    # Node 3's include REPOINTED the transports facts at its own clones — a
+    # fresh host would load the BASE uuids from the bootstrap file, so force
+    # them back the way the real (one-play-per-host) flow sees them.
+    - meta: clear_facts
+    - name: Ensure node 4 install dir exists
+      file: { path: "{{ remnawave_node_install_dir }}", state: directory, mode: '0755' }
+    - name: Reload node-deploy vars from the bootstrap output (fresh-host simulation)
+      set_fact:
+        remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
+        remnawave_reality_inbound_uuid: "{{ _boot.remnawave_reality_inbound_uuid }}"
+        remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
+      vars:
+        _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
+  tasks:
+    # Node 4 (WS only): a SECOND same-port (8443) inbound clone in the SAME
+    # profile — the duplicate-port VERIFY item, kept from the old suite.
+    - name: Create per-node placement objects (node 4, duplicate-port verify)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_node_placement
+    - name: Add node 4's squad to the FCP evade pool
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/fcp/bind_placements
+      vars:
+        _fcp_placement_modes: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} }}"
+    - name: Read back panel + FCP after node 4's legacy creates
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ remnawave_panel_url }}/api/config-profiles"
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+        - "{{ fcp_api_url }}/__state"
+      register: _phase6
+    - name: Materialize the phase-6 state
+      set_fact:
+        _t6_tags: "{{ (_phase6.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t6_squads: "{{ _phase6.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+        _t6_state: "{{ _phase6.results[2].json }}"
+    - name: Assert node 4's clone + squad + append landed alongside node 3
+      assert:
+        that:
+          - _t6_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_FOUR') | list | length == 1
+          - _t6_squads | select('equalto', 'FSF-ci-node-four') | list | length == 1
+          - _t6_state.pools.evade | length == 3   # shared + node3 + node4
+          - _t6_state.pools.privacy | length == 2 # shared + node3
+        fail_msg: "Node 4's legacy placement drifted (duplicate-port tolerance?)"
+
+    # Tear node 3 down: the legacy path must strip exactly what it created.
+    - name: Tear down node 3's placement
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/teardown_node_placement
+      vars:
+        random_hostname: "ci-node-three"
+        remnawave_node_install_dir: "/tmp/role-ci/node3"
+    - name: Read back panel + FCP after the legacy teardown
+      uri:
+        url: "{{ item }}"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      loop:
+        - "{{ remnawave_panel_url }}/api/config-profiles"
+        - "{{ remnawave_panel_url }}/api/internal-squads"
+        - "{{ fcp_api_url }}/__state"
+      register: _phase6b
+    - name: Materialize the post-teardown state
+      set_fact:
+        _t6b_tags: "{{ (_phase6b.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _t6b_squads: "{{ _phase6b.results[1].json.response.internalSquads | map(attribute='name') | list }}"
+        _t6b_state: "{{ _phase6b.results[2].json }}"
+    - name: Assert node 3 fully stripped, node 4 + shared state intact
+      assert:
+        that:
+          - _t6b_tags | select('search', '_CI_NODE_THREE$') | list | length == 0
+          - _t6b_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_FOUR') | list | length == 1
+          - _t6b_squads | select('search', '-ci-node-three$') | list | length == 0
+          - _t6b_squads | select('equalto', 'FSF-ci-node-four') | list | length == 1
+          - _t6b_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
+          - _t6b_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
+          - _t6b_state.pools.evade | length == 2   # shared + node4
+          - _t6b_state.pools.privacy | length == 1 # shared
+        fail_msg: "Legacy teardown left node-3 residue or disturbed node 4 / shared state"
+
     - name: All integration phases passed
       debug:
-        msg: "Integration OK: bootstrap, per-node placement (x2, idempotent, duplicate-port), pool append/detach, node PATCH/DELETE, teardown."
+        msg: "Integration OK: bootstrap (shared squads bound), shared-model nodes x2 (no clones/appends), retire (Hosts+node), legacy per-node placement x2 (idempotent, duplicate-port) + teardown."

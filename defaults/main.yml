@@ -1,10 +1,12 @@
 # defaults/main.yml - Default variables for the role
 
-# Operation mode: 'deploy', 'migrate', 'change', or 'update'
+# Operation mode: 'deploy', 'migrate', 'change', 'update', or 'bootstrap'
 # - deploy: Install server with selected components (outline, slipstream, etc.)
 # - migrate: Migrate server and its components from source to destination host
 # - change: Rotate hostname on existing server (for DNS blocking bypass)
 # - update: Add components (slipstream, WSS) to an existing server
+# - bootstrap: One-time Remnawave PANEL setup (config profile + shared squads
+#   + FCP mode-pool binding; host-agnostic, no host touched)
 # operation_mode: deploy
 
 # ============================================================================
@@ -295,22 +297,30 @@ remnawave_panel_api_token: "" # vault-encrypted; created via Panel UI → Tokens
 remnawave_panel_register_node: false
 remnawave_panel_config_profile_uuid: "" # REQUIRED when register_node=true
 remnawave_panel_active_inbounds: [] # REQUIRED when register_node=true
-# Per-node placement (default ON; needs register_node=true): give this node its
-# own config-profile inbound clones (VLESS_WS_CDN_<HOSTNAME> / VLESS_REALITY_
-# <HOSTNAME>) + its own internal squad(s), activate ONLY those, and append the
-# squad UUID(s) to FCP's per-mode placement pools (evade <- fronted squad,
-# privacy <- Reality squad). This is what lets FCP home each new key to the
-# least-loaded node. OFF = the legacy shared-squad topology (all nodes are one
-# unit; see remnawave_bootstrap_shared_squads). Teardown when retiring a node:
-# providers/remnawave/teardown_node_placement.yml.
-remnawave_per_node_placement: true
+# Per-node placement (LEGACY opt-in, default OFF; needs register_node=true):
+# give this node its own config-profile inbound clones (VLESS_WS_CDN_<HOSTNAME>
+# / VLESS_REALITY_<HOSTNAME>) + its own internal squad(s)
+# (<remnawave_node_fronted_squad_prefix>-<hostname>), activate ONLY those, and
+# append the squad UUID(s) to FCP's per-mode placement pools. OFF (default) =
+# the shared-squad model: every node activates the SHARED base inbounds and the
+# panel-wide squads (FreeSocks-Fastly / FreeSocks-Reality, created at bootstrap)
+# span the fleet — subscriptions carry every node's Host, FCP pools are bound
+# once at bootstrap, and rotation/teardown never touches squads. Panel limit:
+# squad names are capped at 30 chars, so the legacy per-node path uses the
+# SHORT prefixes below (hostname must be <= 26 chars there).
+remnawave_per_node_placement: false
+# Legacy per-node squad naming (remnawave_per_node_placement=true only).
+remnawave_node_fronted_squad_prefix: "FSF"
+remnawave_node_reality_squad_prefix: "FSR"
 remnawave_panel_country_code: "XX" # 2-letter ISO; panel default is "XX"
 # The address the PANEL dials to manage the node (control plane, node_port 2222).
-# Defaults to the public data-plane hostname; override to a Tailscale MagicDNS
-# name / IP (e.g. "{{ inventory_hostname }}") when the panel reaches nodes over
+# Defaults to the node's ORIGIN name: the unguessable fastly_origin_fqdn when
+# Fastly-fronted (the edge CNAME can't carry panel management traffic), else the
+# public data-plane dns_hostname. Override to a Tailscale MagicDNS name / IP
+# (e.g. "{{ inventory_hostname }}") when the panel reaches nodes over
 # Tailscale rather than the public internet. MANAGEMENT endpoint only — does NOT
 # affect the data plane (Fastly origin / Reality address / client Hosts).
-remnawave_node_address: "{{ dns_hostname }}"
+remnawave_node_address: "{{ fastly_origin_fqdn | default(dns_hostname, true) }}"
 
 # TLS via standalone Caddy (opt-in)
 # Required when fronting through Fastly (Fastly origin needs a valid public cert
@@ -511,6 +521,20 @@ fastly_service_name_prefix: "fs"
 fastly_edge_label: ""
 fastly_edge_random: false
 
+# Client-facing fronting domains (LIST, alternative to the shared edge selectors
+# above and to fastly_domain_mode: custom). global.ssl.fastly.net is blocked in
+# many places — fronting domains let clients connect via YOUR OWN domains:
+#   fastly_fronting_domains: ["video-streams.org", "cdn-static.net"]
+# Each domain gets its own Fastly TLS subscription (ACME dns-01) + an edge CNAME
+# in its own DNS zone (resolved by longest-suffix match against domain_providers —
+# every entry MUST be covered by a zone there). The FIRST entry is the primary
+# edge (used where a single value fits: FCP websocketDomain). Remnawave Hosts
+# are created per transport x domain, so subscriptions carry every edge and
+# clients can fail over. Mutually exclusive with fastly_edge_label /
+# fastly_edge_random / fastly_domain_mode: custom. Set at deploy time — adding
+# a domain to a live node means rotation. N domains = N TLS subscriptions.
+fastly_fronting_domains: []
+
 # Fastly backend connection settings (optimized for WebSocket passthrough)
 # connect_timeout: Time in ms to wait for a TCP connection to origin (default: 1000)
 fastly_backend_connect_timeout: 5000
@@ -549,16 +573,19 @@ remnawave_docker_apt_suite: ""
 #     '{"scopes":["admin:servers:read","admin:servers:write"]}'
 
 # Master switch is operation_mode=bootstrap; these tune what it creates.
-remnawave_bootstrap_config_profile_name: "FreeSocks-CDN"
+remnawave_bootstrap_config_profile_name: "FreeSocks-Config"
 remnawave_bootstrap_reality: true                     # also create the Reality inbound
-# Legacy single-unit topology: create the two panel-wide squads at bootstrap and
-# bind them as one-element pools. Default OFF — the per-node model (see
-# remnawave_per_node_placement) creates a squad per node instead, which is what
-# lets FCP's issuance-time placement balance keys across nodes.
-remnawave_bootstrap_shared_squads: false
-# Squad NAME PREFIXES: bootstrap's shared squads use them verbatim; per-node
-# squads append "-<hostname>" (FreeSocks-Fronted-quiet-falcon).
-remnawave_bootstrap_fronted_squad_name: "FreeSocks-Fronted"
+# Shared (panel-wide) squads — THE default topology: one squad per transport,
+# spanning the fleet. Every node activates the shared base inbounds, so a user
+# homed to a squad receives every node's Host in their subscription. FCP's
+# per-mode pools are bound ONCE at bootstrap (evade <- fronted squad, privacy
+# <- Reality squad); node deploys never touch squads or pools. Set false only
+# for the legacy per-node model (remnawave_per_node_placement=true).
+remnawave_bootstrap_shared_squads: true
+# Squad names (panel limit: 30 chars — these fit with room to spare). Scoped
+# per transport/CDN so future CDN-specific squads (e.g. FreeSocks-Cloudflare
+# for an XHTTP-capable provider) slot in alongside FreeSocks-Fastly.
+remnawave_bootstrap_fronted_squad_name: "FreeSocks-Fastly"
 remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
 # Opt-in: path (localhost) to write the created config-profile + inbound UUIDs +
 # a ready remnawave_cdn_transports list to, so node deploys need no manual paste.

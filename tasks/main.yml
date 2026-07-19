@@ -6,23 +6,28 @@
 # Checks every secret the enabled features consume, not just the Cloudflare
 # token — a vault blob (or template placeholder) in any of them used to
 # surface only later, as an opaque 401 mid-run.
+# Materialize via set_fact first — chaining task-level vars (one var referencing
+# another from the same vars: block) mis-evaluates under ansible-core 2.19+ lazy
+# templating, which would silently disable this guard. Only variable NAMES are
+# stored, never values.
+- name: Build the list of undecrypted vault secrets
+  set_fact:
+    _undecrypted_secrets: >-
+      {{ {'cloudflare_api_token': cloudflare_api_token | default(''),
+          'fcp_api_token': fcp_api_token | default('') if (fcp_enabled | default(false) | bool) else '',
+          'remnawave_panel_api_token': remnawave_panel_api_token | default(''),
+          'remnawave_panel_secret_key': remnawave_panel_secret_key | default('') if (remnawave_secret_key_source | default('vault') == 'vault') else ''}
+         | dict2items
+         | selectattr('value', 'string')
+         | selectattr('value', 'search', '\$ANSIBLE_VAULT;')
+         | map(attribute='key') | list }}
+
 - name: Fail if vault-encrypted variables are not decrypted
   fail:
     msg: |
       Vault-encrypted (or placeholder) secrets detected: {{ _undecrypted_secrets | join(', ') }}
       Please run the playbook with --ask-vault-pass or configure a vault password file.
       Example: ansible-playbook playbook.yml --ask-vault-pass --extra-vars "..."
-  vars:
-    _secret_values:
-      cloudflare_api_token: "{{ cloudflare_api_token | default('') }}"
-      fcp_api_token: "{{ fcp_api_token | default('') if (fcp_enabled | default(false) | bool) else '' }}"
-      remnawave_panel_api_token: "{{ remnawave_panel_api_token | default('') }}"
-      remnawave_panel_secret_key: "{{ remnawave_panel_secret_key | default('') if (remnawave_secret_key_source | default('vault') == 'vault') else '' }}"
-    _undecrypted_secrets: >-
-      {{ _secret_values | dict2items
-         | selectattr('value', 'string')
-         | selectattr('value', 'search', '\$ANSIBLE_VAULT;')
-         | map(attribute='key') | list }}
   when: _undecrypted_secrets | length > 0
 
 # Same check for per-domain credentials inside domain_providers (a vault blob
@@ -135,6 +140,18 @@
     - domain_providers[deploy_target_domain].dns_provider is not defined
       or domain_providers[deploy_target_domain].zone_id is not defined
 
+- name: Fail if the deploy target domain has an unsupported dns_provider
+  fail:
+    msg: |
+      domain_providers['{{ deploy_target_domain }}'].dns_provider is
+      '{{ domain_providers[deploy_target_domain].dns_provider }}' — only
+      'cloudflare' is supported. A typo here would silently skip every DNS task.
+  when:
+    - operation_mode == 'deploy'
+    - deploy_target_domain in domain_providers
+    - domain_providers[deploy_target_domain].dns_provider is defined
+    - domain_providers[deploy_target_domain].dns_provider != 'cloudflare'
+
 # ============================================================================
 # SETUP: Deploy Mode Configuration
 # ============================================================================
@@ -161,6 +178,17 @@
     - operation_mode == 'deploy'
     - effective_cdn_provider | default('none') == 'fastly'
     - domain_providers[deploy_target_domain].fastly_api_token | default(fastly_api_token | default('')) == ''
+
+- name: Validate fastly_fronting_domains requires the Fastly CDN (deploy)
+  fail:
+    msg: |
+      fastly_fronting_domains is set but domain_providers['{{ deploy_target_domain }}']
+      has cdn_provider '{{ effective_cdn_provider | default('none') }}' — fronting
+      domains only apply when cdn_provider is 'fastly'.
+  when:
+    - operation_mode == 'deploy'
+    - fastly_fronting_domains | default([]) | length > 0
+    - effective_cdn_provider | default('none') != 'fastly'
 
 - name: Validate Cloudflare credentials (deploy)
   fail:
@@ -216,6 +244,18 @@
     - change_target_domain in domain_providers
     - domain_providers[change_target_domain].dns_provider is not defined
       or domain_providers[change_target_domain].zone_id is not defined
+
+- name: Fail if the change target domain has an unsupported dns_provider
+  fail:
+    msg: |
+      domain_providers['{{ change_target_domain }}'].dns_provider is
+      '{{ domain_providers[change_target_domain].dns_provider }}' — only
+      'cloudflare' is supported. A typo here would silently skip every DNS task.
+  when:
+    - operation_mode == 'change'
+    - change_target_domain in domain_providers
+    - domain_providers[change_target_domain].dns_provider is defined
+    - domain_providers[change_target_domain].dns_provider != 'cloudflare'
 
 - name: Set provider configuration for change target domain
   set_fact:
@@ -466,6 +506,16 @@
           - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
           - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
 
+    # Fastly origin identity: an unguessable per-node origin name
+    # (<hostname>-<rand8>.<base_domain>). In shared + fronting modes this
+    # RESHAPES dns_hostname to the origin FQDN before DNS records are written
+    # below, so the node's only public A record is the suffixed origin.
+    # Must run AFTER hostname facts + provider config, BEFORE the DNS include.
+    - name: Derive the Fastly origin identity
+      include_tasks: providers/fastly/origin_identity.yml
+      when:
+        - effective_cdn_provider | default('none') == 'fastly'
+
     # Provider-specific DNS setup — MUST run before component install.
     # The Outline installer's post-install self-check curls the API hostname.
     # If DNS records don't exist yet, the target's resolver caches the failure
@@ -671,10 +721,9 @@
         - remnawave_enabled | default(false) | bool
         - fcp_register_remnawave_panel | default(false) | bool
 
-    # Per-node placement: add THIS node's squad(s) to FCP's per-mode pools
-    # (append-only — addSquadUuids never disturbs the rest of the pool). The
-    # fronted (WS) squad joins the "evade" pool; the Reality squad joins
-    # "privacy". Needs the same admin:servers:write scope registration uses.
+    # Legacy per-node placement only: add THIS node's squad(s) to FCP's per-mode
+    # pools (append-only — addSquadUuids never disturbs the rest of the pool).
+    # The shared-squad model binds its pools ONCE at bootstrap instead.
     - name: Add this node's squads to FCP mode placements
       include_tasks: providers/fcp/bind_placements.yml
       vars:
@@ -687,7 +736,7 @@
         - component_install_success | bool
         - fcp_enabled | default(false) | bool
         - remnawave_enabled | default(false) | bool
-        - remnawave_per_node_placement | default(true) | bool
+        - remnawave_per_node_placement | default(false) | bool
         - >-
           ((remnawave_node_fronted_squad_uuid | default('')) | length > 0)
           or ((remnawave_node_reality_squad_uuid | default('')) | length > 0)
@@ -819,7 +868,7 @@
 # Use slipstream_base_domain if slipstream is enabled, otherwise use base_domain
 - name: Set update mode base domain
   set_fact:
-    update_base_domain: "{{ slipstream_base_domain if (slipstream_enabled | default(false) | bool) else base_domain }}"
+    update_base_domain: "{{ (slipstream_base_domain | default('')) if (slipstream_enabled | default(false) | bool) else base_domain }}"
   when: operation_mode == 'update'
 
 - name: Fail if the update mode domain is not configured
@@ -840,6 +889,19 @@
     - operation_mode == 'update'
     - update_base_domain is defined
     - update_base_domain in domain_providers
+
+# Same pre-flight deploy has (main.yml deploy validation): fail BEFORE adding
+# components, not at the re-registration step at the end of the update.
+- name: Validate FCP credentials before any update mutation
+  fail:
+    msg: |
+      fcp_enabled=true requires fcp_api_url and fcp_api_token (an fsv1_
+      service token with admin:servers:read + admin:servers:write). Failing
+      here beats adding components first and failing re-registration after.
+  when:
+    - operation_mode == 'update'
+    - fcp_enabled | default(false) | bool
+    - (fcp_api_url | default('') | length == 0) or (fcp_api_token | default('') | length == 0)
 
 - name: Update existing server with new components
   block:
@@ -862,7 +924,7 @@
 
     - name: Set outline_install_success based on existing installation
       set_fact:
-        outline_install_success: "{{ outline_path.stat.exists }}"
+        outline_install_success: "{{ outline_path.stat.exists | bool }}"
 
     - name: Fail if no VPN backend is installed
       fail:
@@ -917,7 +979,7 @@
 
     - name: Extract API URL from access.txt
       set_fact:
-        outline_api_url: "{{ outline_access_decoded | regex_search('apiUrl:(.+)', '\\1') | first | trim }}"
+        outline_api_url: "{{ outline_access_decoded | regex_search('apiUrl:(.+)', '\\1') | first | default('') | trim }}"
       when: outline_path.stat.exists
 
     - name: Build outline_api_info object
@@ -929,8 +991,8 @@
 
     - name: Extract hostname from existing API URL
       set_fact:
-        random_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^.]+)', '\\1') | first | trim }}"
-        dns_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^/]+)', '\\1') | first | trim | regex_replace(':[0-9]+$', '') }}"
+        random_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^.]+)', '\\1') | first | default('') | trim }}"
+        dns_hostname: "{{ outline_api_info.apiUrl | regex_search('https://([^/]+)', '\\1') | first | default('') | trim | regex_replace(':[0-9]+$', '') }}"
       when:
         - outline_path.stat.exists
         - not (outline_api_info.apiUrl | regex_search('https://[0-9]+\.'))
@@ -1160,12 +1222,14 @@
     - name: Ensure the Config Profile + inbounds exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_config_profile.yml
 
-    # Legacy/simple topology only: one panel-wide squad per mode (every node
-    # looks like one unit to FCP's node placement). The per-node model creates
-    # squads at node deploy time instead.
+    # THE default topology: one panel-wide squad per transport (FreeSocks-Fastly
+    # for the WS/CDN side, FreeSocks-Reality for direct Reality), spanning the
+    # fleet — every node activates the shared base inbounds, so users homed to a
+    # squad receive every node's Host. The legacy per-node model
+    # (remnawave_per_node_placement=true) creates squads at node deploy instead.
     - name: Ensure the shared connection-mode squads exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_squad.yml
-      when: remnawave_bootstrap_shared_squads | default(false) | bool
+      when: remnawave_bootstrap_shared_squads | default(true) | bool
 
     # Opt-in: write the created UUIDs to a vars file so node deploys need no manual
     # paste. Load it alongside the creds file: -e @<creds>.yml -e @<this file>.
@@ -1194,8 +1258,9 @@
       delegate_to: localhost
       when: remnawave_bootstrap_output_file | default('') | length > 0
 
-    # Shared-squad topology only: bind the two panel-wide squads as one-element
-    # pools (full replace). Per-node deploys append their own squads instead.
+    # Shared-squad topology (default): bind the two panel-wide squads as the
+    # per-mode pools (full replace — the pools are exactly these squads).
+    # Legacy per-node deploys append their own squads instead.
     - name: Bind the shared squads to FCP mode placements
       include_tasks: providers/fcp/bind_placements.yml
       vars:
@@ -1205,7 +1270,7 @@
               if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {}) }}
       when:
         - fcp_enabled | default(false) | bool
-        - remnawave_bootstrap_shared_squads | default(false) | bool
+        - remnawave_bootstrap_shared_squads | default(true) | bool
         - (remnawave_fronted_squad_uuid | default('')) | length > 0
 
     # Opt-in (needs admin:settings:write; FCP's compiled default is already
@@ -1224,21 +1289,22 @@
           Config Profile: {{ remnawave_bootstrap_config_profile_name }}
             uuid: {{ remnawave_panel_config_profile_uuid | default('(unresolved)') }}
 
-          Base inbounds (copy into your node-deploy vars — node deploys clone
-          them per node when remnawave_per_node_placement is on):
+          Base inbounds (copy into your node-deploy vars — every node activates
+          these shared inbounds; legacy per-node placement clones them instead):
             remnawave_cdn_transports[ws].inbound_uuid:    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}
             remnawave_reality_inbound_uuid:               {{ remnawave_reality_inbound_uuid | default('(disabled)') }}
 
-          {% if remnawave_bootstrap_shared_squads | default(false) | bool %}
-          Shared squads (legacy single-unit topology):
+          {% if remnawave_bootstrap_shared_squads | default(true) | bool %}
+          Shared squads (fleet-spanning; nodes never create their own):
             fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ 'uuid resolved' if (remnawave_fronted_squad_uuid | default('') | length > 0) else '(none)' }}
             reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ 'uuid resolved' if (remnawave_reality_squad_uuid | default('') | length > 0) else '(disabled)' }}
           {% if fcp_enabled | default(false) | bool %}
-          FCP mode placements bound (evade -> fronted pool, privacy -> reality pool).
+          FCP mode placements bound (evade -> fronted squad, privacy -> reality squad).
           {% endif %}
           {% else %}
-          No squads created at bootstrap: node deploys create a per-node squad
-          and append it to FCP's mode pools (remnawave_per_node_placement=true).
+          No squads created at bootstrap: legacy per-node placement
+          (remnawave_per_node_placement=true) creates a squad per node deploy
+          and appends it to FCP's mode pools.
           {% endif %}
   when: operation_mode == 'bootstrap'
 

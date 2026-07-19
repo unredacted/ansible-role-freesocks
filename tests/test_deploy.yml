@@ -48,7 +48,7 @@
     remnawave_reality_sni: "dl.google.com"
     # remnawave_reality_inbound_uuid + remnawave_panel_config_profile_uuid +
     # remnawave_cdn_transports come from the bootstrap output (vars_files below);
-    # per-node placement repoints them at this node's own inbounds.
+    # the shared model activates the BASE inbounds verbatim (no per-node clones).
 
     fcp_enabled: true
     fcp_api_url: "{{ lookup('env', 'FCP_MOCK_URL') | default('http://127.0.0.1:8811', true) }}"
@@ -112,7 +112,7 @@
           - not (_dep_node.isDisabled | default(false))
         fail_msg: "Panel never connected to the deployed node: {{ _dep_node }}"
 
-    # --- per-node placement objects came from the REAL deploy path ----------
+    # --- shared-model deploy: Host created, NO per-node clones/squads ---------
     - name: Read back profiles + squads + hosts
       uri:
         url: "{{ remnawave_panel_url }}{{ item }}"
@@ -122,19 +122,21 @@
       register: _panel
     - name: Materialize panel state
       set_fact:
-        _dep_tags: "{{ (_panel.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-CDN') | list | first).config.inbounds | map(attribute='tag') | list }}"
+        _dep_tags: "{{ (_panel.results[0].json.response.configProfiles | selectattr('name', 'equalto', 'FreeSocks-Config') | list | first).config.inbounds | map(attribute='tag') | list }}"
         _dep_squads: "{{ _panel.results[1].json.response.internalSquads | map(attribute='name') | list }}"
         _dep_hosts: >-
           {{ (_panel.results[2].json.response['hosts']
               if (_panel.results[2].json.response is mapping and 'hosts' in _panel.results[2].json.response)
               else _panel.results[2].json.response) | map(attribute='remark') | list }}
-    - name: Assert per-node inbound + squad + Reality Host exist
+    - name: Assert shared-model objects (Reality Host, no per-node residue)
       assert:
         that:
-          - _dep_tags | select('equalto', 'VLESS_REALITY_CI_REAL_NODE') | list | length == 1
-          - _dep_squads | select('equalto', 'FreeSocks-Reality-ci-real-node') | list | length == 1
           - _dep_hosts | select('equalto', 'ci-real-node-reality') | list | length == 1
-        fail_msg: "Deploy did not create the per-node Reality inbound/squad/Host"
+          - _dep_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
+          - _dep_squads | select('search', '-ci-real-node$') | list | length == 0
+          - _dep_tags | select('search', '_CI_REAL_NODE$') | list | length == 0
+          - _dep_tags | select('equalto', 'VLESS_REALITY') | list | length == 1
+        fail_msg: "Deploy created per-node residue or missed the shared-model Host"
 
     # --- FCP got everything through the real main.yml control-plane section --
     - name: Read the mock FCP + mock Cloudflare state
@@ -146,9 +148,10 @@
     - name: Assert FCP registration + placement and the DNS record
       assert:
         that:
-          # Reality-only node: privacy pool gains this node's squad, evade untouched.
+          # Shared model: pools were bound ONCE at bootstrap; a node deploy
+          # appends nothing.
           - _mocks.results[0].json.pools.privacy | length == 1
-          - (_mocks.results[0].json.pools.evade | default([])) | length == 0
+          - _mocks.results[0].json.pools.evade | length == 1
           - "'ci-panel' in _mocks.results[0].json.servers"
           # the mock CF holds the A record the deploy created (written as the FQDN)
           - _mocks.results[1].json.records | dict2items | map(attribute='value')
@@ -159,4 +162,5 @@
       debug:
         msg: >-
           Real deploy OK: full role path, node container up + panel-connected,
-          per-node Reality placement, FCP registration + pools, mock DNS record.
+          shared-model Reality Host (no per-node residue), FCP registration +
+          bound pools, mock DNS record.

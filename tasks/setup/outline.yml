@@ -71,6 +71,16 @@
     outline_api_info: "{{ outline_install.stdout | regex_search('{.*}') | from_json }}"
   when: outline_install_success
 
+# Persist the CLEAN node name — change mode uses it as the old FCP slug /
+# old_random_hostname (the apiUrl may hold a suffixed Fastly origin FQDN).
+- name: Persist the clean node name
+  copy:
+    content: "{{ random_hostname }}\n"
+    dest: /opt/outline/.node_name
+    mode: '0640'
+  become: yes
+  when: outline_install_success | bool
+
 - name: Display Outline server information
   debug:
     msg: |

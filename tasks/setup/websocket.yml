@@ -65,7 +65,7 @@
   delay: 5
   until: caddy_result.status == 204
   no_log: true  # the apiUrl carries the Outline management secret
-  when: outline_caddy_auto_https
+  when: outline_caddy_auto_https | bool
 
 - name: Enable Caddy web server without auto HTTPS
   uri:
@@ -84,7 +84,7 @@
   delay: 5
   until: caddy_result_no_https.status == 204
   no_log: true  # the apiUrl carries the Outline management secret
-  when: not outline_caddy_auto_https
+  when: not (outline_caddy_auto_https | bool)
 
 - name: Display WSS configuration success
   debug:
@@ -93,8 +93,8 @@
       
       Caddy Domain: {{ effective_caddy_domain }}
       Auto HTTPS: {{ outline_caddy_auto_https }}
-      TCP Path: {{ effective_wss_tcp_path }}{{ ' (randomized)' if outline_wss_random_paths else '' }}
-      UDP Path: {{ effective_wss_udp_path }}{{ ' (randomized)' if outline_wss_random_paths else '' }}
+      TCP Path: {{ effective_wss_tcp_path }}{{ ' (randomized)' if (outline_wss_random_paths | bool) else '' }}
+      UDP Path: {{ effective_wss_udp_path }}{{ ' (randomized)' if (outline_wss_random_paths | bool) else '' }}
       Internal WS Port: {{ outline_wss_server_port }}
       
       New access keys will be WebSocket-only by default.

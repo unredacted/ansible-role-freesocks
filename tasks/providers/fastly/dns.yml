@@ -1,40 +1,38 @@
 ---
-# tasks/providers/fastly/dns.yml - DNS cutover to the Fastly edge (custom domain mode)
+# tasks/providers/fastly/dns.yml - Fastly DNS (origin records + edge CNAMEs)
 #
-# Custom mode splits the name in two:
-#   * origin-<hostname>  A/AAAA -> the server. The Fastly backend dials THIS
-#     name (service.yml's backend address); it must never become a CNAME to
-#     Fastly or the edge would fetch from itself.
-#   * <hostname>         CNAME  -> the Fastly edge (client-facing). The origin
-#     A/AAAA records created earlier (so Caddy could issue its Let's Encrypt
-#     cert for <hostname> before the cutover) are replaced here — Cloudflare
-#     forbids a CNAME coexisting with other records on the same name, so they
-#     must be deleted first.
-#
-# In shared mode, this file is NOT used because clients connect directly
-# to *.global.ssl.fastly.net which is managed by Fastly.
+# Two responsibilities, by mode:
+#   * origin A/AAAA (LEGACY same-domain custom only): the backend dials
+#     fastly_origin_fqdn (<hostname>-<suffix>.<base_domain>) — it must never
+#     become a CNAME to Fastly or the edge would fetch from itself. In shared
+#     + fronting modes the origin record IS dns_hostname, already written by
+#     providers/cloudflare/dns.yml, so this section is skipped there.
+#   * edge CNAME(s): legacy custom writes <hostname> -> cname_target in
+#     base_domain's zone; fronting mode writes EACH fronting domain -> its own
+#     cname_target in its own zone (tls.yml's fastly_cname_targets +
+#     origin_identity.yml's fastly_fronting_zones). In both cases
+#     A/AAAA/stale-CNAME records on the edge name are deleted first
+#     (Cloudflare forbids a CNAME coexisting with other records).
 #
 # Requires:
-#   - fastly_cname_target (set by tls.yml — e.g., x.sni.global.fastly.net)
+#   - fastly_cname_target / fastly_cname_targets (tls.yml)
+#   - fastly_origin_fqdn / fastly_origin_name (origin_identity.yml)
 #   - effective_dns_provider == 'cloudflare'
-#   - domain_providers[base_domain].zone_id
 
 # ============================================================================
-# Set DNS provider credentials
+# 1. Origin A/AAAA records (legacy custom mode — the backend's dial target)
 # ============================================================================
 - name: Set domain-specific Cloudflare credentials for Fastly DNS
   set_fact:
     cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
+  when: fastly_fronting_domains | default([]) | length == 0
 
-- name: Set the Fastly origin FQDN and IPs
+- name: Set the Fastly origin IPs
   set_fact:
-    fastly_origin_fqdn: "origin-{{ random_hostname }}.{{ base_domain }}"
     _fastly_origin_ipv4s: "{{ envoy_mappings[inventory_hostname].ipv4 if (envoy_mappings is defined and envoy_mappings[inventory_hostname] is defined and envoy_mappings[inventory_hostname].ipv4 is defined) else ([ansible_facts['default_ipv4']['address']] if (ansible_facts['default_ipv4']['address'] is defined) else []) }}"
     _fastly_origin_ipv6s: "{{ envoy_mappings[inventory_hostname].ipv6 if (envoy_mappings is defined and envoy_mappings[inventory_hostname] is defined and envoy_mappings[inventory_hostname].ipv6 is defined) else ([ansible_facts['default_ipv6']['address']] if (ansible_facts['default_ipv6']['address'] is defined) else []) }}"
+  when: fastly_fronting_domains | default([]) | length == 0
 
-# ============================================================================
-# 1. Origin A/AAAA records (the backend's dial target)
-# ============================================================================
 - name: Check existing origin A records
   uri:
     url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records?type=A&name={{ fastly_origin_fqdn }}"
@@ -46,6 +44,7 @@
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header
   register: _fastly_origin_a_check
+  when: fastly_fronting_domains | default([]) | length == 0
 
 - name: Create origin A records
   uri:
@@ -57,7 +56,7 @@
     body_format: json
     body:
       type: A
-      name: "origin-{{ random_hostname }}"
+      name: "{{ fastly_origin_name }}"
       content: "{{ item }}"
       ttl: 1
       proxied: false
@@ -65,7 +64,9 @@
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ _fastly_origin_ipv4s }}"
-  when: _fastly_origin_a_check.json.result | default([]) | length == 0
+  when:
+    - fastly_fronting_domains | default([]) | length == 0
+    - _fastly_origin_a_check.json.result | default([]) | length == 0
 
 - name: Check existing origin AAAA records
   uri:
@@ -78,7 +79,9 @@
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header
   register: _fastly_origin_aaaa_check
-  when: _fastly_origin_ipv6s | length > 0
+  when:
+    - fastly_fronting_domains | default([]) | length == 0
+    - _fastly_origin_ipv6s | length > 0
 
 - name: Create origin AAAA records
   uri:
@@ -90,7 +93,7 @@
     body_format: json
     body:
       type: AAAA
-      name: "origin-{{ random_hostname }}"
+      name: "{{ fastly_origin_name }}"
       content: "{{ item }}"
       ttl: 1
       proxied: false
@@ -99,67 +102,45 @@
   no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ _fastly_origin_ipv6s }}"
   when:
+    - fastly_fronting_domains | default([]) | length == 0
     - _fastly_origin_ipv6s | length > 0
     - _fastly_origin_aaaa_check.json.result | default([]) | length == 0
 
 # ============================================================================
-# 2. Remove the origin-bootstrap records from the client-facing name
+# 2. Edge CNAME(s) — one per client-facing domain
 # ============================================================================
-# These A/AAAA records were created at deploy start so Caddy could pass its
-# Let's Encrypt challenge for <hostname> directly. They must go before the
-# CNAME (Cloudflare rejects a CNAME coexisting with other records). A stale
-# CNAME from a prior rotation is removed too.
-- name: Get existing records for the client-facing hostname
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records?name={{ dns_hostname }}"
-    method: GET
-    headers:
-      Content-Type: "application/json"
-      Authorization: "Bearer {{ cf_token }}"
-    status_code: 200
-  delegate_to: localhost
-  no_log: true  # carries the Cloudflare API token in the Authorization header
-  register: _fastly_edge_existing
+- name: Compute the edge CNAME jobs
+  set_fact:
+    _fastly_edge_jobs: >-
+      {%- set jobs = [] -%}
+      {%- if fastly_fronting_domains | default([]) | length > 0 -%}
+        {%- for d in fastly_fronting_domains -%}
+          {%- set _ = jobs.append({'domain': d, 'zone': (fastly_fronting_zones | default({}))[d] | default(base_domain), 'target': (fastly_cname_targets | default({}))[d] | default('')}) -%}
+        {%- endfor -%}
+      {%- else -%}
+        {%- set _ = jobs.append({'domain': dns_hostname, 'zone': base_domain, 'target': fastly_cname_target | default('')}) -%}
+      {%- endif -%}
+      {{ jobs }}
 
-- name: Delete A/AAAA/stale-CNAME records for the client-facing hostname
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records/{{ item.id }}"
-    method: DELETE
-    headers:
-      Content-Type: "application/json"
-      Authorization: "Bearer {{ cf_token }}"
-    status_code: [200, 404]
-  delegate_to: localhost
-  no_log: true  # carries the Cloudflare API token in the Authorization header
-  loop: "{{ _fastly_edge_existing.json.result | default([]) | selectattr('type', 'in', ['A', 'AAAA', 'CNAME']) | list }}"
+- name: Fail if an edge CNAME target is missing
+  fail:
+    msg: >-
+      No cname_target resolved for '{{ item.domain }}' — tls.yml must run first
+      and extract it from the TLS activation (never guess Fastly's target).
+  loop: "{{ _fastly_edge_jobs }}"
   loop_control:
-    label: "{{ item.name }} ({{ item.type }})"
+    label: "{{ item.domain }}"
+  when: item.target | length == 0
 
-# ============================================================================
-# 3. Create the client-facing CNAME to the Fastly edge
-# ============================================================================
-- name: Create DNS CNAME record for Fastly (Cloudflare)
-  uri:
-    url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[base_domain].zone_id }}/dns_records"
-    method: POST
-    headers:
-      Content-Type: "application/json"
-      Authorization: "Bearer {{ cf_token }}"
-    body_format: json
-    body:
-      type: CNAME
-      name: "{{ random_hostname }}"
-      content: "{{ fastly_cname_target }}"
-      ttl: 1
-      proxied: false
-    status_code: [200, 201]
-  delegate_to: localhost
-  no_log: true  # carries the Cloudflare API token in the Authorization header
-  register: fastly_dns_cname_result
+- name: Write the edge CNAMEs (one per domain)
+  include_tasks: dns_edge.yml
+  loop: "{{ _fastly_edge_jobs }}"
+  loop_control:
+    loop_var: _edge_job
+    label: "{{ _edge_job.domain }}"
 
-- name: Debug Fastly DNS cutover result
+- name: Debug Fastly DNS result
   debug:
     msg:
-      - "Origin records ensured: {{ fastly_origin_fqdn }} -> {{ (_fastly_origin_ipv4s + _fastly_origin_ipv6s) | join(', ') }}"
-      - "CNAME record created: {{ dns_hostname }} → {{ fastly_cname_target }}"
-      - "DNS provider: Cloudflare (zone {{ domain_providers[base_domain].zone_id }})"
+      - "Origin: {{ fastly_origin_fqdn }} {{ '(written by providers/cloudflare/dns.yml)' if (fastly_fronting_domains | default([]) | length > 0) else '(records ensured above)' }}"
+      - "Edge CNAMEs: {{ _fastly_edge_jobs | map(attribute='domain') | join(', ') }}"
