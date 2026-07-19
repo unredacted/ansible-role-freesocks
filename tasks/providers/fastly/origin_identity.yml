@@ -1,29 +1,34 @@
 ---
 # tasks/providers/fastly/origin_identity.yml
 #
-# Derive the per-node Fastly origin identity once per deploy/change/migrate:
+# Derive the per-node Fastly identity once per deploy/change/migrate:
 #   fastly_origin_suffix   8-char [a-z0-9] random (fresh per rotation)
 #   fastly_origin_name     <hostname>-<suffix>
 #   fastly_origin_fqdn     <hostname>-<suffix>.<base_domain>
+#   fastly_fronting_edges  effective client-edge list [{fqdn, zone, generated}]
 #
-# Why: the origin A record is the ONLY DNS name that points at the node, so it
-# must be unguessable — passive-DNS / zone enumeration of base_domain would
-# otherwise map every node hostname to its origin IP. The suffix is persisted
-# (fastly_service_id_dir/fastly_origin_fqdn) so rotation can delete the old
-# origin record.
+# Why the origin is suffixed: the origin A record is the ONLY DNS name that
+# points at the node, so it must be unguessable — passive-DNS / zone
+# enumeration of base_domain would otherwise map every node hostname to its
+# origin IP. The suffix is persisted (fastly_service_id_dir/fastly_origin_fqdn)
+# so rotation can delete the old origin record.
+#
+# Client edges come from TWO lists (unioned here into fastly_fronting_edges):
+#   * fastly_fronting_domains — exact, STABLE edge FQDNs (operator-chosen)
+#   * fastly_fronting_zones   — zones under which a RANDOM edge subdomain is
+#     generated per node (<word>-<word>.<zone>; dictionary words, not
+#     DGA-looking alnum). Generated edges are EPHEMERAL: fresh labels per
+#     rotation; the old ones are cleaned up by cleanup_edges.yml via the
+#     persisted fastly_edge_domains file.
 #
 # dns_hostname shape by mode:
-#   * shared + fronting-domains: dns_hostname BECOMES the origin FQDN — the
-#     only A record is the suffixed origin (Caddy cert, Fastly SNI, panel
-#     node address, FCP apiUrl all follow). Fronting domains imply the custom
-#     flow (TLS subscription + edge CNAME per domain).
+#   * shared + fronting (either list): dns_hostname BECOMES the origin FQDN —
+#     the only A record is the suffixed origin (Caddy cert, Fastly SNI, panel
+#     node address, FCP apiUrl all follow). Fronting edges imply the custom
+#     flow (TLS subscription + edge CNAME per edge).
 #   * legacy same-domain custom: dns_hostname stays the clean client-facing
 #     name (CNAME to the edge + Caddy cert); the origin record is written
 #     separately by fastly/dns.yml.
-#
-# Also validates the edge-selector schemes (exactly one of: shared label /
-# shared random / fronting domains) and resolves each fronting domain's DNS
-# zone (longest-suffix match into domain_providers).
 #
 # Requires: random_hostname, base_domain, effective_cdn_provider,
 #           effective_fastly_domain_mode (domain_providers-derived).
@@ -32,25 +37,25 @@
   set_fact:
     _fastly_declared_mode: "{{ effective_fastly_domain_mode | default('shared') }}"
 
-- name: Assert fronting domains are not mixed with legacy same-domain custom mode
+- name: Assert fronting edges are not mixed with legacy same-domain custom mode
   fail:
     msg: >-
-      fastly_fronting_domains and fastly_domain_mode: custom (same-domain) are
-      alternative client-edge schemes — set only one. (fronting domains already
-      imply the custom TLS + edge-CNAME flow, with the edge decoupled from the
-      origin zone.)
+      fastly_fronting_domains / fastly_fronting_zones and fastly_domain_mode:
+      custom (same-domain) are alternative client-edge schemes — set only one.
+      (fronting edges already imply the custom TLS + edge-CNAME flow, with the
+      edge decoupled from the origin zone.)
   when:
-    - fastly_fronting_domains | default([]) | length > 0
+    - (fastly_fronting_domains | default([]) | length + fastly_fronting_zones | default([]) | length) > 0
     - _fastly_declared_mode == 'custom'
 
-- name: Assert the edge selectors are mutually exclusive with fronting domains
+- name: Assert the edge selectors are mutually exclusive with fronting edges
   fail:
     msg: >-
-      fastly_fronting_domains is set alongside fastly_edge_label /
-      fastly_edge_random — pick ONE client-edge scheme (shared label, shared
-      random, or fronting domains).
+      fastly_fronting_domains / fastly_fronting_zones is set alongside
+      fastly_edge_label / fastly_edge_random — pick ONE client-edge scheme
+      (shared label, shared random, or fronting edges).
   when:
-    - fastly_fronting_domains | default([]) | length > 0
+    - (fastly_fronting_domains | default([]) | length + fastly_fronting_zones | default([]) | length) > 0
     - (fastly_edge_label | default('') | length > 0) or (fastly_edge_random | default(false) | bool)
 
 - name: Generate the Fastly origin suffix (8 lowercase alnum)
@@ -63,10 +68,10 @@
     fastly_origin_name: "{{ random_hostname }}-{{ fastly_origin_suffix }}"
     fastly_origin_fqdn: "{{ random_hostname }}-{{ fastly_origin_suffix }}.{{ base_domain }}"
 
-- name: Fronting domains imply the custom flow
+- name: Fronting edges imply the custom flow
   set_fact:
     effective_fastly_domain_mode: "custom"
-  when: fastly_fronting_domains | default([]) | length > 0
+  when: (fastly_fronting_domains | default([]) | length + fastly_fronting_zones | default([]) | length) > 0
 
 # In shared + fronting modes the node has exactly ONE public DNS name — the
 # suffixed origin. Nothing is written for the clean hostname, so a censor
@@ -76,12 +81,12 @@
     dns_hostname: "{{ fastly_origin_fqdn }}"
   when:
     - effective_fastly_domain_mode | default('shared') == 'shared'
-      or (fastly_fronting_domains | default([]) | length > 0)
+      or (fastly_fronting_domains | default([]) | length + fastly_fronting_zones | default([]) | length) > 0
 
-# --- Fronting-domain zone resolution ----------------------------------------
-- name: Resolve each fronting domain's DNS zone (longest-suffix match)
+# --- Exact fronting domains: zone resolution --------------------------------
+- name: Resolve each exact fronting domain's DNS zone (longest-suffix match)
   set_fact:
-    fastly_fronting_zones: >-
+    fastly_fronting_zone_map: >-
       {%- set out = {} -%}
       {%- for d in fastly_fronting_domains | default([]) -%}
         {%- set ns = namespace(best='') -%}
@@ -95,28 +100,88 @@
       {{ out }}
   when: fastly_fronting_domains | default([]) | length > 0
 
-- name: Fail if a fronting domain has no domain_providers zone
+- name: Fail if an exact fronting domain has no domain_providers zone
   fail:
     msg: >-
       fastly_fronting_domains entry '{{ item.key }}' is not covered by any
       domain_providers zone. Add its registrable zone (with zone_id + optional
       cloudflare_api_token) — the edge CNAME and ACME challenge records are
       written there.
-  loop: "{{ fastly_fronting_zones | default({}) | dict2items }}"
+  loop: "{{ fastly_fronting_zone_map | default({}) | dict2items }}"
   loop_control:
     label: "{{ item.key }}"
   when: item.value | length == 0
 
-- name: Fail if a fronting zone is not Cloudflare-managed
+- name: Fail if an exact fronting zone is not Cloudflare-managed
   fail:
     msg: >-
       Fronting zone '{{ item.value }}' (covering '{{ item.key }}') has
       dns_provider '{{ domain_providers[item.value].dns_provider | default('cloudflare') }}'
       — only 'cloudflare' is supported for edge CNAME / ACME challenge records.
-  loop: "{{ fastly_fronting_zones | default({}) | dict2items }}"
+  loop: "{{ fastly_fronting_zone_map | default({}) | dict2items }}"
   loop_control:
     label: "{{ item.key }} -> {{ item.value }}"
   when: domain_providers[item.value].dns_provider | default('cloudflare') != 'cloudflare'
+
+# --- Generated fronting zones: validation + label generation ----------------
+- name: Fail if a fronting zone is missing from domain_providers (or not Cloudflare)
+  fail:
+    msg: >-
+      fastly_fronting_zones entry '{{ item }}' is not in domain_providers as a
+      Cloudflare zone — add it (with zone_id + optional cloudflare_api_token).
+      The generated edge subdomain's CNAME and ACME records are written there.
+  loop: "{{ fastly_fronting_zones | default([]) }}"
+  when: (item not in domain_providers) or (domain_providers[item].dns_provider | default('cloudflare') != 'cloudflare')
+
+- name: Ensure a dictionary word list exists for edge labels
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+  when:
+    - fastly_fronting_zones | default([]) | length > 0
+    - fastly_fronting_labels is not defined
+
+- name: Draw words for the edge labels
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | shuf -n {{ (fastly_fronting_zones | length) * (fastly_fronting_label_words | default(2) | int) }}'
+  register: _fastly_edge_words
+  changed_when: false
+  when:
+    - fastly_fronting_zones | default([]) | length > 0
+    - fastly_fronting_labels is not defined
+
+- name: Build the edge labels (one per fronting zone)
+  set_fact:
+    fastly_fronting_labels: "{{ _fastly_edge_words.stdout_lines | default([]) | batch(fastly_fronting_label_words | default(2) | int) | map('join', '-') | list }}"
+  when:
+    - fastly_fronting_zones | default([]) | length > 0
+    - fastly_fronting_labels is not defined
+
+# --- Union: the effective edge set -------------------------------------------
+- name: Compute the effective fronting edges
+  set_fact:
+    fastly_fronting_edges: >-
+      {%- set edges = [] -%}
+      {%- for d in fastly_fronting_domains | default([]) -%}
+        {%- set _ = edges.append({'fqdn': d, 'zone': (fastly_fronting_zone_map | default({}))[d] | default(''), 'generated': false}) -%}
+      {%- endfor -%}
+      {%- for z in fastly_fronting_zones | default([]) -%}
+        {%- set lbl = (fastly_fronting_labels | default([]))[loop.index0] | default('') -%}
+        {%- set _ = edges.append({'fqdn': (lbl ~ '.' ~ z) if lbl else '', 'zone': z, 'generated': true}) -%}
+      {%- endfor -%}
+      {{ edges }}
+  when: (fastly_fronting_domains | default([]) | length + fastly_fronting_zones | default([]) | length) > 0
+
+- name: Assert every generated edge got a label
+  assert:
+    that:
+      - (fastly_fronting_edges | selectattr('generated') | rejectattr('fqdn', 'equalto', '') | list | length)
+        == (fastly_fronting_zones | default([]) | length)
+    fail_msg: >-
+      Failed to generate an edge label for every fastly_fronting_zones entry
+      (word draw came up short). Re-run; if it persists, check
+      /usr/share/dict/words on the target.
+  when: fastly_fronting_zones | default([]) | length > 0
 
 - name: Debug the origin identity
   debug:
@@ -124,4 +189,4 @@
       - "Fastly origin: {{ fastly_origin_fqdn }} (suffix {{ fastly_origin_suffix }})"
       - "dns_hostname: {{ dns_hostname }}"
       - "Domain mode: {{ effective_fastly_domain_mode }} (declared {{ _fastly_declared_mode }})"
-      - "Fronting domains: {{ fastly_fronting_domains | default([]) | join(', ') | default('(none)', true) }}"
+      - "Fronting edges: {{ (fastly_fronting_edges | default([]) | map(attribute='fqdn') | join(', ')) | default('(none)', true) }}"

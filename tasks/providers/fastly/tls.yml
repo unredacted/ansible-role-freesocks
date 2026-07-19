@@ -22,10 +22,12 @@
   set_fact:
     _fastly_tls_jobs: >-
       {%- set jobs = [] -%}
-      {%- for d in (fastly_fronting_domains | default([]) if (fastly_fronting_domains | default([]) | length > 0) else [fastly_websocket_domain]) -%}
-        {%- set z = (fastly_fronting_zones | default({}))[d] | default(base_domain) -%}
-        {%- set _ = jobs.append({'domain': d, 'zone': z}) -%}
+      {%- for e in fastly_fronting_edges | default([]) -%}
+        {%- set _ = jobs.append({'domain': e.fqdn, 'zone': e.zone}) -%}
       {%- endfor -%}
+      {%- if jobs | length == 0 -%}
+        {%- set _ = jobs.append({'domain': fastly_websocket_domain, 'zone': base_domain}) -%}
+      {%- endif -%}
       {{ jobs }}
 
 - name: Debug TLS jobs

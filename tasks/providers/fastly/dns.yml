@@ -10,9 +10,11 @@
 #   * edge CNAME(s): legacy custom writes <hostname> -> cname_target in
 #     base_domain's zone; fronting mode writes EACH fronting domain -> its own
 #     cname_target in its own zone (tls.yml's fastly_cname_targets +
-#     origin_identity.yml's fastly_fronting_zones). In both cases
-#     A/AAAA/stale-CNAME records on the edge name are deleted first
-#     (Cloudflare forbids a CNAME coexisting with other records).
+#     origin_identity.yml's fastly_fronting_zones). Writing is idempotent and
+#     non-destructive (dns_edge.yml): an already-correct CNAME is left
+#     untouched, a stale-target CNAME is replaced, and A/AAAA records are only
+#     removed in legacy custom mode (they are the role's own LE-bootstrap
+#     records — fronting domains never have their records auto-deleted).
 #
 # Requires:
 #   - fastly_cname_target / fastly_cname_targets (tls.yml)
@@ -25,13 +27,13 @@
 - name: Set domain-specific Cloudflare credentials for Fastly DNS
   set_fact:
     cf_token: "{{ domain_providers[base_domain].cloudflare_api_token | default(cloudflare_api_token) }}"
-  when: fastly_fronting_domains | default([]) | length == 0
+  when: fastly_fronting_edges | default([]) | length == 0
 
 - name: Set the Fastly origin IPs
   set_fact:
     _fastly_origin_ipv4s: "{{ envoy_mappings[inventory_hostname].ipv4 if (envoy_mappings is defined and envoy_mappings[inventory_hostname] is defined and envoy_mappings[inventory_hostname].ipv4 is defined) else ([ansible_facts['default_ipv4']['address']] if (ansible_facts['default_ipv4']['address'] is defined) else []) }}"
     _fastly_origin_ipv6s: "{{ envoy_mappings[inventory_hostname].ipv6 if (envoy_mappings is defined and envoy_mappings[inventory_hostname] is defined and envoy_mappings[inventory_hostname].ipv6 is defined) else ([ansible_facts['default_ipv6']['address']] if (ansible_facts['default_ipv6']['address'] is defined) else []) }}"
-  when: fastly_fronting_domains | default([]) | length == 0
+  when: fastly_fronting_edges | default([]) | length == 0
 
 - name: Check existing origin A records
   uri:
@@ -44,7 +46,7 @@
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header
   register: _fastly_origin_a_check
-  when: fastly_fronting_domains | default([]) | length == 0
+  when: fastly_fronting_edges | default([]) | length == 0
 
 - name: Create origin A records
   uri:
@@ -65,7 +67,7 @@
   no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ _fastly_origin_ipv4s }}"
   when:
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - _fastly_origin_a_check.json.result | default([]) | length == 0
 
 - name: Check existing origin AAAA records
@@ -80,7 +82,7 @@
   no_log: true  # carries the Cloudflare API token in the Authorization header
   register: _fastly_origin_aaaa_check
   when:
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - _fastly_origin_ipv6s | length > 0
 
 - name: Create origin AAAA records
@@ -102,23 +104,27 @@
   no_log: true  # carries the Cloudflare API token in the Authorization header
   loop: "{{ _fastly_origin_ipv6s }}"
   when:
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - _fastly_origin_ipv6s | length > 0
     - _fastly_origin_aaaa_check.json.result | default([]) | length == 0
 
 # ============================================================================
 # 2. Edge CNAME(s) — one per client-facing domain
 # ============================================================================
+# replace_records=true only for LEGACY same-domain custom mode: there the role
+# itself wrote bootstrap A/AAAA records on the client hostname (so Caddy could
+# pass its LE challenge pre-cutover), and removing them is safe by
+# construction. Fronting domains never get their records auto-deleted.
 - name: Compute the edge CNAME jobs
   set_fact:
     _fastly_edge_jobs: >-
       {%- set jobs = [] -%}
-      {%- if fastly_fronting_domains | default([]) | length > 0 -%}
-        {%- for d in fastly_fronting_domains -%}
-          {%- set _ = jobs.append({'domain': d, 'zone': (fastly_fronting_zones | default({}))[d] | default(base_domain), 'target': (fastly_cname_targets | default({}))[d] | default('')}) -%}
+      {%- if fastly_fronting_edges | default([]) | length > 0 -%}
+        {%- for e in fastly_fronting_edges -%}
+          {%- set _ = jobs.append({'domain': e.fqdn, 'zone': e.zone, 'target': (fastly_cname_targets | default({}))[e.fqdn] | default(''), 'replace_records': false}) -%}
         {%- endfor -%}
       {%- else -%}
-        {%- set _ = jobs.append({'domain': dns_hostname, 'zone': base_domain, 'target': fastly_cname_target | default('')}) -%}
+        {%- set _ = jobs.append({'domain': dns_hostname, 'zone': base_domain, 'target': fastly_cname_target | default(''), 'replace_records': true}) -%}
       {%- endif -%}
       {{ jobs }}
 
@@ -142,5 +148,5 @@
 - name: Debug Fastly DNS result
   debug:
     msg:
-      - "Origin: {{ fastly_origin_fqdn }} {{ '(written by providers/cloudflare/dns.yml)' if (fastly_fronting_domains | default([]) | length > 0) else '(records ensured above)' }}"
+      - "Origin: {{ fastly_origin_fqdn }} {{ '(written by providers/cloudflare/dns.yml)' if (fastly_fronting_edges | default([]) | length > 0) else '(records ensured above)' }}"
       - "Edge CNAMEs: {{ _fastly_edge_jobs | map(attribute='domain') | join(', ') }}"

@@ -38,7 +38,7 @@
 # <hostname>-<transport>-<h6> fits a 26-char hostname with room to spare.
 - name: Compute the Host edge domains
   set_fact:
-    _host_edge_domains: "{{ fastly_fronting_domains | default([]) if (fastly_fronting_domains | default([]) | length > 0) else [_remnawave_host_address] }}"
+    _host_edge_domains: "{{ fastly_fronting_edges | default([]) | map(attribute='fqdn') | list if (fastly_fronting_edges | default([]) | length > 0) else [_remnawave_host_address] }}"
 
 - name: List existing Remnawave Hosts
   uri:

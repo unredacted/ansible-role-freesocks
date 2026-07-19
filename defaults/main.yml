@@ -525,15 +525,30 @@ fastly_edge_random: false
 # above and to fastly_domain_mode: custom). global.ssl.fastly.net is blocked in
 # many places — fronting domains let clients connect via YOUR OWN domains:
 #   fastly_fronting_domains: ["video-streams.org", "cdn-static.net"]
-# Each domain gets its own Fastly TLS subscription (ACME dns-01) + an edge CNAME
-# in its own DNS zone (resolved by longest-suffix match against domain_providers —
-# every entry MUST be covered by a zone there). The FIRST entry is the primary
-# edge (used where a single value fits: FCP websocketDomain). Remnawave Hosts
-# are created per transport x domain, so subscriptions carry every edge and
-# clients can fail over. Mutually exclusive with fastly_edge_label /
-# fastly_edge_random / fastly_domain_mode: custom. Set at deploy time — adding
-# a domain to a live node means rotation. N domains = N TLS subscriptions.
+# These are EXACT, STABLE edge names (operator-chosen). Each gets its own Fastly
+# TLS subscription (ACME dns-01) + an edge CNAME to its lettered
+# x.sni.global.fastly.net target in its own zone (longest-suffix match against
+# domain_providers — every entry MUST be covered by a zone there). The FIRST
+# entry (of domains + zones combined) is the primary edge, used where a single
+# value fits (FCP websocketDomain). Remnawave Hosts are created per transport x
+# edge, so subscriptions carry every edge and clients can fail over. Mutually
+# exclusive with fastly_edge_label / fastly_edge_random / fastly_domain_mode:
+# custom. Set at deploy time — adding one to a live node means rotation. N
+# edges = N TLS subscriptions.
 fastly_fronting_domains: []
+
+# Zones under which a RANDOM edge subdomain is generated per node (LIST):
+#   fastly_fronting_zones: ["video-streams.org", "quick-cdn.net"]
+# produces e.g. quiet-river.video-streams.org, amber-field.quick-cdn.net —
+# unique, unguessable, innocuous-looking edge names per node (dictionary words,
+# not DGA-looking alnum). Each zone MUST exist in domain_providers. Generated
+# edges are EPHEMERAL: fresh labels per rotation; the old ones (edge CNAME,
+# TLS subscription, ACME record) are cleaned up via the persisted
+# fastly_edge_domains file. Because they are subdomains, MANY nodes can share
+# the same zones (Fastly's one-domain-per-service limit applies per FQDN).
+fastly_fronting_zones: []
+# Words per generated edge label (dictionary words, hyphen-joined).
+fastly_fronting_label_words: 2
 
 # Fastly backend connection settings (optimized for WebSocket passthrough)
 # connect_timeout: Time in ms to wait for a TCP connection to origin (default: 1000)

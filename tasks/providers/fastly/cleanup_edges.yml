@@ -1,0 +1,131 @@
+---
+# tasks/providers/fastly/cleanup_edges.yml
+#
+# Delete EPHEMERAL generated fronting edges after a rotation. The caller sets
+# old_fastly_edge_domains (the pre-rotation persisted list, one FQDN per line)
+# — read it BEFORE service.yml persists the NEW edges. For each old edge:
+#   1. delete its DNS records in its zone (edge CNAME / stray A-AAAA),
+#   2. delete its _acme-challenge CNAME,
+#   3. delete its Fastly TLS subscription.
+# Exact fastly_fronting_domains are operator-managed and are NEVER touched.
+# Tolerates missing zones (warns) and absent records (404).
+
+- name: Note the old generated edges being retired
+  debug:
+    msg: "Retiring {{ old_fastly_edge_domains | default([]) | length }} generated edge(s): {{ old_fastly_edge_domains | default([]) | join(', ') }}"
+
+- name: Resolve each old edge's zone (longest-suffix match)
+  set_fact:
+    _old_edge_jobs: >-
+      {%- set out = [] -%}
+      {%- for d in old_fastly_edge_domains | default([]) -%}
+        {%- set ns = namespace(best='') -%}
+        {%- for k in domain_providers | default({}) -%}
+          {%- if (d == k or d.endswith('.' ~ k)) and (k | length > ns.best | length) -%}
+            {%- set ns.best = k -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set _ = out.append({'domain': d, 'zone': ns.best}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: old_fastly_edge_domains | default([]) | length > 0
+
+- name: Warn about old edges with no resolvable zone
+  debug:
+    msg: >-
+      Cannot resolve a domain_providers zone for the retired edge
+      '{{ _edge.domain }}' — its DNS records and TLS subscription are LEFT IN
+      PLACE. Clean them up manually.
+  loop: "{{ _old_edge_jobs | default([]) }}"
+  loop_control:
+    loop_var: _edge
+    label: "{{ _edge.domain }}"
+  when: _edge.zone | length == 0
+
+- name: Retire each old generated edge (DNS + TLS)
+  block:
+    - name: Set zone Cloudflare credentials for the old edge
+      set_fact:
+        cf_token: "{{ domain_providers[_edge.zone].cloudflare_api_token | default(cloudflare_api_token) }}"
+
+    - name: Get the old edge's DNS records
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge.zone].zone_id }}/dns_records?name={{ _edge.domain }}"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ cf_token }}"
+        status_code: 200
+      delegate_to: localhost
+      no_log: true  # carries the Cloudflare API token in the Authorization header
+      register: _old_edge_records
+
+    - name: Delete the old edge's DNS records
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge.zone].zone_id }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ cf_token }}"
+        status_code: [200, 404]
+      delegate_to: localhost
+      no_log: true  # carries the Cloudflare API token in the Authorization header
+      loop: "{{ _old_edge_records.json.result | default([]) | selectattr('type', 'in', ['A', 'AAAA', 'CNAME']) | list }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.type }})"
+
+    - name: Get the old edge's ACME challenge record
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge.zone].zone_id }}/dns_records?type=CNAME&name=_acme-challenge.{{ _edge.domain }}"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ cf_token }}"
+        status_code: 200
+      delegate_to: localhost
+      no_log: true  # carries the Cloudflare API token in the Authorization header
+      register: _old_edge_acme
+
+    - name: Delete the old edge's ACME challenge record
+      uri:
+        url: "{{ cloudflare_api_endpoint }}/zones/{{ domain_providers[_edge.zone].zone_id }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ cf_token }}"
+        status_code: [200, 404]
+      delegate_to: localhost
+      no_log: true  # carries the Cloudflare API token in the Authorization header
+      loop: "{{ _old_edge_acme.json.result | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Look up the old edge's TLS subscription
+      uri:
+        url: "{{ fastly_api_endpoint }}/tls/subscriptions?filter[tls_domains.id]={{ _edge.domain | urlencode }}"
+        method: GET
+        headers:
+          Fastly-Key: "{{ fastly_token }}"
+          Accept: "application/vnd.api+json"
+        status_code: 200
+      delegate_to: localhost
+      no_log: true  # carries the Fastly API token in the Fastly-Key header
+      register: _old_edge_tls
+
+    - name: Delete the old edge's TLS subscription
+      uri:
+        url: "{{ fastly_api_endpoint }}/tls/subscriptions/{{ item.id }}"
+        method: DELETE
+        headers:
+          Fastly-Key: "{{ fastly_token }}"
+          Accept: "application/vnd.api+json"
+        status_code: [200, 204, 404]
+      delegate_to: localhost
+      no_log: true  # carries the Fastly API token in the Fastly-Key header
+      loop: "{{ _old_edge_tls.json.data | default([]) }}"
+      loop_control:
+        label: "{{ item.id }}"
+  loop: "{{ _old_edge_jobs | default([]) | rejectattr('zone', 'equalto', '') | list }}"
+  loop_control:
+    loop_var: _edge
+    label: "{{ _edge.domain }}"

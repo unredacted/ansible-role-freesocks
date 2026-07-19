@@ -108,7 +108,7 @@
   register: _fastly_cleanup_tls
   when:
     - effective_fastly_domain_mode | default('shared') == 'custom'
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - fastly_cleanup_domain | default('') | length > 0
 
 - name: Delete TLS subscriptions for the old edge domain
@@ -126,7 +126,7 @@
     label: "{{ item.id }}"
   when:
     - effective_fastly_domain_mode | default('shared') == 'custom'
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - fastly_cleanup_domain | default('') | length > 0
 
 - name: Debug Fastly service deletion

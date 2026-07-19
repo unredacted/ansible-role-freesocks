@@ -6,9 +6,10 @@
 #   1. suffix generation: real lookup produces 8 [a-z0-9] chars
 #   2. shared mode:      dns_hostname is RESHAPED to the suffixed origin FQDN
 #   3. legacy custom:    dns_hostname stays clean; origin is separate
-#   4. fronting domains: imply the custom flow + longest-suffix zone resolution
-#   5. mutual exclusion: fronting + shared selectors / legacy custom -> fail
-#   6. expressions: node-address fallback, multi-edge Host remark + cleanup regex
+#   4. fronting domains: exact edges + longest-suffix zone resolution
+#   5. fronting zones:   generated <word>-<word>.<zone> edges (labels pre-seeded)
+#   6. mutual exclusion: fronting + shared selectors / legacy custom -> fail
+#   7. expressions: node-address fallback, multi-edge Host remark + cleanup regex
 #
 # NOTE: plays share a host, so facts set via set_fact (by the included file)
 # LEAK between plays and outrank play vars — every play after the first
@@ -48,7 +49,7 @@
 - hosts: localhost
   connection: local
   gather_facts: false
-  vars:
+  vars: &reset
     random_hostname: "apple-banana-cherry"
     base_domain: "freesocks.org"
     effective_cdn_provider: "fastly"
@@ -56,13 +57,16 @@
       freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
   pre_tasks:
     - name: Re-establish this play's state (facts leak between plays)
-      set_fact:
+      set_fact: &reset_facts
         dns_hostname: "apple-banana-cherry.freesocks.org"
         effective_fastly_domain_mode: "shared"
         fastly_origin_suffix: "a1b2c3d4" # deterministic; include skips generation
         fastly_origin_fqdn: ""
         fastly_fronting_domains: []
-        fastly_fronting_zones: {}
+        fastly_fronting_zones: []
+        fastly_fronting_labels: []
+        fastly_fronting_zone_map: {}
+        fastly_fronting_edges: []
         fastly_edge_label: ""
         fastly_edge_random: false
   tasks:
@@ -82,23 +86,12 @@
 - hosts: localhost
   connection: local
   gather_facts: false
-  vars:
-    random_hostname: "apple-banana-cherry"
-    base_domain: "freesocks.org"
-    effective_cdn_provider: "fastly"
-    domain_providers:
-      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+  vars: *reset
   pre_tasks:
     - name: Re-establish this play's state (facts leak between plays)
       set_fact:
-        dns_hostname: "apple-banana-cherry.freesocks.org"
+        <<: *reset_facts
         effective_fastly_domain_mode: "custom"
-        fastly_origin_suffix: "a1b2c3d4"
-        fastly_origin_fqdn: ""
-        fastly_fronting_domains: []
-        fastly_fronting_zones: {}
-        fastly_edge_label: ""
-        fastly_edge_random: false
   tasks:
     - name: Include the real origin_identity.yml (legacy custom mode)
       include_tasks: ../tasks/providers/fastly/origin_identity.yml
@@ -111,7 +104,7 @@
           - effective_fastly_domain_mode == 'custom'
         success_msg: "legacy custom: clean dns_hostname, separate suffixed origin."
 
-# --- 4. fronting domains: custom flow + longest-suffix zone match -------------
+# --- 4. fronting domains (exact): custom flow + longest-suffix zone match -----
 - hosts: localhost
   connection: local
   gather_facts: false
@@ -126,19 +119,14 @@
   pre_tasks:
     - name: Re-establish this play's state (facts leak between plays)
       set_fact:
+        <<: *reset_facts
         dns_hostname: "xray1-front-mci1-fs-ce.freesocks.org"
-        effective_fastly_domain_mode: "shared"
-        fastly_origin_suffix: "a1b2c3d4"
-        fastly_origin_fqdn: ""
         fastly_fronting_domains:
           - "video-streams.org"
           - "cdn.video-streams.org"
           - "app.static.net"
-        fastly_fronting_zones: {}
-        fastly_edge_label: ""
-        fastly_edge_random: false
   tasks:
-    - name: Include the real origin_identity.yml (fronting mode)
+    - name: Include the real origin_identity.yml (exact fronting domains)
       include_tasks: ../tasks/providers/fastly/origin_identity.yml
 
     - name: Assert fronting implies custom + origin-shaped dns_hostname
@@ -148,15 +136,73 @@
           - dns_hostname == 'xray1-front-mci1-fs-ce-a1b2c3d4.freesocks.org'
         success_msg: "fronting: custom flow, origin-shaped dns_hostname."
 
-    - name: Assert longest-suffix zone resolution per domain
+    - name: Assert longest-suffix zone resolution per exact domain
       assert:
         that:
-          - fastly_fronting_zones['video-streams.org'] == 'video-streams.org'
-          - fastly_fronting_zones['cdn.video-streams.org'] == 'video-streams.org'
-          - fastly_fronting_zones['app.static.net'] == 'static.net'
+          - fastly_fronting_zone_map['video-streams.org'] == 'video-streams.org'
+          - fastly_fronting_zone_map['cdn.video-streams.org'] == 'video-streams.org'
+          - fastly_fronting_zone_map['app.static.net'] == 'static.net'
         success_msg: "fronting zones resolved by longest suffix."
 
-# --- 5a. mutual exclusion: fronting + shared label fails ----------------------
+    - name: "Assert the edges are the exact domains (generated: false)"
+      assert:
+        that:
+          - fastly_fronting_edges | length == 3
+          - fastly_fronting_edges | map(attribute='fqdn') | list == ['video-streams.org', 'cdn.video-streams.org', 'app.static.net']
+          - fastly_fronting_edges | selectattr('generated') | list | length == 0
+          - (fastly_fronting_edges | first).fqdn == 'video-streams.org'
+        success_msg: "exact edges computed, primary = first."
+
+# --- 5. fronting zones: generated <word>-<word>.<zone> edges -------------------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    random_hostname: "xray1-front-mci1-fs-ce"
+    base_domain: "freesocks.org"
+    effective_cdn_provider: "fastly"
+    domain_providers:
+      freesocks.org: { dns_provider: cloudflare, zone_id: "z1" }
+      video-streams.org: { dns_provider: cloudflare, zone_id: "z2" }
+      quick-cdn.net: { dns_provider: cloudflare, zone_id: "z4" }
+  pre_tasks:
+    - name: Re-establish this play's state (facts leak between plays)
+      set_fact:
+        <<: *reset_facts
+        dns_hostname: "xray1-front-mci1-fs-ce.freesocks.org"
+        fastly_fronting_domains: ["video-streams.org"]
+        fastly_fronting_zones: ["quick-cdn.net", "video-streams.org"]
+        # pre-seeded: origin_identity skips the apt/shuf draw (deterministic)
+        fastly_fronting_labels: ["quiet-river", "amber-field"]
+  tasks:
+    - name: Include the real origin_identity.yml (fronting zones)
+      include_tasks: ../tasks/providers/fastly/origin_identity.yml
+
+    - name: Assert generated edges follow the exact ones (union, primary = first)
+      assert:
+        that:
+          - fastly_fronting_edges | length == 3
+          - fastly_fronting_edges[0].fqdn == 'video-streams.org'
+          - fastly_fronting_edges[0].generated == false
+          - fastly_fronting_edges[1].fqdn == 'quiet-river.quick-cdn.net'
+          - fastly_fronting_edges[1].zone == 'quick-cdn.net'
+          - fastly_fronting_edges[1].generated == true
+          - fastly_fronting_edges[2].fqdn == 'amber-field.video-streams.org'
+          - fastly_fronting_edges[2].zone == 'video-streams.org'
+          - fastly_fronting_edges[2].generated == true
+          - effective_fastly_domain_mode == 'custom'
+          - dns_hostname == 'xray1-front-mci1-fs-ce-a1b2c3d4.freesocks.org'
+        success_msg: "generated edges: exact first, then one per zone."
+
+    - name: Word-to-label pairing expression (batch + join) matches the include
+      vars:
+        _words: ["quiet", "river", "amber", "field"]
+      assert:
+        that:
+          - (_words | batch(2) | map('join', '-') | list) == ['quiet-river', 'amber-field']
+        success_msg: "batch(label_words) + join('-') pairs words into labels."
+
+# --- 6a. mutual exclusion: fronting + shared label fails -----------------------
 - hosts: localhost
   connection: local
   gather_facts: false
@@ -170,14 +216,10 @@
   pre_tasks:
     - name: Re-establish this play's state (facts leak between plays)
       set_fact:
+        <<: *reset_facts
         dns_hostname: "apple-banana-cherry.freesocks.org"
-        effective_fastly_domain_mode: "shared"
-        fastly_origin_suffix: "a1b2c3d4"
-        fastly_origin_fqdn: ""
         fastly_fronting_domains: ["video-streams.org"]
-        fastly_fronting_zones: {}
         fastly_edge_label: "cdn-content"
-        fastly_edge_random: false
         _conflict_not_detected: ""
   tasks:
     - name: Expect the mutual-exclusion assert to fire
@@ -196,7 +238,7 @@
           - _conflict_not_detected != 'yes'
         fail_msg: "fronting + fastly_edge_label should hard-fail but did not"
 
-# --- 5b. mutual exclusion: fronting + legacy custom mode fails ----------------
+# --- 6b. mutual exclusion: fronting zones + legacy custom mode fails -----------
 - hosts: localhost
   connection: local
   gather_facts: false
@@ -210,14 +252,11 @@
   pre_tasks:
     - name: Re-establish this play's state (facts leak between plays)
       set_fact:
+        <<: *reset_facts
         dns_hostname: "apple-banana-cherry.freesocks.org"
         effective_fastly_domain_mode: "custom"
-        fastly_origin_suffix: "a1b2c3d4"
-        fastly_origin_fqdn: ""
-        fastly_fronting_domains: ["video-streams.org"]
-        fastly_fronting_zones: {}
-        fastly_edge_label: ""
-        fastly_edge_random: false
+        fastly_fronting_zones: ["video-streams.org"]
+        fastly_fronting_labels: ["quiet-river"]
         _conflict_not_detected: ""
   tasks:
     - name: Expect the legacy-custom conflict assert to fire
@@ -236,13 +275,12 @@
           - _conflict_not_detected != 'yes'
         fail_msg: "fronting + fastly_domain_mode: custom should hard-fail but did not"
 
-# --- 6. expressions: node address, Host remark, cleanup regex ------------------
+# --- 7. expressions: node address, Host remark, cleanup regex ------------------
 - hosts: localhost
   connection: local
   gather_facts: false
   vars:
     random_hostname: "quiet-falcon"
-    dns_hostname: "quiet-falcon.freesocks.org"
     _domains: ["video-streams.org", "cdn-static.net"]
   pre_tasks:
     - name: Re-establish this play's state (facts leak between plays)
@@ -299,3 +337,54 @@
     - name: All origin-identity tests passed
       debug:
         msg: "All origin-identity tests passed."
+
+# --- 8. dns_edge classification semantics (idempotent, non-destructive) --------
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _target: "x.sni.global.fastly.net"
+    _scenarios:
+      # correct CNAME already present -> no-op
+      - { records: [{type: CNAME, content: "x.sni.global.fastly.net", id: "1"}], expect_ok: 1, expect_stale: 0, expect_addr: 0 }
+      # stale CNAME (different target) -> replaced
+      - { records: [{type: CNAME, content: "y.sni.global.fastly.net", id: "2"}], expect_ok: 0, expect_stale: 1, expect_addr: 0 }
+      # A/AAAA present (fronting: fail / legacy custom: delete) -> no CNAME actions
+      - { records: [{type: A, content: "1.2.3.4", id: "3"}, {type: AAAA, content: "::1", id: "4"}], expect_ok: 0, expect_stale: 0, expect_addr: 2 }
+      # mixed: correct CNAME + stray A -> no-op wins (nothing touched)
+      - { records: [{type: CNAME, content: "x.sni.global.fastly.net", id: "5"}, {type: A, content: "1.2.3.4", id: "6"}], expect_ok: 1, expect_stale: 0, expect_addr: 1 }
+      # empty -> create only
+      - { records: [], expect_ok: 0, expect_stale: 0, expect_addr: 0 }
+  tasks:
+    - name: Records classify into ok / stale / addr correctly
+      vars:
+        _ok: "{{ item.records | selectattr('type', 'equalto', 'CNAME') | selectattr('content', 'equalto', _target) | list }}"
+        _stale: "{{ item.records | selectattr('type', 'equalto', 'CNAME') | rejectattr('content', 'equalto', _target) | list }}"
+        _addr: "{{ item.records | selectattr('type', 'in', ['A', 'AAAA']) | list }}"
+      assert:
+        that:
+          - _ok | length == item.expect_ok
+          - _stale | length == item.expect_stale
+          - _addr | length == item.expect_addr
+        success_msg: "scenario ok={{ item.expect_ok }} stale={{ item.expect_stale }} addr={{ item.expect_addr }}."
+      loop: "{{ _scenarios }}"
+      loop_control:
+        label: "{{ item.records | map(attribute='type') | join('+') | default('empty', true) }}"
+
+    - name: The fail condition fires only with addr records and no replace flag
+      assert:
+        that:
+          - >-
+            (item.ok == 0 and item.addr > 0 and not item.replace) == item.expect_fail
+        success_msg: "fail semantics: {{ item.name }}."
+      loop:
+        - { name: "fronting + addr records -> FAIL", ok: 0, addr: 2, replace: false, expect_fail: true }
+        - { name: "legacy custom + addr records -> allowed", ok: 0, addr: 2, replace: true, expect_fail: false }
+        - { name: "fronting + correct CNAME -> no fail", ok: 1, addr: 1, replace: false, expect_fail: false }
+        - { name: "fronting + empty -> no fail", ok: 0, addr: 0, replace: false, expect_fail: false }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: All dns_edge classification tests passed
+      debug:
+        msg: "All dns_edge classification tests passed."

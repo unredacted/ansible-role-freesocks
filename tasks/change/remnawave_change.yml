@@ -288,6 +288,23 @@
     - _old_fastly_origin_raw.content is defined
     - (_old_fastly_origin_raw.content | b64decode | trim) | length > 0
 
+# Same for the OLD generated edge FQDNs — service.yml persists the NEW list;
+# cleanup_edges.yml retires the old ones at the end of the rotation.
+- name: Read the OLD generated Fastly edge domains (pre-rotation)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/fastly_edge_domains"
+  register: _old_fastly_edges_raw
+  become: yes
+  failed_when: false
+  when: effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set the OLD generated edge list fact
+  set_fact:
+    old_fastly_edge_domains: "{{ (_old_fastly_edges_raw.content | b64decode).split('\n') | select('string') | reject('equalto', '') | list }}"
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_edges_raw.content is defined
+
 # The service is named after the hostname — a rotation to a NEW hostname is
 # always a new-name create (old service deleted AFTER). Only an unchanged
 # hostname (re-run / custom_hostname reuse) reuses the same name — then the old
@@ -357,6 +374,15 @@
   when:
     - effective_cdn_provider | default('none') == 'fastly'
     - not (_fastly_same_name_rotation | default(false) | bool)
+
+# Old generated edges come down only after the new ones are live (their TLS
+# subscriptions + edge CNAMEs), so a mid-run failure leaves the old edges
+# serving. Exact fastly_fronting_domains are never touched.
+- name: Retire OLD generated Fastly edges (DNS + TLS subscription)
+  include_tasks: ../providers/fastly/cleanup_edges.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - old_fastly_edge_domains | default([]) | length > 0
 
 # ============================================================================
 # STEP 5: Update Panel-side address

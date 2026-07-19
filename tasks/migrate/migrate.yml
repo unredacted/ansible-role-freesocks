@@ -295,6 +295,25 @@
     - outline_migrate_fastly_id_file.stat.exists
     - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
 
+- name: Read the OLD generated Fastly edge domains (Outline, transferred)
+  slurp:
+    src: /opt/outline/fastly_edge_domains
+  register: _old_fastly_edges_raw
+  become: yes
+  failed_when: false
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - outline_migrate_fastly_id_file.stat.exists
+
+- name: Set the OLD generated edge list fact (Outline)
+  set_fact:
+    old_fastly_edge_domains: "{{ (_old_fastly_edges_raw.content | b64decode).split('\n') | select('string') | reject('equalto', '') | list }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - _old_fastly_edges_raw.content is defined
+
 # The service is named after the hostname — only an UNCHANGED hostname
 # (destination named after the source) reuses the same service name, and then
 # the old service must be deleted first (the create would otherwise reuse it
@@ -364,6 +383,15 @@
     - outline_migrate_fastly_id_file.stat.exists
     - effective_cdn_provider | default('none') == 'fastly'
     - not (_fastly_same_name_rotation | default(false) | bool)
+
+# Old generated edges (from the source) come down last. Exact
+# fastly_fronting_domains are never touched.
+- name: Retire OLD generated Fastly edges (Outline)
+  include_tasks: ../providers/fastly/cleanup_edges.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'outline'
+    - old_fastly_edge_domains | default([]) | length > 0
 
 # ============================================================================
 # Re-read the transferred Outline API info (destination, Outline only)
@@ -543,6 +571,26 @@
     - _old_fastly_service_id_raw.content is defined
     - (_old_fastly_service_id_raw.content | b64decode | trim) | length > 0
 
+- name: Read the OLD generated Fastly edge domains (Remnawave, transferred)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/fastly_edge_domains"
+  register: _old_fastly_edges_raw
+  become: yes
+  failed_when: false
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+
+- name: Set the OLD generated edge list fact (Remnawave)
+  set_fact:
+    old_fastly_edge_domains: "{{ (_old_fastly_edges_raw.content | b64decode).split('\n') | select('string') | reject('equalto', '') | list }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - effective_cdn_provider | default('none') == 'fastly'
+    - _old_fastly_edges_raw.content is defined
+
 # The service is named after the hostname — only an UNCHANGED hostname
 # (destination named after the source) reuses the same service name, and then
 # the old service must be deleted first (the create would otherwise reuse it
@@ -633,3 +681,11 @@
     - migrate_component == 'remnawave'
     - effective_cdn_provider | default('none') == 'fastly'
     - not (_fastly_same_name_rotation | default(false) | bool)
+
+# Old generated edges (from the source) come down last. Exact
+# fastly_fronting_domains are never touched.
+- name: Retire OLD generated Fastly edges (DNS + TLS subscription)
+  include_tasks: ../providers/fastly/cleanup_edges.yml
+  when:
+    - effective_cdn_provider | default('none') == 'fastly'
+    - old_fastly_edge_domains | default([]) | length > 0

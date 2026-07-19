@@ -337,27 +337,41 @@ client-edge scheme:
 | **Fronting domains** | `fastly_fronting_domains: ["video-streams.org", …]` | your own domains | **Recommended** — `global.ssl.fastly.net` is blocked in many places |
 | Legacy custom | `fastly_domain_mode: custom` on the domain | `<hostname>.<base_domain>` | Same-domain edge |
 
-**Fronting domains** (a LIST — multiple domains give client-side failover when
-one gets blocked):
+**Fronting edges** (two complementary lists — the effective edge set is their
+union, first entry = primary):
 
 ```yaml
-fastly_fronting_domains: ["video-streams.org", "cdn-static.net"]
+# Exact, stable edge names (operator-chosen; follow the node through rotation):
+fastly_fronting_domains: ["cdn-content.com"]
+# Zones under which a RANDOM edge subdomain is generated per node
+# (e.g. quiet-river.video-streams.org, fresh per rotation):
+fastly_fronting_zones: ["video-streams.org", "quick-cdn.net"]
 ```
 
-- Each domain gets its **own Fastly TLS subscription** (Let's Encrypt ACME
-  dns-01) and an edge CNAME written in **its own DNS zone** — resolved by
-  longest-suffix match against `domain_providers`, so every entry must be
-  covered by a zone there (with `zone_id` + optional per-zone
-  `cloudflare_api_token`). The role fails fast listing any uncovered domain.
-- The **first** entry is the primary edge, used where a single value fits
-  (FCP `websocketDomain`, the single-Host case).
-- Remnawave **Hosts are created per transport × domain**, so subscriptions
-  carry every edge and clients can fail over. With more than one domain a
+- **Generated edges** (`fastly_fronting_zones`) are the recommended default:
+  unique, unguessable, innocuous-looking (2 dictionary words, not DGA-looking
+  alnum) edge names per node. They are **ephemeral** — rotation generates
+  fresh labels and the old ones (edge CNAME, TLS subscription, ACME record)
+  are retired automatically via the persisted `fastly_edge_domains` file.
+  Because they are subdomains, **many nodes can share the same zones**
+  (Fastly's one-domain-per-service limit applies per FQDN).
+- **Exact edges** (`fastly_fronting_domains`) are stable operator-chosen
+  names; their CNAMEs are re-pointed on rotation, never deleted.
+- Each edge gets its **own Fastly TLS subscription** (Let's Encrypt ACME
+  dns-01) and an edge CNAME to its lettered `x.sni.global.fastly.net` target,
+  written in **its own DNS zone** (exact domains: longest-suffix match against
+  `domain_providers`; generated: the zone entry itself). Every domain/zone
+  must be covered there (with `zone_id` + optional per-zone
+  `cloudflare_api_token`) — the role fails fast listing any uncovered entry.
+- Remnawave **Hosts are created per transport × edge**, so subscriptions
+  carry every edge and clients can fail over. With more than one edge a
   deterministic 6-hex suffix is added to the Host remark.
-- Fronting domains are **per-node** (Fastly allows a domain on only one
-  service) and follow the node through rotation — their CNAMEs are re-pointed,
-  never deleted. Adding a domain to a live node means rotating. N domains = N
-  TLS subscriptions (possible Fastly cost).
+- Edge CNAME writes are **idempotent and non-destructive**: an
+  already-correct CNAME is left untouched, a stale-target CNAME is replaced,
+  and your A/AAAA records on a fronting name are **never auto-deleted** — the
+  role fails with guidance instead.
+- Edges are set at deploy time — adding one to a live node means rotating.
+  N edges = N TLS subscriptions (possible Fastly cost).
 
 **Node identity and the hidden origin.** Whatever the edge scheme, the node is
 identified everywhere by its hostname (`custom_hostname` for ops-meaningful

@@ -10,9 +10,11 @@
 #     external DNS/TLS needed.
 #   - custom (legacy same-domain): your own hostname (requires TLS
 #     subscription + DNS CNAME in base_domain's zone)
-#   - fronting domains (fastly_fronting_domains): one or more decoupled edge
-#     domains (e.g. video-streams.org), each with its own TLS subscription +
-#     CNAME in its own zone. Implies the custom flow; primary = first entry.
+#   - fronting edges (fastly_fronting_domains exact / fastly_fronting_zones
+#     random subdomains): one or more decoupled edge domains (e.g.
+#     video-streams.org or quiet-river.video-streams.org), each with its own
+#     TLS subscription + edge CNAME in its own zone. Implies the custom flow;
+#     primary = first entry of fastly_fronting_edges.
 # The backend always dials the unguessable per-node origin FQDN
 # (<hostname>-<suffix>.<base_domain>, from origin_identity.yml).
 #
@@ -31,9 +33,9 @@
 - name: Set Fastly API credentials
   set_fact:
     fastly_token: "{{ domain_providers[base_domain].fastly_api_token | default(fastly_api_token) }}"
-    # Fronting domains imply the custom flow (TLS subscription + edge CNAMEs);
-    # origin_identity.yml derives + validates them before this file runs.
-    fastly_domain_mode_effective: "{{ 'custom' if (fastly_fronting_domains | default([]) | length > 0) else (domain_providers[base_domain].fastly_domain_mode | default('shared')) }}"
+    # Fronting edges imply the custom flow (TLS subscription + edge CNAMEs);
+    # origin_identity.yml computes fastly_fronting_edges before this file runs.
+    fastly_domain_mode_effective: "{{ 'custom' if (fastly_fronting_edges | default([]) | length > 0) else (domain_providers[base_domain].fastly_domain_mode | default('shared')) }}"
 
 - name: Fail if Fastly API token is not set
   fail:
@@ -62,23 +64,23 @@
       (fs-<random>.global.ssl.fastly.net) for a shared-mode Fastly node.
   when:
     - fastly_domain_mode_effective == 'shared'
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
 
 # The service is ALWAYS named after the node hostname (ops-identifiable per
 # node; the idempotency lookup below keys off it). Only the attached DOMAIN(S)
 # differ by edge scheme.
-- name: Set Fastly service + edge names (fronting domains — primary is first)
+- name: Set Fastly service + edge names (fronting edges — primary is first)
   set_fact:
     fastly_service_name: "{{ random_hostname }}"
-    fastly_websocket_domain: "{{ fastly_fronting_domains | first }}"
-  when: fastly_fronting_domains | default([]) | length > 0
+    fastly_websocket_domain: "{{ (fastly_fronting_edges | first).fqdn }}"
+  when: fastly_fronting_edges | default([]) | length > 0
 
 - name: Set Fastly shared domain name (operator-chosen label)
   set_fact:
     fastly_service_name: "{{ random_hostname }}"
     fastly_websocket_domain: "{{ fastly_edge_label }}.global.ssl.fastly.net"
   when:
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - fastly_domain_mode_effective == 'shared'
     - fastly_edge_label | default('') | length > 0
 
@@ -87,7 +89,7 @@
     fastly_service_name: "{{ random_hostname }}"
     fastly_websocket_domain: "{{ fastly_service_name_prefix }}-{{ random_hostname }}.global.ssl.fastly.net"
   when:
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - fastly_domain_mode_effective == 'shared'
     - not (fastly_edge_label | default('') | length > 0)
     - fastly_edge_random | default(false) | bool
@@ -97,7 +99,7 @@
     fastly_service_name: "{{ random_hostname }}"
     fastly_websocket_domain: "{{ dns_hostname }}"
   when:
-    - fastly_fronting_domains | default([]) | length == 0
+    - fastly_fronting_edges | default([]) | length == 0
     - fastly_domain_mode_effective == 'custom'
 
 # The backend ALWAYS dials the per-node origin FQDN (an unguessable
@@ -274,7 +276,7 @@
 # them); shared/legacy-custom attach the single edge name.
 - name: Compute the domains to attach to the service
   set_fact:
-    _fastly_domains_to_attach: "{{ fastly_fronting_domains | default([]) if (fastly_fronting_domains | default([]) | length > 0) else [fastly_websocket_domain] }}"
+    _fastly_domains_to_attach: "{{ fastly_fronting_edges | default([]) | map(attribute='fqdn') | list if (fastly_fronting_edges | default([]) | length > 0) else [fastly_websocket_domain] }}"
 
 - name: Add domain to Fastly service
   uri:
@@ -468,6 +470,18 @@
     dest: "{{ fastly_service_id_dir }}/fastly_origin_fqdn"
     mode: '0644'
   become: yes
+
+# Persist the GENERATED edge FQDNs (one per line) — rotation generates fresh
+# labels and cleanup_edges.yml removes these old ones (edge CNAME, TLS
+# subscription, ACME record). Only generated edges are ephemeral; exact
+# fastly_fronting_domains are operator-managed and never cleaned up.
+- name: Save generated Fastly edge domains to server
+  copy:
+    content: "{{ (fastly_fronting_edges | default([]) | selectattr('generated') | map(attribute='fqdn') | list | join('\n')) ~ '\n' }}"
+    dest: "{{ fastly_service_id_dir }}/fastly_edge_domains"
+    mode: '0644'
+  become: yes
+  when: fastly_fronting_edges | default([]) | selectattr('generated') | list | length > 0
 
 - name: Display Fastly service summary
   debug:
