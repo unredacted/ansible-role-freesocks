@@ -141,7 +141,7 @@
     body:
       type: "CNAME"
       name: "{{ fastly_acme_challenge_record.record_name }}"
-      content: "{{ fastly_acme_challenge_record.values | first }}"
+      content: "{{ fastly_acme_challenge_record['values'] | first }}"
       ttl: 1
       proxied: false
     status_code: [200, 201]
@@ -150,7 +150,7 @@
   when:
     - effective_dns_provider == 'cloudflare'
     - fastly_acme_challenge_record is defined
-    - fastly_acme_challenge_record.values | default([]) | length > 0
+    - fastly_acme_challenge_record['values'] | default([]) | length > 0
     - _acme_dns_existing.json.result | default([]) | length == 0
   register: acme_dns_result
 
