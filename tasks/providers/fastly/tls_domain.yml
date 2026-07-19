@@ -109,6 +109,17 @@
   set_fact:
     fastly_acme_challenge_record: "{{ (fastly_tls_challenges | first).attributes.challenges | selectattr('type', 'in', ['dns-01', 'managed-dns']) | first }}"
 
+# The lettered edge target (x.sni.global.fastly.net) is offered in the SAME
+# authorization as a 'managed-http-cname' challenge — no extra call needed.
+# (The old /tls/activations cname_target attribute no longer exists in the
+# current API; that lookup below is only a fallback.)
+- name: Extract the edge CNAME target from the authorization ({{ _tls_job.domain }})
+  set_fact:
+    _tls_cname_target: >-
+      {{ (((fastly_tls_challenges | first).attributes.challenges
+           | selectattr('type', 'equalto', 'managed-http-cname') | list | first | default({}))
+          ['values'] | default([]) | first | default('')) }}
+
 # Set per-zone Cloudflare credentials for the ACME record (the fronting zone
 # may live in a different Cloudflare account than base_domain).
 - name: Set zone Cloudflare credentials for ACME ({{ _tls_job.zone }})
@@ -183,10 +194,11 @@
   when: fastly_tls_status.json.data.attributes.state == 'failed'
 
 # ============================================================================
-# Extract CNAME target for DNS routing
+# Extract CNAME target for DNS routing (fallback: /tls/activations)
 # ============================================================================
-# After TLS is issued, get the specific CNAME Target (e.g., x.sni.global.fastly.net)
-- name: Get TLS domain details for CNAME target ({{ _tls_job.domain }})
+# Only needed when the authorization offered no managed-http-cname challenge.
+# After TLS is issued, the activation may lag — retry while it appears.
+- name: Get TLS domain details for CNAME target ({{ _tls_job.domain }}, fallback)
   uri:
     url: "{{ fastly_api_endpoint }}/tls/activations?filter[tls_subscription.id]={{ fastly_tls_subscription_id }}"
     method: GET
@@ -197,13 +209,20 @@
   delegate_to: localhost
   no_log: true  # carries the Fastly API token in the Fastly-Key header
   register: fastly_tls_activations
+  retries: 12
+  delay: 10
+  until: >-
+    ((fastly_tls_activations.json.data | default([]) | first | default({}))
+     .attributes.cname_target | default('') | length) > 0
+  failed_when: false
+  when: _tls_cname_target | length == 0
 
-- name: Extract this domain's Fastly CNAME target
+- name: Extract this domain's Fastly CNAME target (fallback)
   set_fact:
-    # The CNAME target comes from the TLS configuration
-    # Format is typically: {letter}.sni.global.fastly.net
-    _tls_cname_target: "{{ fastly_tls_activations.json.data[0].attributes.cname_target | default('') }}"
-  when: fastly_tls_activations.json.data | length > 0
+    _tls_cname_target: "{{ (fastly_tls_activations.json.data | first).attributes.cname_target | default('') }}"
+  when:
+    - _tls_cname_target | length == 0
+    - fastly_tls_activations.json.data | default([]) | length > 0
 
 # The CNAME target is NOT derivable from the domain name (Fastly assigns it per
 # subscription) — never guess it. Fail loudly so the operator checks the
@@ -211,11 +230,12 @@
 - name: Fail if Fastly did not report a CNAME target ({{ _tls_job.domain }})
   fail:
     msg: >-
-      Fastly's /tls/activations returned no cname_target for TLS subscription
-      {{ fastly_tls_subscription_id }} ({{ _tls_job.domain }}). The edge
-      CNAME cannot be written without it — check the subscription state in the
-      Fastly dashboard/API, then re-run.
-  when: _tls_cname_target is not defined or _tls_cname_target == ''
+      Fastly reported no edge CNAME target for TLS subscription
+      {{ fastly_tls_subscription_id }} ({{ _tls_job.domain }}) — neither a
+      'managed-http-cname' challenge in the authorization nor a cname_target
+      from /tls/activations. Check the subscription state in the Fastly
+      dashboard/API, then re-run.
+  when: _tls_cname_target | length == 0
 
 - name: Record this domain's CNAME target
   set_fact:
