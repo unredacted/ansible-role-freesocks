@@ -32,7 +32,7 @@
     fcp_enabled: true
     fcp_api_url: "{{ lookup('env', 'FCP_MOCK_URL') | default('http://127.0.0.1:8811', true) }}"
     fcp_api_token: "fsv1_ci-mock-token"
-    fcp_default_connection_mode: "evade"
+    fcp_default_connection_mode: "freedom-ws"
     remnawave_bootstrap_output_file: "/tmp/role-ci/bootstrap-vars.yml"
     remnawave_persist_become: false
   pre_tasks:
@@ -85,9 +85,9 @@
         that:
           - _t1_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
           - _t1_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
-          - _t1_fcp.defaultMode == 'evade'
-          - _t1_fcp.pools.evade | length == 1
-          - _t1_fcp.pools.privacy | length == 1
+          - _t1_fcp.defaultMode == 'freedom-ws'
+          - _t1_fcp.pools['freedom-ws'] | length == 1
+          - _t1_fcp.pools['privacy-reality'] | length == 1
         fail_msg: "Bootstrap should create + bind the shared squads (FreeSocks-Fastly / FreeSocks-Reality)"
 
 - name: Integration — phase 2 (node 1, shared model — no clones/squads/appends)
@@ -229,8 +229,8 @@
           # shared model: no per-node squads, no inbound clones, no pool appends
           - _t2_squads | select('search', '-ci-node') | list | length == 0
           - _t2_tags | select('search', '_CI_NODE') | list | length == 0
-          - _t2_state.pools.evade | length == 1
-          - _t2_state.pools.privacy | length == 1
+          - _t2_state.pools['freedom-ws'] | length == 1
+          - _t2_state.pools['privacy-reality'] | length == 1
           - _t2_state.servers['ci-panel'].maxKeys == 100
           - _t2_state.servers['ci-panel'].priority == 5
         fail_msg: "Shared-model node registration created per-node objects or drifted FCP state"
@@ -291,8 +291,8 @@
     - name: Assert the shared pools + squads are undisturbed
       assert:
         that:
-          - _t3_fcp.pools.evade | length == 1
-          - _t3_fcp.pools.privacy | length == 1
+          - _t3_fcp.pools['freedom-ws'] | length == 1
+          - _t3_fcp.pools['privacy-reality'] | length == 1
           - _t3_squads | select('search', '-ci-node') | list | length == 0
         fail_msg: "A shared-model node disturbed the pools or created per-node squads"
 
@@ -372,8 +372,8 @@
           - _t4_tags | length == 2  # the two base inbounds, nothing cloned
           - _t4_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
           - _t4_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
-          - _t4_state.pools.evade | length == 1
-          - _t4_state.pools.privacy | length == 1
+          - _t4_state.pools['freedom-ws'] | length == 1
+          - _t4_state.pools['privacy-reality'] | length == 1
         fail_msg: "Shared-model teardown left node-1 residue or disturbed the fleet state"
 
 - name: "Integration — phase 5 (LEGACY per-node placement: clones, squads, pools, teardown)"
@@ -415,9 +415,9 @@
         tasks_from: providers/fcp/bind_placements
       vars:
         _fcp_placement_modes: >-
-          {{ ({'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
+          {{ ({'freedom-ws': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
               if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {})
-             | combine({'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
+             | combine({'privacy-reality': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
               if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {}) }}
     - name: Read back panel + FCP after node 3's legacy creates
       uri:
@@ -441,8 +441,8 @@
           - _t5_tags | select('equalto', 'VLESS_REALITY_CI_NODE_THREE') | list | length == 1
           - _t5_squads | select('equalto', 'FSF-ci-node-three') | list | length == 1
           - _t5_squads | select('equalto', 'FSR-ci-node-three') | list | length == 1
-          - _t5_state.pools.evade | length == 2   # shared + node3
-          - _t5_state.pools.privacy | length == 2 # shared + node3
+          - _t5_state.pools['freedom-ws'] | length == 2   # shared + node3
+          - _t5_state.pools['privacy-reality'] | length == 2 # shared + node3
         fail_msg: "Legacy per-node placement (clones/squads/appends/idempotency) drifted"
 
 - name: "Integration — phase 6 (LEGACY node 4: duplicate-port, then tear down node 3)"
@@ -479,12 +479,12 @@
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/remnawave/create_node_placement
-    - name: Add node 4's squad to the FCP evade pool
+    - name: Add node 4's squad to the FCP freedom-ws pool
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
         tasks_from: providers/fcp/bind_placements
       vars:
-        _fcp_placement_modes: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} }}"
+        _fcp_placement_modes: "{{ {'freedom-ws': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} }}"
     - name: Read back panel + FCP after node 4's legacy creates
       uri:
         url: "{{ item }}"
@@ -505,8 +505,8 @@
         that:
           - _t6_tags | select('equalto', 'VLESS_WS_CDN_CI_NODE_FOUR') | list | length == 1
           - _t6_squads | select('equalto', 'FSF-ci-node-four') | list | length == 1
-          - _t6_state.pools.evade | length == 3   # shared + node3 + node4
-          - _t6_state.pools.privacy | length == 2 # shared + node3
+          - _t6_state.pools['freedom-ws'] | length == 3   # shared + node3 + node4
+          - _t6_state.pools['privacy-reality'] | length == 2 # shared + node3
         fail_msg: "Node 4's legacy placement drifted (duplicate-port tolerance?)"
 
     # Tear node 3 down: the legacy path must strip exactly what it created.
@@ -541,8 +541,8 @@
           - _t6b_squads | select('equalto', 'FSF-ci-node-four') | list | length == 1
           - _t6b_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
           - _t6b_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
-          - _t6b_state.pools.evade | length == 2   # shared + node4
-          - _t6b_state.pools.privacy | length == 1 # shared
+          - _t6b_state.pools['freedom-ws'] | length == 2   # shared + node4
+          - _t6b_state.pools['privacy-reality'] | length == 1 # shared
         fail_msg: "Legacy teardown left node-3 residue or disturbed node 4 / shared state"
 
     - name: All integration phases passed

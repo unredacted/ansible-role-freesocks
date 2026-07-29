@@ -2,20 +2,23 @@
 # tasks/providers/fcp/bind_placements.yml
 #
 # Bind Remnawave squads to FCP's per-connection-mode NODE-PLACEMENT pools via
-#   PATCH {fcp_api_url}/api/v1/admin/remnawave/mode-placements
-# (replaced the removed /api/v1/admin/connection-profiles endpoint — FCP's
-# node-placement redesign moved squad binding off connection profiles/tiers and
-# onto per-mode squad POOLS; at issuance FCP homes each new key to the
-# least-loaded node of the chosen mode's pool).
+#   PATCH {fcp_api_url}/api/v1/admin/backends/remnawave/mode-placements
+# (the generic per-backend placement route from FCP's DB-driven mode catalog,
+# 2026-07-28; it succeeded /api/v1/admin/remnawave/mode-placements, which FCP
+# keeps as a byte-compatible alias for older role checkouts. At issuance FCP
+# homes each new key to the least-loaded node of the chosen mode's pool).
 #
 # The caller builds the per-mode ops and passes them as `_fcp_placement_modes`:
-#   full replace:   { evade: { squadUuids:       [<uuid>, ...] } }   ([] clears)
-#   append itself:  { evade: { addSquadUuids:    [<uuid>] } }
-#   detach itself:  { evade: { removeSquadUuids: [<uuid>] } }
-# (mode ids: evade = "Beat censorship" / fronted WS; privacy = "Maximum
-# privacy" / Reality.) add/remove exist so a node deploy can join or leave the
-# pool without knowing the rest of it — the UUIDs are write-only in FCP (never
-# echoed back; audited only as a poolBound boolean + pool size).
+#   full replace:   { freedom-ws: { squadUuids:       [<uuid>, ...] } }   ([] clears)
+#   append itself:  { freedom-ws: { addSquadUuids:    [<uuid>] } }
+#   detach itself:  { freedom-ws: { removeSquadUuids: [<uuid>] } }
+# (mode slugs: freedom-ws = Freedom Mode / fronted WS; privacy-reality =
+# Privacy Mode / Reality. The pre-rename ids evade/privacy are accepted only
+# by FCP's legacy alias route, not the generic one.) add/remove exist so a
+# node deploy can join or leave the pool without knowing the rest of it — the
+# UUIDs are write-only in FCP (never echoed back; audited only as a poolBound
+# boolean + pool size). Unknown mode slugs are SKIPPED by FCP, never a 400 —
+# an inventory naming a deleted mode does not break the converge.
 #
 # Scope: the fsv1_ token needs admin:servers:write — the SAME scope node/panel
 # registration already uses, so no extra scope for placement binding:
@@ -39,7 +42,7 @@
 
 - name: Bind squads to FCP mode placements (idempotent by PATCH)
   uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/remnawave/mode-placements"
+    url: "{{ fcp_api_url }}/api/v1/admin/backends/remnawave/mode-placements"
     method: PATCH
     headers:
       Authorization: "Bearer {{ fcp_api_token }}"

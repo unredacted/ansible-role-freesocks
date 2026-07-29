@@ -82,8 +82,8 @@
   include_tasks: providers/fcp/bind_placements.yml
   vars:
     _fcp_placement_modes: >-
-      {{ ({'evade': {'removeSquadUuids': [_td_fronted_uuid]}} if (_td_fronted_uuid | length > 0) else {})
-         | combine({'privacy': {'removeSquadUuids': [_td_reality_uuid]}} if (_td_reality_uuid | length > 0) else {}) }}
+      {{ ({'freedom-ws': {'removeSquadUuids': [_td_fronted_uuid]}} if (_td_fronted_uuid | length > 0) else {})
+         | combine({'privacy-reality': {'removeSquadUuids': [_td_reality_uuid]}} if (_td_reality_uuid | length > 0) else {}) }}
   when:
     - fcp_enabled | default(false) | bool
     - (_td_fronted_uuid | length > 0) or (_td_reality_uuid | length > 0)

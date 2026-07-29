@@ -10,10 +10,23 @@ production:
   POST   /api/v1/admin/backend-servers/test-connection  (STRICT: rejects undeclared
                                                          fields like name/maxKeys/priority,
                                                          mirroring Convex arg validators)
-  PATCH  /api/v1/admin/remnawave/mode-placements        (squadUuids replace +
+  PATCH  /api/v1/admin/backends/remnawave/mode-placements
+                                                        (the generic per-backend
+                                                         placement route, 2026-07-28:
+                                                         squadUuids replace +
                                                          addSquadUuids/removeSquadUuids;
-                                                         UUID-validated like FCP)
-  PATCH  /api/v1/admin/connection-modes                 ({default} only)
+                                                         UUID-validated; UNKNOWN mode
+                                                         slugs skipped like FCP)
+  PATCH  /api/v1/admin/remnawave/mode-placements        (byte-compatible legacy ALIAS:
+                                                         also maps the pre-rename ids
+                                                         evade/privacy onto the current
+                                                         slugs, exactly like FCP)
+  PATCH  /api/v1/admin/connection-modes/{slug}          (per-mode catalog PATCH; the
+                                                         mock honors {makeDefault};
+                                                         404 unknown slug, 400
+                                                         makeDefault-on-disabled. The
+                                                         old BULK PATCH /connection-modes
+                                                         is GONE, mirroring FCP)
   GET    /api/v1/admin/status                           (registered slugs, healthy)
   GET    /__state                                       (test hook: full mock state)
   POST   /__mint {token, scopes}                        (test hook: register a
@@ -37,7 +50,13 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-MODE_IDS = ("evade", "privacy")
+# The compiled default catalog (slug -> enabled), mirroring FCP's built-ins:
+# freedom-reality ships dark until an operator lights it up.
+MODES = {"freedom-ws": True, "freedom-reality": False, "privacy-reality": True}
+MODE_IDS = tuple(MODES)
+COMPILED_DEFAULT_MODE = "freedom-ws"
+# Pre-rename ids, accepted ONLY by the legacy alias route (like FCP).
+LEGACY_ALIAS = {"evade": "freedom-ws", "privacy": "privacy-reality"}
 TESTCONN_FIELDS = {"backend", "id", "baseUrl", "apiToken", "apiUrl", "websocketEnabled", "websocketDomain"}
 ALL_SCOPES = {"admin:servers:read", "admin:servers:write", "admin:settings:write", "admin:status:read"}
 
@@ -188,74 +207,96 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "keyCount": 0})
         self._error(404, "not_found", self.path)
 
+    def _apply_placements(self, modes):
+        """Shared mode-placements body handler (canonical slugs only — the alias
+        route remaps its keys BEFORE calling this, exactly like FCP)."""
+        if not isinstance(modes, dict):
+            return self._error(400, "validation", "mode-placement patch must be an object")
+        wrote = False
+        for mode_id, entry in modes.items():
+            if mode_id not in MODE_IDS or not isinstance(entry, dict):
+                continue  # unknown slugs are skipped, never a 400 (like FCP)
+            replace = entry.get("squadUuids")
+            add = entry.get("addSquadUuids")
+            remove = entry.get("removeSquadUuids")
+            if replace is None and add is None and remove is None:
+                continue
+            # FCP validates replace/add entries as UUIDs; remove is any string.
+            for field, val, strict in (("squadUuids", replace, True),
+                                       ("addSquadUuids", add, True),
+                                       ("removeSquadUuids", remove, False)):
+                if val is None:
+                    continue
+                if not isinstance(val, list) or any(not isinstance(s, str) or not s.strip() for s in val):
+                    return self._error(400, "validation", f"{field} must be an array of non-empty strings")
+                if strict:
+                    bad = [s for s in val if not UUID_RE.match(s.strip())]
+                    if bad:
+                        return self._error(400, "validation", "not a squad UUID: " + ", ".join(bad))
+            pool = list(replace) if replace is not None else list(STATE["pools"].get(mode_id, []))
+            if add:
+                pool += [s for s in add if s not in pool]
+            if remove:
+                pool = [s for s in pool if s not in set(remove)]
+            # dedupe, keep order
+            seen, deduped = set(), []
+            for s in pool:
+                if s not in seen:
+                    seen.add(s)
+                    deduped.append(s)
+            STATE["pools"][mode_id] = deduped
+            wrote = True
+        if not wrote:
+            return self._error(400, "validation", "no recognized mode-placement fields")
+        return self._send(200, {
+            "bound": [m for m in MODE_IDS if STATE["pools"].get(m)],
+            "placements": [{"modeId": m, "boundCount": len(STATE["pools"].get(m, []))}
+                           for m in MODE_IDS],
+        })
+
     def do_PATCH(self):
         self._record()
-        if self.path == "/api/v1/admin/remnawave/mode-placements":
+        if self.path == "/api/v1/admin/backends/remnawave/mode-placements":
+            # The generic per-backend route the role targets: canonical slugs
+            # ONLY — a pre-rename id here is skipped like any unknown slug.
             if not self._scoped("admin:servers:write"):
                 return
-            body = self._body()
-            modes = body.get("modes")
-            if not isinstance(modes, dict):
+            return self._apply_placements(self._body().get("modes"))
+        if self.path == "/api/v1/admin/remnawave/mode-placements":
+            # Legacy byte-compatible ALIAS: maps pre-rename entry ids onto the
+            # current slugs (canonical entry wins when both spellings appear).
+            if not self._scoped("admin:servers:write"):
+                return
+            raw = self._body().get("modes")
+            if not isinstance(raw, dict):
                 return self._error(400, "validation", "mode-placement patch must be an object")
-            wrote = False
-            for mode_id, entry in modes.items():
-                if mode_id not in MODE_IDS or not isinstance(entry, dict):
-                    continue
-                replace = entry.get("squadUuids")
-                add = entry.get("addSquadUuids")
-                remove = entry.get("removeSquadUuids")
-                if replace is None and add is None and remove is None:
-                    continue
-                # FCP validates replace/add entries as UUIDs; remove is any string.
-                for field, val, strict in (("squadUuids", replace, True),
-                                           ("addSquadUuids", add, True),
-                                           ("removeSquadUuids", remove, False)):
-                    if val is None:
-                        continue
-                    if not isinstance(val, list) or any(not isinstance(s, str) or not s.strip() for s in val):
-                        return self._error(400, "validation", f"{field} must be an array of non-empty strings")
-                    if strict:
-                        bad = [s for s in val if not UUID_RE.match(s.strip())]
-                        if bad:
-                            return self._error(400, "validation", "not a squad UUID: " + ", ".join(bad))
-                pool = list(replace) if replace is not None else list(STATE["pools"].get(mode_id, []))
-                if add:
-                    pool += [s for s in add if s not in pool]
-                if remove:
-                    pool = [s for s in pool if s not in set(remove)]
-                # dedupe, keep order
-                seen, deduped = set(), []
-                for s in pool:
-                    if s not in seen:
-                        seen.add(s)
-                        deduped.append(s)
-                STATE["pools"][mode_id] = deduped
-                wrote = True
-            if not wrote:
-                return self._error(400, "validation", "no recognized mode-placement fields")
-            return self._send(200, {
-                "bound": [m for m in MODE_IDS if STATE["pools"].get(m)],
-                "placements": [{"modeId": m, "boundCount": len(STATE["pools"].get(m, []))}
-                               for m in MODE_IDS],
-            })
-        if self.path == "/api/v1/admin/connection-modes":
+            modes = {}
+            for key, entry in raw.items():
+                canonical = LEGACY_ALIAS.get(key)
+                if canonical:
+                    if canonical not in raw:
+                        modes[canonical] = entry
+                else:
+                    modes[key] = entry
+            return self._apply_placements(modes)
+        m = re.match(r"^/api/v1/admin/connection-modes/([a-z0-9-]+)$", self.path)
+        if m:
             if not self._scoped("admin:settings:write"):
                 return
+            slug = m.group(1)
+            if slug not in MODES:
+                return self._error(404, "not_found", f"unknown connection mode: {slug}")
             body = self._body()
-            default = body.get("default")
-            if default is not None and default not in MODE_IDS:
-                return self._error(400, "validation", "invalid default mode id")
-            if default is None and not body.get("modes"):
-                return self._error(400, "validation", "no recognized connection-mode fields")
-            if default is not None:
-                STATE["defaultMode"] = default
-            return self._send(200, {"modes": [
-                {"id": m, "label": None, "description": None,
-                 "deliveryStyle": "url" if m == "evade" else "rawConfig",
-                 "isDefault": (STATE["defaultMode"] or "evade") == m,
-                 "bound": bool(STATE["pools"].get(m))}
-                for m in MODE_IDS
-            ]})
+            if body.get("makeDefault"):
+                if not MODES[slug]:
+                    return self._error(400, "validation", "cannot make a disabled mode the default")
+                STATE["defaultMode"] = slug
+            if "enabled" in body:
+                MODES[slug] = bool(body["enabled"])
+            return self._send(200, {"ok": True})
+        # NOTE: the old BULK PATCH /api/v1/admin/connection-modes is deliberately
+        # ABSENT (404) — FCP removed it 2026-07-28; a role regression back to
+        # that shape must fail here.
         self._error(404, "not_found", self.path)
 
 

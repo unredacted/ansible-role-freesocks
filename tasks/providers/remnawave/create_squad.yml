@@ -2,8 +2,8 @@
 # tasks/providers/remnawave/create_squad.yml
 #
 # Ensure the two connection-mode internal squads exist and capture their UUIDs:
-#   * fronted squad  = WS inbound           -> FCP "Stay connected" (evade)
-#   * Reality squad  = the Reality inbound  -> FCP "Maximize privacy" (privacy)
+#   * fronted squad  = WS inbound           -> FCP Freedom Mode (freedom-ws)
+#   * Reality squad  = the Reality inbound  -> FCP Privacy Mode (privacy-reality)
 # These are the LEGACY shared (panel-wide) squads, created only when
 # remnawave_bootstrap_shared_squads=true; per-node squads are created at node
 # deploy time by create_node_placement.yml instead. FCP homes keys to a squad

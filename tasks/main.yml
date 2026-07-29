@@ -728,9 +728,9 @@
       include_tasks: providers/fcp/bind_placements.yml
       vars:
         _fcp_placement_modes: >-
-          {{ ({'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
+          {{ ({'freedom-ws': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}}
               if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {})
-             | combine({'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
+             | combine({'privacy-reality': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}}
               if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {}) }}
       when:
         - component_install_success | bool
@@ -1265,8 +1265,8 @@
       include_tasks: providers/fcp/bind_placements.yml
       vars:
         _fcp_placement_modes: >-
-          {{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}}
-             | combine({'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}}
+          {{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}}
+             | combine({'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}}
               if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {}) }}
       when:
         - fcp_enabled | default(false) | bool
@@ -1274,7 +1274,7 @@
         - (remnawave_fronted_squad_uuid | default('')) | length > 0
 
     # Opt-in (needs admin:settings:write; FCP's compiled default is already
-    # 'evade', so most deployments leave fcp_default_connection_mode empty).
+    # 'freedom-ws', so most deployments leave fcp_default_connection_mode empty).
     - name: Set the FCP default connection mode
       include_tasks: providers/fcp/bind_default_mode.yml
       when:
@@ -1299,7 +1299,7 @@
             fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ 'uuid resolved' if (remnawave_fronted_squad_uuid | default('') | length > 0) else '(none)' }}
             reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ 'uuid resolved' if (remnawave_reality_squad_uuid | default('') | length > 0) else '(disabled)' }}
           {% if fcp_enabled | default(false) | bool %}
-          FCP mode placements bound (evade -> fronted squad, privacy -> reality squad).
+          FCP mode placements bound (freedom-ws -> fronted squad, privacy-reality -> reality squad).
           {% endif %}
           {% else %}
           No squads created at bootstrap: legacy per-node placement

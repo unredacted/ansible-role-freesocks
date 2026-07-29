@@ -2,14 +2,20 @@
 # tasks/providers/fcp/bind_default_mode.yml
 #
 # Set FCP's DEFAULT connection mode (which mode a brand-new member issues
-# into) via PATCH {fcp_api_url}/api/v1/admin/connection-modes — the generic
-# mode-catalog endpoint (label/description/default; it carries NO squads —
-# placement pools are bound separately, see bind_placements.yml).
+# into) via PATCH {fcp_api_url}/api/v1/admin/connection-modes/{slug} with
+# {makeDefault: true} — the per-mode route of FCP's DB-driven mode catalog
+# (2026-07-28; the old bulk PATCH /admin/connection-modes this task used to
+# call was removed in that release). The mode catalog is admin-extensible, so
+# any live mode slug is accepted here; the built-ins are freedom-ws (Freedom
+# Mode / fronted WS, FCP's compiled default), freedom-reality, and
+# privacy-reality (Privacy Mode / Reality). FCP refuses makeDefault on a
+# disabled mode (400) and 404s an unknown slug — both fail the run loudly
+# instead of silently pointing members at a dead mode.
 #
 # Opt-in: only runs when fcp_default_connection_mode is non-empty. FCP's
-# compiled default is already "evade", so most deployments never need this —
-# and skipping it keeps the fsv1_ token at admin:servers:* only. Setting it
-# requires the WIDER admin:settings:write scope:
+# compiled default is already "freedom-ws", so most deployments never need
+# this — and skipping it keeps the fsv1_ token at admin:servers:* only.
+# Setting it requires the WIDER admin:settings:write scope:
 #   bunx convex run adminApi:mintAutomationToken \
 #     '{"scopes":["admin:servers:read","admin:servers:write","admin:settings:write"]}'
 
@@ -18,16 +24,19 @@
     that:
       - fcp_api_url is defined and fcp_api_url | length > 0
       - fcp_api_token is defined and fcp_api_token | length > 0
-      - fcp_default_connection_mode in ['evade', 'privacy']
+      - fcp_default_connection_mode is defined
+      - fcp_default_connection_mode is match('^[a-z0-9][a-z0-9-]{0,31}$')
     fail_msg: >-
       Setting the FCP default connection mode requires fcp_api_url,
       fcp_api_token (with admin:settings:write), and
-      fcp_default_connection_mode set to 'evade' or 'privacy'.
+      fcp_default_connection_mode set to a mode slug (lowercase letters,
+      digits, hyphens — e.g. 'freedom-ws' or 'privacy-reality'; the pre-2026-07
+      ids 'evade'/'privacy' were renamed).
   no_log: true
 
 - name: Set the FCP default connection mode (idempotent by PATCH)
   uri:
-    url: "{{ fcp_api_url }}/api/v1/admin/connection-modes"
+    url: "{{ fcp_api_url }}/api/v1/admin/connection-modes/{{ fcp_default_connection_mode }}"
     method: PATCH
     headers:
       Authorization: "Bearer {{ fcp_api_token }}"
@@ -35,7 +44,7 @@
       Accept: "application/json"
     body_format: json
     body:
-      default: "{{ fcp_default_connection_mode }}"
+      makeDefault: true
     status_code: [200]
   delegate_to: localhost
   no_log: true

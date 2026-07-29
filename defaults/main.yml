@@ -593,8 +593,8 @@ remnawave_bootstrap_reality: true                     # also create the Reality 
 # Shared (panel-wide) squads — THE default topology: one squad per transport,
 # spanning the fleet. Every node activates the shared base inbounds, so a user
 # homed to a squad receives every node's Host in their subscription. FCP's
-# per-mode pools are bound ONCE at bootstrap (evade <- fronted squad, privacy
-# <- Reality squad); node deploys never touch squads or pools. Set false only
+# per-mode pools are bound ONCE at bootstrap (freedom-ws <- fronted squad,
+# privacy-reality <- Reality squad); node deploys never touch squads or pools. Set false only
 # for the legacy per-node model (remnawave_per_node_placement=true).
 remnawave_bootstrap_shared_squads: true
 # Squad names (panel limit: 30 chars — these fit with room to spare). Scoped
@@ -641,8 +641,10 @@ remnawave_bootstrap_cdn_inbounds:
       wsSettings: { path: "/ws" }
     sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
 
-# Opt-in: set FCP's default connection mode at bootstrap ('evade' = Beat
-# censorship, 'privacy' = Maximum privacy). Empty = skip (FCP's compiled
-# default is already 'evade', and skipping keeps the token at admin:servers:*
-# only — setting it needs admin:settings:write).
+# Opt-in: set FCP's default connection mode at bootstrap, by mode slug
+# ('freedom-ws' = Freedom Mode / fronted WS, 'privacy-reality' = Privacy Mode /
+# Reality; admin-created slugs work too — the pre-2026-07 ids 'evade'/'privacy'
+# were renamed). Empty = skip (FCP's compiled default is already 'freedom-ws',
+# and skipping keeps the token at admin:servers:* only — setting it needs
+# admin:settings:write).
 fcp_default_connection_mode: ""

@@ -16,7 +16,7 @@
     remnawave_bootstrap_reality_server_names: ["dl.google.com"]
     remnawave_bootstrap_reality_short_ids: [""]
     remnawave_reality_private_key: "PRIV-KEY-xyz"
-    fcp_default_connection_mode: "evade"
+    fcp_default_connection_mode: "freedom-ws"
     # A fake GET /api/config-profiles/inbounds response (both plausible shapes).
     _fake_inbounds_flat:
       response:
@@ -121,40 +121,40 @@
       vars:
         remnawave_fronted_squad_uuid: "sq-front"
         remnawave_reality_squad_uuid: "sq-reality"
-        _privacy_entry: "{{ {'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
+        _privacy_entry: "{{ {'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
       assert:
         that:
-          - _fcp_placement_modes.evade.squadUuids == ['sq-front']
-          - _fcp_placement_modes.privacy.squadUuids == ['sq-reality']
-        success_msg: "FCP placement body OK (evade -> fronted pool, privacy -> reality pool)."
+          - _fcp_placement_modes['freedom-ws'].squadUuids == ['sq-front']
+          - _fcp_placement_modes['privacy-reality'].squadUuids == ['sq-reality']
+        success_msg: "FCP placement body OK (freedom-ws -> fronted pool, privacy-reality -> reality pool)."
 
-    # (g) The pool body omits privacy when Reality is disabled (empty squad).
+    # (g) The pool body omits privacy-reality when Reality is disabled (empty squad).
     - name: Build FCP placement body (Reality disabled)
       vars:
         remnawave_fronted_squad_uuid: "sq-front"
         remnawave_reality_squad_uuid: ""
-        _privacy_entry: "{{ {'privacy': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ {'evade': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
+        _privacy_entry: "{{ {'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
       assert:
         that:
-          - _fcp_placement_modes.evade.squadUuids == ['sq-front']
-          - "'privacy' not in _fcp_placement_modes"
-        success_msg: "FCP placement body omits privacy when Reality is disabled."
+          - _fcp_placement_modes['freedom-ws'].squadUuids == ['sq-front']
+          - "'privacy-reality' not in _fcp_placement_modes"
+        success_msg: "FCP placement body omits privacy-reality when Reality is disabled."
 
     # (h) Per-node deploy: the append-only add body (never disturbs the pool).
     - name: Build FCP placement body (per-node addSquadUuids)
       vars:
         remnawave_node_fronted_squad_uuid: "sq-node-front"
         remnawave_node_reality_squad_uuid: ""
-        _evade_entry: "{{ {'evade': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
-        _privacy_entry: "{{ {'privacy': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ _evade_entry | combine(_privacy_entry) }}"
+        _fronted_entry: "{{ {'freedom-ws': {'addSquadUuids': [remnawave_node_fronted_squad_uuid]}} if ((remnawave_node_fronted_squad_uuid | default('')) | length > 0) else {} }}"
+        _privacy_entry: "{{ {'privacy-reality': {'addSquadUuids': [remnawave_node_reality_squad_uuid]}} if ((remnawave_node_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ _fronted_entry | combine(_privacy_entry) }}"
       assert:
         that:
-          - _fcp_placement_modes.evade.addSquadUuids == ['sq-node-front']
-          - "'squadUuids' not in _fcp_placement_modes.evade"
-          - "'privacy' not in _fcp_placement_modes"
+          - _fcp_placement_modes['freedom-ws'].addSquadUuids == ['sq-node-front']
+          - "'squadUuids' not in _fcp_placement_modes['freedom-ws']"
+          - "'privacy-reality' not in _fcp_placement_modes"
         success_msg: "Per-node add body OK (append-only, WS squad only)."
 
     # (i) Per-node inbound plan + clone expressions (create_node_placement.yml).
