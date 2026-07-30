@@ -130,7 +130,13 @@
       - remnawave_panel_config_profile_uuid | length > 0
     fail_msg: >-
       Could not resolve the '{{ remnawave_bootstrap_config_profile_name }}' Config
-      Profile UUID from /api/config-profiles. Check the endpoint + response shape.
+      Profile UUID from /api/config-profiles. Profiles on the panel:
+      {{ _rw_profiles2 | map(attribute='name') | list | join(', ') | default('(none)', true) }}.
+      A panel bootstrapped under an OLDER role default (FreeSocks-CDN) needs
+      remnawave_bootstrap_config_profile_name pinned to that existing name —
+      otherwise this run tries to create a duplicate (the panel may 409 the
+      POST, which is tolerated for idempotency, landing here instead). If the
+      names DO match, check the endpoint + response shape against the panel /docs.
 
 - name: List Config Profile inbounds (read back the created UUIDs)
   uri:
