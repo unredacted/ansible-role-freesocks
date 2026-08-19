@@ -750,12 +750,20 @@
     - dest_node_uuid_raw.content is defined
     - (dest_node_uuid_raw.content | b64decode | trim) | length > 0
 
+# Gated on the EFFECTIVE fact, not the raw flag. Host creation and cleanup below
+# already use _migrate_register_node_effective, so a migration whose source carries
+# a .node_uuid but whose invocation left remnawave_panel_register_node at its
+# default recreated the destination's Hosts while leaving the panel dialling the
+# SOURCE address — and the source container is stopped by then, so the node is
+# unreachable through the panel until a human intervenes. If detection is trusted
+# enough to rewrite Hosts, it is trusted enough to PATCH the address, and the uuid
+# needed to do it was transferred with the install dir.
 - name: Update Panel-side node address (Remnawave)
   include_tasks: ../providers/remnawave/update_node.yml
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_panel_register_node | default(false) | bool
+    - _migrate_register_node_effective | bool
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0
 
@@ -766,11 +774,14 @@
       The Remnawave node was migrated to {{ dns_hostname }} but the Panel API
       was not used to update the address. Open the Panel UI → Nodes → find the
       entry for {{ source_kv_hostname }}.* and update its 'Address' to '{{ dns_hostname }}'.
+
+      The panel is still dialling the SOURCE address, which is no longer serving —
+      this node is unreachable through the panel until that field is updated.
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
     - >-
-      not (remnawave_panel_register_node | default(false) | bool)
+      not (_migrate_register_node_effective | bool)
       or remnawave_node_uuid is not defined
       or remnawave_node_uuid | length == 0
 

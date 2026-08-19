@@ -19,6 +19,9 @@
 #       mutating task. This ordering has been got wrong twice, and a comment does
 #       not enforce it — a gate that runs after the transfer strands the node
 #       instead of refusing the run.
+#   (p) STRUCTURAL: migrate.yml gates on the *_effective facts only, never on a raw
+#       transport flag — mixing the two made Hosts follow detection while the panel
+#       address update followed the raw flag.
 #   (o) squad membership is reconciled PER SQUAD, not against a panel-wide list.
 #   (j) the anti-leak invariant covers the node's own IPs, not just its hostname.
 #   (k) endpoint drift on a same-name op replaces the Host instead of skipping.
@@ -819,6 +822,33 @@
           migrate={{ _mig.find(_incl) }}, change={{ _chg.find(_incl) }}. -1 means
           that mode can publish the node's own address as the relay edge.
         success_msg: "(n3) deploy, change and migrate all enforce the anti-leak invariant."
+
+    # --- (p) structural: migrate gates on effective facts, not raw flags -------
+    # migrate derives _migrate_*_effective as "caller flag OR detected on source",
+    # then must use ONLY those. Mixing the two is what let Host creation follow
+    # detection while the panel address update followed the raw flag: a migration
+    # whose source had a .node_uuid but whose invocation omitted the flag rewrote the
+    # Hosts and left the panel dialling the stopped source. Each raw flag may appear
+    # exactly once — in the line that builds its effective fact.
+    - name: Count raw transport-flag gate expressions in migrate.yml
+      set_fact:
+        _raw_counts: >-
+          {{ {'remnawave_caddy_enabled': _mig.count('remnawave_caddy_enabled | default(false) | bool'),
+              'remnawave_reality_enabled': _mig.count('remnawave_reality_enabled | default(false) | bool'),
+              'remnawave_relay_enabled': _mig.count('remnawave_relay_enabled | default(false) | bool'),
+              'remnawave_panel_register_node': _mig.count('remnawave_panel_register_node | default(false) | bool')} }}
+
+    - name: Assert each raw flag appears only where its effective fact is built
+      assert:
+        that:
+          - (_raw_counts.values() | list | max) == 1
+          - (_raw_counts.values() | list | min) == 1
+        fail_msg: >-
+          Raw transport flags must not gate tasks in migrate.yml — use the
+          _migrate_*_effective facts. Counts: {{ _raw_counts }}. A count above 1 means
+          a task is gated on the caller's flag and will ignore what was detected on
+          the source; a count of 0 means an effective fact lost its input.
+        success_msg: "(p) migrate.yml gates only on the *_effective facts."
 
     # --- (o) squad membership is reconciled PER SQUAD -------------------------
     # The first version of this predicate flattened every squad's inbounds into one
