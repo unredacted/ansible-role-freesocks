@@ -1001,13 +1001,18 @@
         _f_real: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_reality_host.yml') }}"
         _f_ws: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_hosts.yml') }}"
 
+    # Marker is each GET's REGISTERED VARIABLE, which is unique to that task. An
+    # earlier version searched for '/api/hosts' and matched a prose comment
+    # mentioning "PATCH /api/hosts" — so it passed on a file whose GET had been
+    # deleted. A structural guard keyed on text that also appears in comments is
+    # worse than none, because it reads as coverage.
     - name: Assert each file fetches existing Hosts before deciding what to create
       vars:
-        _relay_get: "{{ _f_relay.find('/api/hosts') }}"
+        _relay_get: "{{ _f_relay.find('register: remnawave_relay_hosts_list') }}"
         _relay_dec: "{{ _f_relay.find('_relay_existing') }}"
-        _real_get: "{{ _f_real.find('/api/hosts') }}"
+        _real_get: "{{ _f_real.find('register: remnawave_reality_hosts_list') }}"
         _real_dec: "{{ _f_real.find('not in (_remnawave_hosts') }}"
-        _ws_get: "{{ _f_ws.find('/api/hosts') }}"
+        _ws_get: "{{ _f_ws.find('register: remnawave_hosts_list') }}"
         _ws_dec: "{{ _f_ws.find('_existing_host_remarks') }}"
       assert:
         that:
