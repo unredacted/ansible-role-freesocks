@@ -478,6 +478,48 @@
           address={{ _t3b_relay_host.address | default('(none)') }},
           port={{ _t3b_relay_host.port | default('(none)') }}).
 
+    # Re-run with a CHANGED edge: the remark already exists, so a plain skip would
+    # keep advertising the old endpoint. Proves the drift path against a real panel.
+    - name: Re-create the relay Host with a changed edge endpoint
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_relay_host
+      vars:
+        remnawave_relay_address: "relay-edge-2.example.test"
+        remnawave_relay_port: 9443
+
+    - name: Read back the Hosts after the endpoint change
+      uri:
+        url: "{{ remnawave_panel_url }}/api/hosts"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t3c_hosts_raw
+    - name: Materialize the re-pointed relay Host
+      set_fact:
+        _t3c_hosts: >-
+          {{ (_t3c_hosts_raw.json.response['hosts']
+              if (_t3c_hosts_raw.json.response is mapping and 'hosts' in _t3c_hosts_raw.json.response)
+              else _t3c_hosts_raw.json.response)
+             | selectattr('remark', 'equalto', 'ci-node-relay-relay') | list }}
+    - name: Assert the Host was re-pointed, not duplicated or left stale
+      assert:
+        that:
+          # Exactly one Host under this remark — no duplicate from the re-create.
+          - _t3c_hosts | length == 1
+          - _t3c_hosts[0].address == 'relay-edge-2.example.test'
+          - (_t3c_hosts[0].port | int) == 9443
+        fail_msg: >-
+          Endpoint drift was not applied: {{ _t3c_hosts | length }} Host(s),
+          address={{ _t3c_hosts[0].address | default('(none)') }},
+          port={{ _t3c_hosts[0].port | default('(none)') }}. A same-name op with a
+          changed edge must replace the Host, not skip it.
+
+    # Restore the original endpoint so the marker + later phases stay coherent.
+    - name: Re-point the relay Host back to the original edge
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_relay_host
+
     # The marker is written by setup/remnawave.yml, which these task-level phases
     # never run (they include individual files via tasks_from). So mirror the write
     # exactly as that file does — same pattern as the active-inbound derivation

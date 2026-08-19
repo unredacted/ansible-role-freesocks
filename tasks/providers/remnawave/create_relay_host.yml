@@ -34,20 +34,49 @@
       - remnawave_relay_address | default('') | length > 0
       - remnawave_relay_sni | default('') | length > 0
       - random_hostname is defined and random_hostname | length > 0
-      # The anti-leak invariant is enforced HERE, at the single choke point every
-      # path goes through. tasks/main.yml has an equivalent guard, but it lives in
-      # the deploy block — change and migrate include this file without passing
-      # through it, and both let a caller override the persisted endpoint. An
-      # address equal to the node's own name is a direct-Reality deploy wearing a
-      # relay label, and it hands every subscriber the address an IP block needs.
-      - (remnawave_relay_address | default('')) != (dns_hostname | default(''))
     fail_msg: >-
       Relay Host creation requires remnawave_panel_api_token,
       remnawave_panel_config_profile_uuid, remnawave_relay_inbound_uuid,
-      remnawave_relay_address (the EXTERNAL proxy edge — never this node, and
-      asserted to differ from dns_hostname) and remnawave_relay_sni (a serverName
-      the relay inbound borrows).
+      remnawave_relay_address (the EXTERNAL proxy edge — never this node) and
+      remnawave_relay_sni (a serverName the relay inbound borrows).
   no_log: true
+
+# The anti-leak invariant is enforced HERE, at the single choke point every path
+# goes through. tasks/main.yml has an equivalent guard, but it lives in the deploy
+# block — change and migrate include this file without passing through it, and both
+# let a caller override the persisted endpoint.
+#
+# It is a SEPARATE assert from the one above so its fail_msg is actually visible:
+# that one is no_log for the credential checks, which would censor this diagnosis.
+# Nothing below references a secret.
+#
+# remnawave_relay_address accepts an IP as well as an FQDN, so comparing against
+# dns_hostname alone is not enough — the node's own address in either form is a
+# direct-Reality deploy wearing a relay label, and it hands every subscriber
+# exactly the address an IP block needs. Every source is `default`ed so this
+# degrades to the hostname check when facts were not gathered.
+- name: Collect the node's own addresses (for the relay anti-leak check)
+  set_fact:
+    _relay_node_addresses: >-
+      {{ ([dns_hostname | default(''), ansible_facts['default_ipv4']['address'] | default(''),
+           ansible_facts['default_ipv6']['address'] | default('')]
+          + (ansible_facts['all_ipv4_addresses'] | default([]))
+          + (ansible_facts['all_ipv6_addresses'] | default([]))
+          + (envoy_mappings[inventory_hostname]['ipv4'] | default([]) if (envoy_mappings | default({})) is mapping else [])
+          + (envoy_mappings[inventory_hostname]['ipv6'] | default([]) if (envoy_mappings | default({})) is mapping else []))
+         | select('string') | reject('equalto', '') | list }}
+
+- name: Assert the relay Host advertises the proxy edge, never this node
+  assert:
+    that:
+      - (remnawave_relay_address | default('')) not in _relay_node_addresses
+    fail_msg: >-
+      remnawave_relay_address ({{ remnawave_relay_address }}) is one of THIS NODE's
+      own addresses ({{ _relay_node_addresses | join(', ') }}). That is a direct
+      Reality deploy wearing a relay label: the Host would publish the node's own
+      address to every subscriber, so an IP block kills it and the external proxy is
+      bypassed entirely. Point remnawave_relay_address at the proxy edge, or use
+      remnawave_reality_enabled=true for a genuinely direct node.
 
 # Distinct fact name on purpose: create_hosts.yml and create_reality_host.yml
 # both write _remnawave_hosts, and set_facts outlive the task file — sharing the
@@ -69,6 +98,53 @@
 - name: Normalize the Hosts list payload (relay; bare array or hosts-wrapped)
   set_fact:
     _remnawave_relay_hosts: "{{ remnawave_relay_hosts_list.json.response['hosts'] if (remnawave_relay_hosts_list.json.response is mapping and 'hosts' in remnawave_relay_hosts_list.json.response) else (remnawave_relay_hosts_list.json.response | default([])) }}"
+
+# Idempotency is by remark, but the remark does not encode the endpoint — and the
+# relay endpoint is the MANUAL proxy edge, the one field an operator changes
+# independently of the hostname. On a same-name rotation or migration the remark
+# already exists, so a plain skip would keep advertising the OLD edge while
+# .relay_address is rewritten with the new one: subscriptions and the marker would
+# disagree, and every later lifecycle run would trust the marker.
+#
+# So: detect drift and replace. Delete-then-POST rather than PATCH /api/hosts —
+# both endpoints used here are already exercised by this role, whereas the Host
+# PATCH contract is not, and this is not the place to take that risk.
+- name: Identify an existing relay Host with this remark
+  set_fact:
+    _relay_existing: >-
+      {{ (_remnawave_relay_hosts | selectattr('remark', 'equalto', random_hostname ~ '-relay')
+          | list | first) | default({}, true) }}
+
+- name: Detect endpoint drift on the existing relay Host
+  set_fact:
+    _relay_drift: >-
+      {{ ((_relay_existing.uuid | default('')) | length > 0)
+         and (((_relay_existing.address | default('')) != (remnawave_relay_address | default('')))
+              or ((_relay_existing.port | default(0) | int) != (remnawave_relay_port | default(443, true) | int))
+              or ((_relay_existing.sni | default('')) != (remnawave_relay_sni | default('')))
+              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome')))) }}
+
+- name: Delete the stale relay Host before re-creating it (endpoint drift)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts/{{ _relay_existing.uuid }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 204, 404]
+  delegate_to: localhost
+  no_log: true
+  when: _relay_drift | bool
+
+- name: Note that the relay Host is being re-pointed
+  debug:
+    msg: >-
+      Relay Host {{ random_hostname }}-relay is being re-created: its endpoint
+      changed from {{ _relay_existing.address | default('?') }}:{{ _relay_existing.port | default('?') }}
+      (sni {{ _relay_existing.sni | default('?') }}) to
+      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
+      (sni {{ remnawave_relay_sni }}).
+  when: _relay_drift | bool
 
 - name: Create the relay Host
   uri:
@@ -100,7 +176,9 @@
   delegate_to: localhost
   no_log: true
   register: remnawave_relay_host_result
-  when: (random_hostname ~ '-relay') not in (_remnawave_relay_hosts | map(attribute='remark') | list)
+  when: >-
+    ((_relay_existing.uuid | default('')) | length == 0)
+    or (_relay_drift | bool)
 
 - name: Summarize relay Host creation
   debug:

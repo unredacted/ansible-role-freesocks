@@ -302,6 +302,40 @@
 # cleanup_hosts.yml is gated only on the *_effective flags, while the create
 # includes carry extra uuid gates. A missing uuid used to SKIP the create while
 # cleanup still ran, silently removing the node from every subscription.
+# The effective facts above are OR-combined (caller flag OR source detection), so
+# inventory that enables Caddy or direct Reality on top of a detected relay source
+# makes BOTH effective — and nothing downstream re-checks exclusivity. The
+# migration would then install Caddy AND create a Reality Host alongside the relay,
+# all three contending for :443, which deploy mode forbids outright. Refuse here,
+# ahead of the transfer, rather than building a contradictory node.
+- name: Fail on contradictory effective transports for the destination
+  fail:
+    msg: |
+      The destination would end up with relay AND another :443 transport enabled.
+
+        relay   : {{ _migrate_relay_effective }}{{ ' (detected from the source marker)' if (migrate_detected_relay | default(false) | bool) else '' }}
+        caddy   : {{ _migrate_caddy_effective }}{{ ' (detected on the source)' if (migrate_detected_caddy | default(false) | bool) else '' }}
+        reality : {{ _migrate_reality_effective }}{{ ' (detected on the source)' if (migrate_detected_reality | default(false) | bool) else '' }}
+        cdn     : {{ effective_cdn_provider | default('none') }}
+
+      Relay is a DEDICATED node mode — it terminates REALITY on the node itself and
+      contends for :443 with both Caddy and direct Reality, and Fastly cannot
+      forward raw TCP. Deploy mode asserts this; migration has to as well, because
+      the capability flags you pass are OR'd with what was detected on the source
+      (Ansible cannot tell an explicit false from an unset default).
+
+      Either drop remnawave_caddy_enabled / remnawave_reality_enabled from this
+      migration and set the domain's cdn_provider to none, or migrate the node as
+      the non-relay type it actually is.
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_effective | bool
+    - >-
+      (_migrate_caddy_effective | bool)
+      or (_migrate_reality_effective | bool)
+      or (effective_cdn_provider | default('none') == 'fastly')
+
 - name: Validate the Reality inbound UUID is available before touching Hosts
   fail:
     msg: |

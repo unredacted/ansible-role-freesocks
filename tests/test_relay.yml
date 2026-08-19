@@ -15,6 +15,10 @@
 #       claims every relay node too (relay runs no Caddy either). The cases
 #       below pin the fix AND pin that legacy nodes still detect identically.
 #   (c) parsing the .relay_address marker file.
+#   (j) the anti-leak invariant covers the node's own IPs, not just its hostname.
+#   (k) endpoint drift on a same-name op replaces the Host instead of skipping.
+#   (l) migrate refuses a destination where relay and another :443 transport would
+#       both be effective.
 #   (g) the same-name guard on Host cleanup: a same-name rotation/migration must
 #       NOT delete the Host it is meant to keep, while the wipe path (which sets
 #       old == new deliberately) must still clean.
@@ -485,6 +489,159 @@
       vars:
         _rec_cases_ref: *reconcile_cases
 
+    # --- (j) anti-leak covers IPs, not just the hostname ----------------------
+    # remnawave_relay_address accepts an IP as well as an FQDN, so comparing only
+    # against dns_hostname let the node's own IP through — same disclosure, and it
+    # is the form an operator is most likely to paste by mistake.
+    - name: Build the node-address set the way create_relay_host.yml does
+      set_fact:
+        _node_addrs: >-
+          {{ (['n1.example.test', '203.0.113.10', '2001:db8::10']
+              + ['198.51.100.7'])
+             | select('string') | reject('equalto', '') | list }}
+
+    - name: Evaluate the anti-leak invariant against each candidate address
+      set_fact:
+        _leak_ok: "{{ (item.addr | default('')) not in _node_addrs }}"
+      loop: &leak_cases
+        - { name: "proxy edge FQDN",        addr: "relay-edge.example.test", want: true  }
+        - { name: "proxy edge IP",          addr: "192.0.2.50",              want: true  }
+        - { name: "node hostname",          addr: "n1.example.test",         want: false }
+        - { name: "node default IPv4",      addr: "203.0.113.10",            want: false }
+        - { name: "node IPv6",              addr: "2001:db8::10",            want: false }
+        - { name: "node envoy_mappings IP", addr: "198.51.100.7",            want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _leaks
+
+    - name: Assert every form of the node's own address is rejected
+      assert:
+        that:
+          - (item.0.ansible_facts._leak_ok | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }} ({{ item.1.addr }}): accepted={{ item.0.ansible_facts._leak_ok }},
+          expected {{ item.1.want }}. Publishing any of the node's own addresses
+          defeats the whole point of the relay.
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _leaks.results | zip(_leak_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _leak_cases_ref: *leak_cases
+
+    # --- (k) endpoint drift replaces a same-name Host -------------------------
+    # The remark does not encode the endpoint, and the relay edge is the one field
+    # an operator changes independently of the hostname. Without drift detection a
+    # same-name op keeps advertising the old edge while .relay_address records the
+    # new one — subscriptions and the marker silently disagree.
+    - name: Evaluate the drift decision for each existing-Host shape
+      set_fact:
+        _drift: >-
+          {{ ((item.existing.uuid | default('')) | length > 0)
+             and (((item.existing.address | default('')) != item.want_addr)
+                  or ((item.existing.port | default(0) | int) != (item.want_port | int))
+                  or ((item.existing.sni | default('')) != item.want_sni)
+                  or ((item.existing.fingerprint | default('chrome')) != 'chrome')) }}
+        _creates: >-
+          {{ ((item.existing.uuid | default('')) | length == 0)
+             or (((item.existing.uuid | default('')) | length > 0)
+                 and (((item.existing.address | default('')) != item.want_addr)
+                      or ((item.existing.port | default(0) | int) != (item.want_port | int))
+                      or ((item.existing.sni | default('')) != item.want_sni)
+                      or ((item.existing.fingerprint | default('chrome')) != 'chrome'))) }}
+      loop: &drift_cases
+        - name: "no existing Host"
+          existing: {}
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: false
+          creates: true
+        - name: "identical Host (true no-op)"
+          existing: { uuid: "h1", address: "edge.example.test", port: 8443, sni: "decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: false
+          creates: false
+        - name: "edge address changed"
+          existing: { uuid: "h1", address: "old-edge.example.test", port: 8443, sni: "decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: true
+          creates: true
+        - name: "edge port changed"
+          existing: { uuid: "h1", address: "edge.example.test", port: 443, sni: "decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: true
+          creates: true
+        - name: "decoy sni changed"
+          existing: { uuid: "h1", address: "edge.example.test", port: 8443, sni: "old-decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: true
+          creates: true
+      loop_control:
+        label: "{{ item.name }}"
+      register: _drifts
+
+    - name: Assert drift replaces the Host and an identical Host is a true no-op
+      assert:
+        that:
+          - (item.0.ansible_facts._drift | bool) == (item.1.drift | bool)
+          - (item.0.ansible_facts._creates | bool) == (item.1.creates | bool)
+        fail_msg: >-
+          {{ item.1.name }}: drift={{ item.0.ansible_facts._drift }} (want
+          {{ item.1.drift }}), creates={{ item.0.ansible_facts._creates }} (want
+          {{ item.1.creates }}). Skipping on drift leaves subscriptions on the old
+          edge; drifting on an identical Host churns it on every run.
+        success_msg: "{{ item.1.name }} -> drift={{ item.1.drift }} create={{ item.1.creates }}"
+      loop: "{{ _drifts.results | zip(_drift_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _drift_cases_ref: *drift_cases
+
+    # --- (l) migrate refuses contradictory effective transports ---------------
+    # The effective facts are OR-combined (caller flag OR source detection), so
+    # inventory enabling Caddy/Reality on top of a detected relay source makes both
+    # effective and nothing downstream re-checks it.
+    - name: Evaluate the contradiction gate
+      set_fact:
+        _contradicts: >-
+          {{ (item.relay | bool)
+             and ((item.caddy | bool) or (item.reality | bool) or (item.cdn == 'fastly')) }}
+      loop: &contra_cases
+        # The valid relay configuration — must be ALLOWED, not refused.
+        - { name: "relay only",              relay: true,  caddy: false, reality: false, cdn: none,    want: false }
+        - { name: "relay + caddy",           relay: true,  caddy: true,  reality: false, cdn: none,    want: true  }
+        - { name: "relay + direct reality",  relay: true,  caddy: false, reality: true,  cdn: none,    want: true  }
+        - { name: "relay + fastly",          relay: true,  caddy: false, reality: false, cdn: fastly,  want: true  }
+        - { name: "caddy + fastly (no relay)", relay: false, caddy: true, reality: false, cdn: fastly, want: false }
+        - { name: "reality only (no relay)", relay: false, caddy: false, reality: true,  cdn: none,    want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _contras
+
+    - name: Assert the gate fires only on genuinely contradictory combinations
+      assert:
+        that:
+          - (item.0.ansible_facts._contradicts | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: contradicts={{ item.0.ansible_facts._contradicts }},
+          expected {{ item.1.want }}. Firing too broadly blocks ordinary Caddy or
+          Reality migrations; too narrowly builds a node with two :443 transports.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _contras.results | zip(_contra_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _contra_cases_ref: *contra_cases
+
     - name: Summary
       debug:
         msg: >-
@@ -492,4 +649,5 @@
           .relay_address parsing, the repoint gates, relay port precedence, and
           relay-only inbound activation, the same-name cleanup guard, the
           choke-point anti-leak invariant, and reconcile-on-empty-profile all
-          verified.
+          verified — plus the IP-aware anti-leak check, endpoint-drift replacement,
+          and migrate's contradictory-transport refusal.
