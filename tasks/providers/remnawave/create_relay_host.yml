@@ -63,6 +63,26 @@
   vars:
     _relay_edge_candidate: "{{ remnawave_relay_address }}"
 
+# Distinct fact name on purpose: create_hosts.yml and create_reality_host.yml both
+# write _remnawave_hosts, and set_facts outlive the task file — sharing the name
+# would cross-contaminate the idempotency check when two of these run in one play.
+- name: List existing Remnawave Hosts (relay)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_relay_hosts_list
+
+- name: Normalize the Hosts list payload (relay; bare array or hosts-wrapped)
+  set_fact:
+    _remnawave_relay_hosts: "{{ remnawave_relay_hosts_list.json.response['hosts'] if (remnawave_relay_hosts_list.json.response is mapping and 'hosts' in remnawave_relay_hosts_list.json.response) else (remnawave_relay_hosts_list.json.response | default([])) }}"
+
 # Idempotency is by remark, but the remark does not encode the endpoint — and the
 # relay endpoint is the MANUAL proxy edge, the one field an operator changes
 # independently of the hostname. On a same-name rotation or migration the remark

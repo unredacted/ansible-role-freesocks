@@ -19,6 +19,9 @@
 #       mutating task. This ordering has been got wrong twice, and a comment does
 #       not enforce it — a gate that runs after the transfer strands the node
 #       instead of refusing the run.
+#   (s) STRUCTURAL: every Host-creation task file fetches the existing Hosts BEFORE
+#       its idempotency decision. Dropping that GET makes every run look like
+#       "nothing exists", so re-runs duplicate Hosts instead of replacing them.
 #   (q) DNS-equivalent spellings of the node's own address are rejected too
 #       (case, terminal dot, IPv6 hex case) — a byte compare let those through.
 #   (r) bootstrap refuses relay without the shared-squad topology, the combination
@@ -990,6 +993,34 @@
         label: "{{ item.1.name }}"
       vars:
         _r_cases_ref: *r_cases
+
+    # --- (s) structural: the Hosts GET precedes the idempotency decision -------
+    - name: Read the three Host-creation task files
+      set_fact:
+        _f_relay: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_relay_host.yml') }}"
+        _f_real: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_reality_host.yml') }}"
+        _f_ws: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_hosts.yml') }}"
+
+    - name: Assert each file fetches existing Hosts before deciding what to create
+      vars:
+        _relay_get: "{{ _f_relay.find('/api/hosts') }}"
+        _relay_dec: "{{ _f_relay.find('_relay_existing') }}"
+        _real_get: "{{ _f_real.find('/api/hosts') }}"
+        _real_dec: "{{ _f_real.find('not in (_remnawave_hosts') }}"
+        _ws_get: "{{ _f_ws.find('/api/hosts') }}"
+        _ws_dec: "{{ _f_ws.find('_existing_host_remarks') }}"
+      assert:
+        that:
+          - (_relay_get | int) > 0 and (_relay_dec | int) > 0 and (_relay_get | int) < (_relay_dec | int)
+          - (_real_get | int) > 0 and (_real_dec | int) > 0 and (_real_get | int) < (_real_dec | int)
+          - (_ws_get | int) > 0 and (_ws_dec | int) > 0 and (_ws_get | int) < (_ws_dec | int)
+        fail_msg: >-
+          A Host-creation file decides idempotency before (or without) fetching the
+          existing Hosts. relay get/dec={{ _relay_get }}/{{ _relay_dec }},
+          reality={{ _real_get }}/{{ _real_dec }}, ws={{ _ws_get }}/{{ _ws_dec }}.
+          A -1 means the GET or the decision marker is missing — without the GET every
+          run looks like "nothing exists" and re-runs duplicate Hosts.
+        success_msg: "(s) all three Host-creation files fetch existing Hosts before deciding."
 
     - name: Summary
       debug:
