@@ -565,23 +565,11 @@
     # Cannot live in the validation block above: dns_hostname is not derived until
     # the hostname facts are set. Still runs before DNS records and before any
     # install, so a misconfigured relay node never reaches the panel.
-    - name: Collect this node's own addresses (relay anti-leak pre-flight)
-      include_tasks: providers/remnawave/relay_node_addresses.yml
-      when: remnawave_relay_enabled | default(false) | bool
-
     - name: Validate the relay edge address is not the node itself
-      fail:
-        msg: |
-          remnawave_relay_address ({{ remnawave_relay_address }}) is one of this
-          node's own addresses ({{ _relay_node_addresses | default([]) | join(', ') }})
-          — that is a DIRECT Reality deploy, not a relay: clients would connect
-          straight to the node and the external proxy would be bypassed entirely,
-          publishing the node's address to every subscriber.
-          Point remnawave_relay_address at the external L4 proxy's edge, or use
-          remnawave_reality_enabled=true for a genuinely direct node.
-      when:
-        - remnawave_relay_enabled | default(false) | bool
-        - (remnawave_relay_address | default('')) in (_relay_node_addresses | default([]))
+      include_tasks: providers/remnawave/assert_relay_edge.yml
+      vars:
+        _relay_edge_candidate: "{{ remnawave_relay_address }}"
+      when: remnawave_relay_enabled | default(false) | bool
 
     # Fastly origin identity: an unguessable per-node origin name
     # (<hostname>-<rand8>.<base_domain>). In shared + fronting modes this
@@ -1324,6 +1312,37 @@
           Bootstrap requires remnawave_panel_url and remnawave_panel_api_token (a
           panel API token with config-profile, internal-squad, and system-tools scopes).
       no_log: true
+
+    # Relay has NO per-node placement path — deploy asserts relay is incompatible
+    # with remnawave_per_node_placement, because that planner only knows the ws and
+    # reality inbound kinds. So the shared squad is the only way a relay inbound
+    # ever reaches a subscriber. With shared squads off, bootstrap would happily
+    # create and print the relay inbound while create_squad was skipped, leaving
+    # remnawave_relay_squad_uuid unset — at which point the freedom-reality pool
+    # binding drops silently out of the combine below AND out of
+    # _fcp_placement_expect_bound, so even that guard cannot see it. The result
+    # looks like a successful bootstrap and a working relay deploy with no squad
+    # through which any key can reach the node.
+    - name: Validate relay bootstrap requires the shared-squad topology
+      fail:
+        msg: |
+          remnawave_bootstrap_relay=true requires
+          remnawave_bootstrap_shared_squads=true.
+
+          Relay has no legacy per-node placement path (deploy rejects
+          remnawave_per_node_placement=true for relay nodes, because that planner
+          only knows the ws and reality inbound kinds), so the panel-wide
+          '{{ remnawave_bootstrap_relay_squad_name }}' squad is the ONLY route from
+          the relay inbound to a subscriber. With shared squads disabled this run
+          would create the inbound, print its UUID, and bind nothing — a relay
+          deploy that looks healthy but is unreachable.
+
+          Either enable remnawave_bootstrap_shared_squads, or set
+          remnawave_bootstrap_relay=false and manage the relay inbound and its squad
+          by hand in the panel.
+      when:
+        - remnawave_bootstrap_relay | default(true) | bool
+        - not (remnawave_bootstrap_shared_squads | default(true) | bool)
 
     - name: Generate the Reality x25519 keypair (panel API)
       include_tasks: providers/remnawave/gen_x25519.yml

@@ -19,6 +19,10 @@
 #       mutating task. This ordering has been got wrong twice, and a comment does
 #       not enforce it — a gate that runs after the transfer strands the node
 #       instead of refusing the run.
+#   (q) DNS-equivalent spellings of the node's own address are rejected too
+#       (case, terminal dot, IPv6 hex case) — a byte compare let those through.
+#   (r) bootstrap refuses relay without the shared-squad topology, the combination
+#       that produced a healthy-looking relay with no squad at all.
 #   (p) STRUCTURAL: migrate.yml gates on the *_effective facts only, never on a raw
 #       transport flag — mixing the two made Hosts follow detection while the panel
 #       address update followed the raw flag.
@@ -810,7 +814,7 @@
 
     - name: Assert every mode includes the shared node-address definition
       vars:
-        _incl: 'providers/remnawave/relay_node_addresses.yml'
+        _incl: 'providers/remnawave/assert_relay_edge.yml'
       assert:
         that:
           - _mainy.find(_incl) > 0
@@ -830,25 +834,32 @@
     # whose source had a .node_uuid but whose invocation omitted the flag rewrote the
     # Hosts and left the panel dialling the stopped source. Each raw flag may appear
     # exactly once — in the line that builds its effective fact.
-    - name: Count raw transport-flag gate expressions in migrate.yml
+    - name: Count raw transport-flag gate expressions in both lifecycle files
       set_fact:
-        _raw_counts: >-
-          {{ {'remnawave_caddy_enabled': _mig.count('remnawave_caddy_enabled | default(false) | bool'),
-              'remnawave_reality_enabled': _mig.count('remnawave_reality_enabled | default(false) | bool'),
-              'remnawave_relay_enabled': _mig.count('remnawave_relay_enabled | default(false) | bool'),
-              'remnawave_panel_register_node': _mig.count('remnawave_panel_register_node | default(false) | bool')} }}
+        _raw_mig: >-
+          {{ {'caddy': _mig.count('remnawave_caddy_enabled | default(false) | bool'),
+              'reality': _mig.count('remnawave_reality_enabled | default(false) | bool'),
+              'relay': _mig.count('remnawave_relay_enabled | default(false) | bool'),
+              'register_node': _mig.count('remnawave_panel_register_node | default(false) | bool')} }}
+        # change mode derives only _change_register_node_effective (its other
+        # capabilities come from caller vars plus the relay marker), so only that
+        # flag is audited here — but it IS audited: checking migrate alone is exactly
+        # how six raw gates survived in change.yml for a round.
+        _raw_chg: >-
+          {{ {'register_node': _chg.count('remnawave_panel_register_node | default(false) | bool')} }}
 
     - name: Assert each raw flag appears only where its effective fact is built
       assert:
         that:
-          - (_raw_counts.values() | list | max) == 1
-          - (_raw_counts.values() | list | min) == 1
+          - (_raw_mig.values() | list | max) == 1
+          - (_raw_mig.values() | list | min) == 1
+          - _raw_chg['register_node'] == 1
         fail_msg: >-
-          Raw transport flags must not gate tasks in migrate.yml — use the
-          _migrate_*_effective facts. Counts: {{ _raw_counts }}. A count above 1 means
-          a task is gated on the caller's flag and will ignore what was detected on
-          the source; a count of 0 means an effective fact lost its input.
-        success_msg: "(p) migrate.yml gates only on the *_effective facts."
+          Raw transport flags must not gate tasks — use the *_effective facts.
+          migrate: {{ _raw_mig }}, change: {{ _raw_chg }}. A count above 1 means a
+          task is gated on the caller's flag and will ignore what was detected on
+          disk; 0 means an effective fact lost its input.
+        success_msg: "(p) migrate.yml and change mode both gate only on *_effective facts."
 
     # --- (o) squad membership is reconciled PER SQUAD -------------------------
     # The first version of this predicate flattened every squad's inbounds into one
@@ -898,6 +909,87 @@
           FreeSocks squad must be repaired regardless of which other squads happen
           to reference the same inbound, or its FCP mode reaches no node.
         success_msg: "(o) membership is checked per squad; the old panel-wide predicate is proven blind."
+
+    # --- (q) DNS-equivalent spellings are normalized before comparison --------
+    # Mirrors assert_relay_edge.yml. DNS is case-insensitive and a terminal dot names
+    # the same FQDN, so a byte comparison let `NODE.Example.com.` past a list holding
+    # `node.example.com`. Lowercasing also normalizes IPv6 hex case.
+    - name: Build a normalized node-address list the way assert_relay_edge.yml does
+      set_fact:
+        _norm_addrs: >-
+          {{ ['node.example.test', '203.0.113.10', '2001:DB8::10']
+             | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+    - name: Normalize each candidate and test membership
+      set_fact:
+        _q_ok: >-
+          {{ ((item.addr | lower | regex_replace('[.]$', '')) not in _norm_addrs) }}
+      loop: &q_cases
+        - { name: "proxy edge",                 addr: "relay-edge.example.test", want: true  }
+        - { name: "exact node name",            addr: "node.example.test",       want: false }
+        - { name: "node name, upper case",      addr: "NODE.EXAMPLE.TEST",        want: false }
+        - { name: "node name, terminal dot",    addr: "node.example.test.",       want: false }
+        - { name: "node name, mixed + dot",     addr: "Node.Example.Test.",       want: false }
+        - { name: "node IPv6, lower hex",       addr: "2001:db8::10",            want: false }
+        - { name: "node IPv6, upper hex",       addr: "2001:DB8::10",            want: false }
+        # A DIFFERENT host that merely shares a suffix must still be accepted.
+        - { name: "different host, same suffix", addr: "other.example.test",      want: true  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _qs
+
+    - name: Assert every DNS-equivalent spelling of the node is rejected
+      assert:
+        that:
+          - (item.0.ansible_facts._q_ok | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }} ({{ item.1.addr }}): accepted={{ item.0.ansible_facts._q_ok }},
+          expected {{ item.1.want }}. Case and terminal-dot variants resolve to the
+          same host, so accepting one publishes the origin just as surely.
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _qs.results | zip(_q_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _q_cases_ref: *q_cases
+
+    # --- (r) bootstrap refuses relay without shared squads --------------------
+    # Relay has no per-node placement path, so the shared squad is its only route to
+    # a subscriber. The old behaviour created and printed the inbound while binding
+    # nothing — and because the pool entry AND _fcp_placement_expect_bound are both
+    # conditional on the squad uuid, the expect-bound guard was blind to it.
+    - name: Evaluate the bootstrap relay/shared-squad gate
+      set_fact:
+        _r_refused: "{{ (item.relay | bool) and (not (item.shared | bool)) }}"
+        # What the pool body would have looked like in that state: silently empty.
+        _r_pool: >-
+          {{ {'freedom-ws': {'squadUuids': ['sq-f']}}
+             | combine({'freedom-reality': {'squadUuids': [item.relay_squad]}}
+               if ((item.relay_squad | default('')) | length > 0) else {}) }}
+      loop: &r_cases
+        - { name: "relay + shared squads",        relay: true,  shared: true,  relay_squad: "sq-rl", want: false, pool: true  }
+        - { name: "relay, shared squads OFF",     relay: true,  shared: false, relay_squad: "",      want: true,  pool: false }
+        - { name: "no relay, shared squads OFF",  relay: false, shared: false, relay_squad: "",      want: false, pool: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _rs
+
+    - name: Assert the gate fires exactly on the unreachable combination
+      assert:
+        that:
+          - (item.0.ansible_facts._r_refused | bool) == (item.1.want | bool)
+          # Confirms the silent failure it prevents: no freedom-reality binding.
+          - (('freedom-reality' in item.0.ansible_facts._r_pool) | bool) == (item.1.pool | bool)
+        fail_msg: >-
+          {{ item.1.name }}: refused={{ item.0.ansible_facts._r_refused }} (want
+          {{ item.1.want }}), pool has freedom-reality={{ 'freedom-reality' in item.0.ansible_facts._r_pool }}
+          (want {{ item.1.pool }}).
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}, freedom-reality bound={{ item.1.pool }}"
+      loop: "{{ _rs.results | zip(_r_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _r_cases_ref: *r_cases
 
     - name: Summary
       debug:

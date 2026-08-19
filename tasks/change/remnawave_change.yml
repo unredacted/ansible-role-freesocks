@@ -144,6 +144,18 @@
          else (((_change_relay_text | regex_search('^port=[0-9]+', multiline=true) | default('', true))
                 | regex_replace('^port=', '')) | default('443', true)) }}
 
+# Mirror migrate's "caller flag OR detected on disk" derivation. Without this, a
+# rotation that omits remnawave_panel_register_node skips Host create, cleanup AND
+# the panel address update on a node that WAS registered at deploy — while still
+# rewriting DNS and .node_name. The old DNS name may be deleted with the panel still
+# dialling it, and once .node_name is overwritten the old Host's remark can never be
+# selected for cleanup again, so it is orphaned in subscriptions permanently.
+- name: Derive the effective panel-registration fact for this rotation
+  set_fact:
+    _change_register_node_effective: >-
+      {{ (remnawave_panel_register_node | default(false) | bool)
+         or ((remnawave_node_uuid | default('')) | length > 0) }}
+
 - name: Debug existing state
   debug:
     msg:
@@ -221,24 +233,10 @@
 # same own-address mistake is reachable here — and create_relay_host.yml's
 # choke-point assert only fires after the DNS records have already been rewritten.
 # All three modes now check it before mutating anything.
-- name: Collect this node's own addresses (relay anti-leak pre-flight)
-  include_tasks: ../providers/remnawave/relay_node_addresses.yml
-  when: _change_relay_effective | default(false) | bool
-
 - name: Assert the relay edge is not one of this node's own addresses (rotation)
-  assert:
-    that:
-      - (_change_relay_address | default('')) not in (_relay_node_addresses | default([]))
-    fail_msg: |
-      The relay edge address ({{ _change_relay_address }}) is one of THIS NODE's own
-      addresses ({{ _relay_node_addresses | default([]) | join(', ') }}).
-
-      Rotating with that value would publish the node's own address to every
-      subscriber — an IP block kills it and the external proxy is bypassed, which is
-      the one thing the relay transport exists to prevent.
-
-      Point remnawave_relay_address at the proxy edge:
-        -e remnawave_relay_address=<proxy edge FQDN or IP>
+  include_tasks: ../providers/remnawave/assert_relay_edge.yml
+  vars:
+    _relay_edge_candidate: "{{ _change_relay_address }}"
   when:
     - _change_relay_effective | default(false) | bool
     - (_change_relay_address | default('')) | length > 0
@@ -561,14 +559,14 @@
 - name: Create NEW Remnawave Hosts for the rotated hostname
   include_tasks: ../providers/remnawave/create_hosts.yml
   when:
-    - remnawave_panel_register_node | default(false) | bool
+    - _change_register_node_effective | bool
     - remnawave_caddy_enabled | default(false) | bool
     - effective_cdn_provider | default('none') in ['fastly', 'none']
 
 - name: Create NEW Reality Host for the rotated hostname
   include_tasks: ../providers/remnawave/create_reality_host.yml
   when:
-    - remnawave_panel_register_node | default(false) | bool
+    - _change_register_node_effective | bool
     - remnawave_reality_enabled | default(false) | bool
 
 # The relay Host's ADDRESS (the proxy edge) does not rotate — only its remark
@@ -583,7 +581,7 @@
     remnawave_relay_address: "{{ _change_relay_address }}"
     remnawave_relay_port: "{{ _change_relay_port }}"
   when:
-    - remnawave_panel_register_node | default(false) | bool
+    - _change_register_node_effective | bool
     - _change_relay_effective | default(false) | bool
 
 # Old objects come down only after their replacements exist.
@@ -599,7 +597,7 @@
 - name: Clean up OLD Remnawave Hosts on the panel
   include_tasks: ../providers/remnawave/cleanup_hosts.yml
   when:
-    - remnawave_panel_register_node | default(false) | bool
+    - _change_register_node_effective | bool
     - (old_random_hostname | default('')) != (random_hostname | default(''))
     - >-
       (remnawave_caddy_enabled | default(false) | bool)
@@ -613,7 +611,7 @@
       existing Hosts already carry this remark and were left in place rather than
       deleted and re-created.
   when:
-    - remnawave_panel_register_node | default(false) | bool
+    - _change_register_node_effective | bool
     - (old_random_hostname | default('')) == (random_hostname | default(''))
 
 - name: Delete OLD Fastly service (after the NEW one is live)
@@ -637,7 +635,7 @@
 - name: Update node address on Panel
   include_tasks: ../providers/remnawave/update_node.yml
   when:
-    - remnawave_panel_register_node | default(false) | bool
+    - _change_register_node_effective | bool
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0
 
@@ -645,12 +643,13 @@
   debug:
     msg: |
       ⚠️  Manual step required:
-      remnawave_panel_register_node is false (or no .node_uuid was found).
+      neither remnawave_panel_register_node nor a persisted .node_uuid was found,
+      so the panel is still dialling the OLD address.
       Open the Panel UI → Nodes → find the entry for {{ old_dns_hostname }}
       and update its 'Address' field to '{{ dns_hostname }}'.
       The role cannot do this automatically without Panel API access.
   when: >-
-    not (remnawave_panel_register_node | default(false) | bool)
+    not (_change_register_node_effective | bool)
     or remnawave_node_uuid is not defined
     or remnawave_node_uuid | length == 0
 

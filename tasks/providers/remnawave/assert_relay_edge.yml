@@ -1,0 +1,63 @@
+---
+# tasks/providers/remnawave/assert_relay_edge.yml
+#
+# THE relay anti-leak invariant, in one place: the client-facing relay edge must
+# never be an address that resolves to this node. Publishing the node's own address
+# hands every subscriber exactly what an IP block needs and bypasses the proxy
+# entirely, which is the single thing the relay transport exists to prevent.
+#
+# Caller sets _relay_edge_candidate, then includes this file. Both the list AND the
+# comparison live here on purpose: this invariant has now drifted between modes
+# three times — first existing only in deploy, then only comparing the hostname,
+# then missing from change entirely — and every one of those was a case of the same
+# rule being re-implemented per mode. There is nothing left to re-implement.
+#
+# Every fact source is defaulted, so with facts ungathered this degrades to the
+# hostname comparison rather than failing.
+#
+# Names are normalized before comparison: DNS is case-insensitive and a terminal dot
+# denotes the same FQDN, so `NODE.Example.com.` and `node.example.com` are the same
+# host and a byte comparison would let the first through. Lowercasing also
+# normalizes hex-case differences in IPv6 literals. The pattern is backslash-free
+# ('[.]$' not '\.$') because YAML block and quoted scalars disagree about
+# backslashes — see the note in tasks/migrate/migrate.yml.
+
+- name: Collect this node's own addresses (relay anti-leak)
+  set_fact:
+    _relay_node_addresses: >-
+      {{ ([dns_hostname | default(''),
+           ansible_facts['default_ipv4']['address'] | default(''),
+           ansible_facts['default_ipv6']['address'] | default('')]
+          + (ansible_facts['all_ipv4_addresses'] | default([]))
+          + (ansible_facts['all_ipv6_addresses'] | default([]))
+          + ((envoy_mappings[inventory_hostname]['ipv4'] | default([]))
+             if ((envoy_mappings | default({})) is mapping and (inventory_hostname in (envoy_mappings | default({})))) else [])
+          + ((envoy_mappings[inventory_hostname]['ipv6'] | default([]))
+             if ((envoy_mappings | default({})) is mapping and (inventory_hostname in (envoy_mappings | default({})))) else []))
+         | select('string') | reject('equalto', '')
+         | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+- name: Normalize the proposed relay edge for comparison
+  set_fact:
+    _relay_edge_normalized: "{{ (_relay_edge_candidate | default('')) | lower | regex_replace('[.]$', '') }}"
+
+- name: Assert the relay edge is not one of this node's own addresses
+  assert:
+    that:
+      - _relay_edge_normalized not in _relay_node_addresses
+    fail_msg: |
+      The relay edge address ({{ _relay_edge_candidate | default('(unset)') }}) is one
+      of THIS NODE's own addresses.
+
+        proposed edge (normalized) : {{ _relay_edge_normalized }}
+        this node's addresses      : {{ _relay_node_addresses | join(', ') }}
+
+      That is a direct Reality deploy wearing a relay label: the Host would publish
+      the node's own address to every subscriber, so an IP block kills it and the
+      external L4 proxy is bypassed entirely.
+
+      Point the edge at the proxy instead:
+        -e remnawave_relay_address=<proxy edge FQDN or IP>
+
+      For a genuinely direct node, use remnawave_reality_enabled=true rather than
+      pointing a relay at itself.

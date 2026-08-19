@@ -390,27 +390,10 @@
 # running, DNS already repointed — the relay offline — and a normal retry blocked
 # by the clean-destination check in tasks/main.yml. The choke-point assert stays as
 # defence in depth; this one is what actually saves the node.
-- name: Collect the destination's own addresses (relay anti-leak pre-flight)
-  include_tasks: ../providers/remnawave/relay_node_addresses.yml
-  when:
-    - inventory_hostname == destination_hostname
-    - migrate_component == 'remnawave'
-    - _migrate_relay_effective | bool
-
 - name: Assert the relay edge is not one of the destination's own addresses
-  assert:
-    that:
-      - (_migrate_relay_address_effective | default('')) not in (_relay_node_addresses | default([]))
-    fail_msg: |
-      The relay edge address ({{ _migrate_relay_address_effective }}) is one of the
-      DESTINATION's own addresses ({{ _relay_node_addresses | default([]) | join(', ') }}).
-
-      That would publish the node's own address to every subscriber — an IP block
-      kills it and the external proxy is bypassed entirely, which is the one thing
-      the relay transport exists to prevent.
-
-      Point remnawave_relay_address at the proxy edge:
-        -e remnawave_relay_address=<proxy edge FQDN or IP>
+  include_tasks: ../providers/remnawave/assert_relay_edge.yml
+  vars:
+    _relay_edge_candidate: "{{ _migrate_relay_address_effective }}"
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
