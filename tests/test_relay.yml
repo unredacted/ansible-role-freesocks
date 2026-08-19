@@ -247,6 +247,12 @@
           {{ (item.relay | bool) and (not (item.delete_old_dns | bool)) }}
         _migrate_fails: >-
           {{ (item.relay | bool) and (not (item.ack | bool)) }}
+        # The second half of the rotation hazard: acknowledging without a
+        # custom_hostname means the name the operator re-pointed to cannot be
+        # reproduced, because it came from `shuf`.
+        _change_needs_name: >-
+          {{ (item.relay | bool) and (item.delete_old_dns | bool)
+             and (item.ack | bool) and (not (item.custom | default(false) | bool)) }}
       loop: &gate_cases
         # Not a relay node: never gated, whatever the other flags say.
         - { name: "non-relay, delete dns",     relay: false, delete_old_dns: true,  ack: false, cf: false, cw: false, mf: false }
@@ -256,7 +262,13 @@
         # Relay, old name DELETED, unacknowledged: the irrecoverable case.
         - { name: "relay, delete dns, no ack", relay: true,  delete_old_dns: true,  ack: false, cf: true,  cw: false, mf: true  }
         # Acknowledged: change proceeds; migrate proceeds.
-        - { name: "relay, delete dns, ack",    relay: true,  delete_old_dns: true,  ack: true,  cf: false, cw: false, mf: false }
+        # Acknowledged WITHOUT an explicit name: the generated origin is not
+        # reproducible, so this must be refused rather than deleting the old record
+        # and publishing a third name.
+        - { name: "relay, delete dns, ack, random name", relay: true, delete_old_dns: true, ack: true, custom: false, cf: false, cw: false, mf: false, needs_name: true }
+        # Acknowledged WITH the name passed back: the only completable form.
+        - { name: "relay, delete dns, ack, name given",  relay: true, delete_old_dns: true, ack: true, custom: true,  cf: false, cw: false, mf: false, needs_name: false }
+        # Old name retained: the new name is live either way, nothing to pass back.
         - { name: "relay, keep dns, ack",      relay: true,  delete_old_dns: false, ack: true,  cf: false, cw: true,  mf: false }
       loop_control:
         label: "{{ item.name }}"
@@ -268,12 +280,15 @@
           - (item.0.ansible_facts._change_fails | bool) == (item.1.cf | bool)
           - (item.0.ansible_facts._change_warns | bool) == (item.1.cw | bool)
           - (item.0.ansible_facts._migrate_fails | bool) == (item.1.mf | bool)
+          - (item.0.ansible_facts._change_needs_name | bool) == (item.1.needs_name | default(false) | bool)
         fail_msg: >-
           {{ item.1.name }}: change_fails={{ item.0.ansible_facts._change_fails }}
           (want {{ item.1.cf }}), change_warns={{ item.0.ansible_facts._change_warns }}
           (want {{ item.1.cw }}), migrate_fails={{ item.0.ansible_facts._migrate_fails }}
-          (want {{ item.1.mf }}).
-        success_msg: "{{ item.1.name }} -> change_fail={{ item.1.cf }} change_warn={{ item.1.cw }} migrate_fail={{ item.1.mf }}"
+          (want {{ item.1.mf }}),
+          needs_name={{ item.0.ansible_facts._change_needs_name }} (want
+          {{ item.1.needs_name | default(false) }}).
+        success_msg: "{{ item.1.name }} -> change_fail={{ item.1.cf }} change_warn={{ item.1.cw }} migrate_fail={{ item.1.mf }} needs_name={{ item.0.ansible_facts._change_needs_name }}"
       loop: "{{ _gates.results | zip(_gate_cases_ref) | list }}"
       loop_control:
         label: "{{ item.1.name }}"
