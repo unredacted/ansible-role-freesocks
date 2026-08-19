@@ -544,14 +544,34 @@
     - _change_relay_effective | default(false) | bool
 
 # Old objects come down only after their replacements exist.
+# Same-name guard: when the new hostname equals the old one (a same-name rotation
+# or migration — both are supported, see the _fastly_same_name_rotation paths), the
+# create tasks above find the remark ALREADY present and skip, so cleaning up
+# "the old hostname" would delete the very Host that is meant to survive and put
+# nothing back. There is nothing old to remove in that case.
+#
+# The guard lives HERE and not inside cleanup_hosts.yml on purpose: the
+# force_wipe_remnawave path deliberately calls it with old == new to remove a
+# decommissioned node's own Hosts (tasks/update/remnawave_update.yml).
 - name: Clean up OLD Remnawave Hosts on the panel
   include_tasks: ../providers/remnawave/cleanup_hosts.yml
   when:
     - remnawave_panel_register_node | default(false) | bool
+    - (old_random_hostname | default('')) != (random_hostname | default(''))
     - >-
       (remnawave_caddy_enabled | default(false) | bool)
       or (remnawave_reality_enabled | default(false) | bool)
       or (_change_relay_effective | default(false) | bool)
+
+- name: Note that Host cleanup is skipped for a same-name rotation
+  debug:
+    msg: >-
+      Same-name rotation ({{ random_hostname }}) — skipping Host cleanup. The
+      existing Hosts already carry this remark and were left in place rather than
+      deleted and re-created.
+  when:
+    - remnawave_panel_register_node | default(false) | bool
+    - (old_random_hostname | default('')) == (random_hostname | default(''))
 
 - name: Delete OLD Fastly service (after the NEW one is live)
   include_tasks: ../providers/fastly/cleanup.yml

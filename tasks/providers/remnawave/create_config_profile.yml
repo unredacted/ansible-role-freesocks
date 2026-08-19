@@ -272,7 +272,11 @@
     - _rw_profile_exists
     - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
     - _rw_live_profile.config is defined
-    - (_rw_live_profile.config.inbounds | default([])) | length > 0
+    # Deliberately NOT gated on the live inbound list being non-empty: a profile
+    # pre-created by hand (or emptied) has config but no inbounds, which is exactly
+    # the case that needs populating. `| default([])` in the combine below already
+    # handles a missing key, and gating on it made bootstrap fail the read-back
+    # assertions instead of filling the profile in.
     - _rw_missing_inbounds | length > 0
 
 - name: List Config Profile inbounds (read back the created UUIDs)

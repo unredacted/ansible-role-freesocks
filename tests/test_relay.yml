@@ -15,6 +15,9 @@
 #       claims every relay node too (relay runs no Caddy either). The cases
 #       below pin the fix AND pin that legacy nodes still detect identically.
 #   (c) parsing the .relay_address marker file.
+#   (g) the same-name guard on Host cleanup: a same-name rotation/migration must
+#       NOT delete the Host it is meant to keep, while the wipe path (which sets
+#       old == new deliberately) must still clean.
 #   (f) a relay node activates ONLY its relay inbound, even when an enabled CDN
 #       transport is inherited from the bootstrap output (which arrives as
 #       extra-vars and cannot be overridden from inventory).
@@ -381,9 +384,112 @@
           testing that it gets dropped.
         success_msg: "(f) relay nodes activate only the relay inbound; non-relay nodes unaffected."
 
+    # --- (g) same-name Host-cleanup guard -------------------------------------
+    # The create tasks are GET-first by remark, so on a same-name rotation or
+    # migration they find the remark already present and skip. Cleaning up "the old
+    # hostname" would then delete the very Host meant to survive and put nothing
+    # back — the node silently leaves every subscription. This affects ws, reality
+    # AND relay: they all share the skip-by-remark shape.
+    #
+    # The guard is at the change/migrate CALL SITES, not inside cleanup_hosts.yml,
+    # because force_wipe_remnawave deliberately calls it with old == new to remove a
+    # decommissioned node's own Hosts.
+    - name: Evaluate the cleanup gate for each scenario
+      set_fact:
+        _cleanup_runs: >-
+          {{ ((item.old | default('')) != (item.new | default('')))
+             if (item.path == 'lifecycle') else true }}
+      loop: &cleanup_cases
+        - { name: "rotation to a new name",    path: lifecycle, old: "quiet-falcon", new: "brave-otter",  want: true  }
+        - { name: "same-name rotation",        path: lifecycle, old: "quiet-falcon", new: "quiet-falcon", want: false }
+        - { name: "migration to a new name",   path: lifecycle, old: "node-one",     new: "node-two",     want: true  }
+        - { name: "same-name migration",       path: lifecycle, old: "node-one",     new: "node-one",     want: false }
+        # The wipe path is NOT gated — it must delete this node's own Hosts.
+        - { name: "wipe (old == new by design)", path: wipe,    old: "quiet-falcon", new: "quiet-falcon", want: true  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _cleanups
+
+    - name: Assert cleanup runs exactly when there is something old to remove
+      assert:
+        that:
+          - (item.0.ansible_facts._cleanup_runs | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: cleanup_runs={{ item.0.ansible_facts._cleanup_runs }},
+          expected {{ item.1.want }}. Running it on a same-name lifecycle op deletes
+          the surviving Host; skipping it on a wipe orphans a dead node's Hosts.
+        success_msg: "{{ item.1.name }} -> cleanup {{ 'runs' if item.1.want else 'skipped' }}"
+      loop: "{{ _cleanups.results | zip(_cleanup_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _cleanup_cases_ref: *cleanup_cases
+
+    # --- (h) the anti-leak invariant is enforced at the choke point ------------
+    # create_relay_host.yml asserts address != dns_hostname itself, because change
+    # and migrate include it WITHOUT passing through the deploy-block guard and both
+    # let a caller override the persisted endpoint.
+    - name: Evaluate the choke-point invariant
+      set_fact:
+        _addr_ok: >-
+          {{ ((item.addr | default('')) | length > 0)
+             and ((item.addr | default('')) != (item.node | default(''))) }}
+      loop: &addr_cases
+        - { name: "edge address",              addr: "relay-edge.example.test", node: "n1.example.test", want: true  }
+        - { name: "address == node (leak)",    addr: "n1.example.test",         node: "n1.example.test", want: false }
+        - { name: "empty address",             addr: "",                        node: "n1.example.test", want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _addrs
+
+    - name: Assert the invariant rejects both the leak and the empty case
+      assert:
+        that:
+          - (item.0.ansible_facts._addr_ok | bool) == (item.1.want | bool)
+        fail_msg: "{{ item.1.name }}: accepted={{ item.0.ansible_facts._addr_ok }}, expected {{ item.1.want }}."
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _addrs.results | zip(_addr_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _addr_cases_ref: *addr_cases
+
+    # --- (i) reconcile must populate a pre-created EMPTY profile ---------------
+    - name: Evaluate the reconcile PATCH gate
+      set_fact:
+        _patches: >-
+          {{ (item.exists | bool) and (item.has_config | bool) and ((item.missing | length) > 0) }}
+      loop: &reconcile_cases
+        - { name: "existing profile, relay inbound missing", exists: true,  has_config: true, missing: ["VLESS_RELAY_REALITY"], want: true  }
+        # The case the old length>0 guard broke: a hand-created, empty profile.
+        - { name: "existing EMPTY profile",                  exists: true,  has_config: true, missing: ["VLESS_WS_CDN", "VLESS_REALITY", "VLESS_RELAY_REALITY"], want: true }
+        - { name: "existing profile, nothing missing",       exists: true,  has_config: true, missing: [],                      want: false }
+        # Freshly created by this run — the POST already carried every inbound.
+        - { name: "profile just created",                    exists: false, has_config: true, missing: ["VLESS_RELAY_REALITY"], want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _recs
+
+    - name: Assert reconcile fires for every existing profile that lacks an inbound
+      assert:
+        that:
+          - (item.0.ansible_facts._patches | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: patches={{ item.0.ansible_facts._patches }}, expected
+          {{ item.1.want }}. An existing profile with an EMPTY inbound list must be
+          populated, not skipped — skipping it fails the read-back assertions.
+        success_msg: "{{ item.1.name }} -> {{ 'PATCH' if item.1.want else 'skip' }}"
+      loop: "{{ _recs.results | zip(_rec_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _rec_cases_ref: *reconcile_cases
+
     - name: Summary
       debug:
         msg: >-
           relay: cleanup_hosts remark regex, migrate detection truth table,
           .relay_address parsing, the repoint gates, relay port precedence, and
-          relay-only inbound activation all verified.
+          relay-only inbound activation, the same-name cleanup guard, the
+          choke-point anti-leak invariant, and reconcile-on-empty-profile all
+          verified.
