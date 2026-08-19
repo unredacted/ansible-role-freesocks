@@ -24,6 +24,8 @@
 #       only resolve from the networks clients use).
 #   (t2) the getent_hosts RESULT SHAPE (keyed by address, names as values) — (t)
 #       covered the comparison and passed while the extraction was wrong.
+#   (t3) the KNOWN GAP in IPv6 spelling equivalence, asserted as a gap so it cannot be
+#       mistaken for coverage.
 #   (u) the panel-token pre-flights fire whenever the registered path is effective.
 #   (s) STRUCTURAL: every Host-creation task file fetches the existing Hosts BEFORE
 #       its idempotency decision. Dropping that GET makes every run look like
@@ -1131,6 +1133,41 @@
         label: "{{ item.1.name }}"
       vars:
         _t2_cases_ref: *t2_cases
+
+    # --- (t3) KNOWN GAP: equivalent IPv6 spellings are not canonicalized -------
+    # Documented rather than silently absent. ansible-core has no IP filter, and
+    # hand-rolled `::` collapsing risks FALSE rejections (a refused legitimate edge
+    # blocks a deploy). This test states the gap so nobody reads (q)/(t2) as covering
+    # it; flip the expectations here if ansible.utils + netaddr are ever adopted.
+    - name: Evaluate the textual comparison on equivalent IPv6 spellings
+      set_fact:
+        _t3_caught: "{{ (item.addr | lower) in (item.node_addrs | map('lower') | list) }}"
+      loop: &t3_cases
+        - { name: "same spelling (caught)",          addr: "2001:db8::1",              node_addrs: ["2001:db8::1"], want: true  }
+        - { name: "case differs (caught by lower)",  addr: "2001:DB8::1",              node_addrs: ["2001:db8::1"], want: true  }
+        # THE GAP: same address, expanded spelling -> textually different.
+        - { name: "expanded form (NOT caught)",      addr: "2001:0db8:0:0:0:0:0:1",    node_addrs: ["2001:db8::1"], want: false }
+        - { name: "leading zeros (NOT caught)",      addr: "2001:0db8::1",             node_addrs: ["2001:db8::1"], want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _t3s
+
+    - name: Assert the documented gap is exactly as described (no more, no less)
+      assert:
+        that:
+          - (item.0.ansible_facts._t3_caught | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: caught={{ item.0.ansible_facts._t3_caught }}, expected
+          {{ item.1.want }}. If an expanded IPv6 form is now caught, canonicalization
+          was added — update this test and the KNOWN LIMIT note in
+          assert_relay_edge.yml. If a same-spelling case stopped being caught, the
+          textual comparison has regressed.
+        success_msg: "{{ item.1.name }} -> {{ 'caught' if item.1.want else 'NOT caught (known gap)' }}"
+      loop: "{{ _t3s.results | zip(_t3_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _t3_cases_ref: *t3_cases
 
     # --- (u) panel-token pre-flights follow the EFFECTIVE registered path ------
     # The token asserts live inside the Host and update_node task files, i.e. at the end

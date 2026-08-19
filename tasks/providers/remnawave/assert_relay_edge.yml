@@ -15,6 +15,25 @@
 # Every fact source is defaulted, so with facts ungathered this degrades to the
 # hostname comparison rather than failing.
 #
+# KNOWN LIMIT — equivalent IPv6 spellings are not canonicalized. `2001:db8::1` and
+# `2001:0db8:0:0:0:0:0:1` are the same address, and lowercasing does not make those two
+# strings equal, so supplying the node's own IPv6 in expanded form would pass the
+# textual comparison. Two reasons this is not fixed here rather than papered over:
+#
+#   * ansible-core ships no IP-address filter. ipaddr/ipv6 live in ansible.utils and
+#     additionally need the netaddr Python package, and requirements.yml deliberately
+#     carries community.docker alone. A collection plus a pip dependency is
+#     disproportionate for one narrow spelling of an already-guarded footgun.
+#   * hand-rolling IPv6 canonicalization in Jinja means getting `::` run-collapsing
+#     right, and a mistake there produces FALSE rejections — a legitimate edge refused
+#     and a deploy blocked, which is worse than the case it would catch.
+#
+# The resolver pass below is the partial mitigation: literals are handed to getent,
+# which echoes its own canonical form when it can resolve them. If exact IPv6 semantics
+# are wanted, add ansible.utils + netaddr and compare with `ipaddr('address')` on both
+# sides; that is a deliberate dependency decision for the maintainer, not something to
+# smuggle in here.
+#
 # Names are normalized before comparison: DNS is case-insensitive and a terminal dot
 # denotes the same FQDN, so `NODE.Example.com.` and `node.example.com` are the same
 # host and a byte comparison would let the first through. Lowercasing also
@@ -84,11 +103,10 @@
   register: _relay_edge_resolved
   failed_when: false
   changed_when: false
-  when:
-    - (_relay_edge_normalized | length) > 0
-    # Literal IPs are already covered textually above; nothing to resolve.
-    - not (_relay_edge_normalized is match('^[0-9.]+$'))
-    - not (':' in _relay_edge_normalized)
+  # Literals are NOT skipped: `getent hosts <literal>` echoes the address in the
+  # resolver's own canonical form, which is free partial canonicalization for the
+  # equivalent-IPv6-spelling case below. Costs one extra lookup per run.
+  when: (_relay_edge_normalized | length) > 0
 
 # getent_hosts is keyed by the FIRST COLUMN of `getent hosts`, which is the ADDRESS,
 # with the names as the values: {'127.0.0.1': ['localhost']}. Taking values() alone
@@ -136,6 +154,4 @@
       networks clients use. Confirm by hand that it points at the proxy, not the node.
   when:
     - (_relay_edge_normalized | length) > 0
-    - not (_relay_edge_normalized is match('^[0-9.]+$'))
-    - not (':' in _relay_edge_normalized)
     - (_relay_edge_resolved_addrs | default([])) | length == 0
