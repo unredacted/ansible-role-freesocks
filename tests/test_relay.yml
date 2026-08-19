@@ -15,6 +15,9 @@
 #       claims every relay node too (relay runs no Caddy either). The cases
 #       below pin the fix AND pin that legacy nodes still detect identically.
 #   (c) parsing the .relay_address marker file.
+#   (f) a relay node activates ONLY its relay inbound, even when an enabled CDN
+#       transport is inherited from the bootstrap output (which arrives as
+#       extra-vars and cannot be overridden from inventory).
 #   (e) relay port precedence across lifecycle ops (regression: a concrete 443
 #       default made "was it supplied?" always true, so a non-443 edge port was
 #       silently rewritten to 443 on every rotation/migration).
@@ -319,9 +322,68 @@
           it with `| default(443, true)`.
         success_msg: "(e) relay port precedence OK; the empty default keeps 'unset' detectable."
 
+    # --- (f) relay nodes drop inherited CDN transports ------------------------
+    # Mirrors the derivation in tasks/setup/remnawave.yml. The hazard: the
+    # bootstrap output vars file carries an ENABLED ws transport and is loaded with
+    # `-e @file`, so it outranks an inventory-level `remnawave_cdn_transports: []`.
+    # If the derivation did not drop it, a "dedicated" relay node would also
+    # activate the WS inbound.
+    - name: Resolve the active inbound set for each node kind
+      set_fact:
+        _decl: >-
+          {{ item.transports | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+             | select('string') | reject('equalto', '') | list }}
+        _cdn: >-
+          {{ []
+             if (item.relay | bool)
+             else (item.transports | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+                   | select('string') | reject('equalto', '') | list) }}
+      loop: &inbound_cases
+        # The real-world relay case: WS transport inherited and enabled.
+        - name: "relay node, WS inherited"
+          relay: true
+          transports: [{ name: ws, inbound_uuid: "uuid-ws", enabled: true }]
+          want_cdn: []
+        # A non-relay node must be completely unaffected by this change.
+        - name: "ws node, WS enabled"
+          relay: false
+          transports: [{ name: ws, inbound_uuid: "uuid-ws", enabled: true }]
+          want_cdn: ["uuid-ws"]
+        - name: "ws node, WS disabled"
+          relay: false
+          transports: [{ name: ws, inbound_uuid: "uuid-ws", enabled: false }]
+          want_cdn: []
+      loop_control:
+        label: "{{ item.name }}"
+      register: _inbounds
+
+    - name: Assert relay drops inherited transports and others keep theirs
+      assert:
+        that:
+          - item.0.ansible_facts._cdn == item.1.want_cdn
+        fail_msg: >-
+          {{ item.1.name }}: active CDN inbounds {{ item.0.ansible_facts._cdn }},
+          expected {{ item.1.want_cdn }}. A relay node must activate only its relay
+          inbound; a non-relay node must be untouched by that rule.
+        success_msg: "{{ item.1.name }} -> cdn={{ item.0.ansible_facts._cdn }}"
+      loop: "{{ _inbounds.results | zip(_inbound_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _inbound_cases_ref: *inbound_cases
+
+    - name: The relay case must still have SEEN a declared transport
+      assert:
+        that:
+          - _inbounds.results[0].ansible_facts._decl == ['uuid-ws']
+        fail_msg: >-
+          The relay fixture no longer carries an enabled transport, so (f) is not
+          testing that it gets dropped.
+        success_msg: "(f) relay nodes activate only the relay inbound; non-relay nodes unaffected."
+
     - name: Summary
       debug:
         msg: >-
           relay: cleanup_hosts remark regex, migrate detection truth table,
-          .relay_address parsing, the repoint gates, and relay port precedence
-          all verified.
+          .relay_address parsing, the repoint gates, relay port precedence, and
+          relay-only inbound activation all verified.

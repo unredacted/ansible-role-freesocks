@@ -978,9 +978,9 @@
     remnawave_caddy_enabled: false
     remnawave_reality_enabled: false
     remnawave_per_node_placement: false
-    # A relay node must not also activate the WS inbound it would otherwise
-    # inherit from a bootstrap-generated vars file.
-    remnawave_cdn_transports: []
+    # No need to blank remnawave_cdn_transports: the role drops inherited CDN
+    # transports on a relay node itself. (It has to — the bootstrap output file is
+    # loaded as extra-vars, which outrank anything set here.)
 
     remnawave_relay_enabled: true
     remnawave_relay_inbound_uuid: "your-relay-inbound-uuid"   # from bootstrap output

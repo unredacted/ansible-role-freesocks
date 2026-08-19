@@ -726,7 +726,8 @@ outline_enabled: false
 remnawave_caddy_enabled: false            # MUST stay off (contends for :443)
 remnawave_reality_enabled: false          # MUST stay off (contends for :443)
 remnawave_per_node_placement: false       # legacy path does not know relay
-remnawave_cdn_transports: []              # don't also activate the WS inbound
+# remnawave_cdn_transports: []            # not needed: the role drops inherited
+                                          # CDN transports on a relay node itself
 
 remnawave_relay_enabled: true
 remnawave_relay_inbound_uuid: "<configProfileInboundUuid of the relay inbound>"

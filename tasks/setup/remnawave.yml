@@ -82,11 +82,40 @@
 # The `when:` below MUST list every transport: a relay-only node whose disjunct is
 # missing skips this task entirely, falls through to the empty
 # remnawave_panel_active_inbounds default, and dies in register_node.yml's assert.
+# A relay node is DEDICATED, and that has to be enforced in CODE rather than by
+# documentation: the bootstrap output file carries an ENABLED ws transport, and it
+# is loaded with `-e @file`, i.e. extra-vars — which outrank an inventory-level
+# `remnawave_cdn_transports: []`. So an operator cannot reliably turn it off from
+# inventory, and a relay node would otherwise also activate the WS inbound. That
+# inbound cannot work here anyway (it needs Caddy to terminate TLS and proxy to
+# it, and Caddy is asserted off on relay nodes), so activating it is never right —
+# it just occupies a loopback port and muddies the node's inbound set.
+#
+# Two independent keys in ONE set_fact (no cross-reference, so 2.19-safe): the
+# declared set is kept only to tell the operator what was ignored.
 - name: Collect enabled CDN-transport inbound UUIDs
   set_fact:
-    _cdn_transport_inbounds: >-
+    _cdn_transport_inbounds_declared: >-
       {{ remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
          | select('string') | reject('equalto', '') | list }}
+    _cdn_transport_inbounds: >-
+      {{ []
+         if (remnawave_relay_enabled | default(false) | bool)
+         else (remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+               | select('string') | reject('equalto', '') | list) }}
+
+- name: Note that CDN transports are ignored on a relay node
+  debug:
+    msg: >-
+      Relay node — ignoring {{ _cdn_transport_inbounds_declared | length }} enabled
+      CDN transport(s) from remnawave_cdn_transports. A relay node is dedicated:
+      the WS inbound needs Caddy to terminate TLS in front of it, and Caddy is
+      asserted off here, so it would never carry traffic. This node activates only
+      its relay inbound. (The entry usually arrives from the bootstrap output vars
+      file, which is loaded as extra-vars and cannot be overridden from inventory.)
+  when:
+    - remnawave_relay_enabled | default(false) | bool
+    - _cdn_transport_inbounds_declared | length > 0
 
 - name: Derive active inbounds from enabled CDN transports (+ Reality, + relay)
   set_fact:

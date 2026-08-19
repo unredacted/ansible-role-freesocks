@@ -381,9 +381,11 @@
         remnawave_relay_inbound_uuid: "{{ _boot.remnawave_relay_inbound_uuid }}"
         remnawave_relay_sni: "{{ _boot.remnawave_relay_sni }}"
         remnawave_relay_node_listen_port: "{{ _boot.remnawave_relay_node_listen_port }}"
-        # A relay node is dedicated — it must not also activate the WS inbound it
-        # would otherwise inherit from the generated vars file.
-        remnawave_cdn_transports: []
+        # Deliberately loaded VERBATIM from the bootstrap output, WS transport and
+        # all — that is what a real relay deploy inherits, and the file arrives as
+        # extra-vars so it cannot be overridden from inventory. The derivation
+        # below must drop it on its own.
+        remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
       vars:
         _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
   tasks:
@@ -400,11 +402,24 @@
     # The relay-only active-inbound derivation: this is the case whose missing
     # `when:` disjunct would fall through to the empty default and die in
     # register_node's assert.
+    - name: Assert the inherited WS transport really is enabled (the hazard is live)
+      assert:
+        that:
+          - (remnawave_cdn_transports | rejectattr('enabled', 'equalto', false) | list | length) > 0
+        fail_msg: >-
+          The bootstrap output no longer carries an enabled CDN transport, so this
+          phase is no longer testing that a relay node drops it.
+
     - name: Derive active inbounds for a relay-only node (as setup/remnawave.yml does)
       set_fact:
-        _cdn_transport_inbounds: >-
+        _cdn_transport_inbounds_declared: >-
           {{ remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
              | select('string') | reject('equalto', '') | list }}
+        _cdn_transport_inbounds: >-
+          {{ []
+             if (remnawave_relay_enabled | default(false) | bool)
+             else (remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+                   | select('string') | reject('equalto', '') | list) }}
     - name: Derive the active inbound set
       set_fact:
         remnawave_panel_active_inbounds: >-
@@ -413,13 +428,18 @@
                 if (remnawave_relay_enabled | default(false) | bool
                      and (remnawave_relay_inbound_uuid | default('') | length > 0))
                 else []) }}
-    - name: Assert a relay-only node activates exactly the relay inbound
+    - name: Assert a relay node activates ONLY the relay inbound
       assert:
         that:
           - remnawave_panel_active_inbounds == [remnawave_relay_inbound_uuid]
+          # The inherited WS inbound must be dropped by the derivation itself, not
+          # by the caller remembering to blank remnawave_cdn_transports.
+          - _cdn_transport_inbounds_declared | length > 0
+          - _cdn_transport_inbounds | length == 0
         fail_msg: >-
-          A relay-only node must activate exactly its own inbound, got
-          {{ remnawave_panel_active_inbounds }}.
+          A relay node must activate exactly its own inbound, got
+          {{ remnawave_panel_active_inbounds }} (declared CDN inbounds:
+          {{ _cdn_transport_inbounds_declared }}).
 
     - name: Register the relay node
       include_role:
