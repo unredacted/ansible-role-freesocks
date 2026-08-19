@@ -194,6 +194,7 @@
     content: |
       address={{ remnawave_relay_address }}
       port={{ remnawave_relay_port | default(443, true) | int }}
+      fingerprint={{ remnawave_relay_fingerprint | default('chrome', true) }}
     dest: "{{ remnawave_node_install_dir }}/.relay_address"
     mode: '0640'
   become: "{{ remnawave_persist_become | default(true) }}"

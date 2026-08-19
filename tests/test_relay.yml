@@ -357,12 +357,51 @@
       vars:
         _port_cases_ref: *port_cases
 
+    # --- (e2) fingerprint precedence + marker backward compatibility -----------
+    # The last Host field that had the port bug's shape: a concrete 'chrome' default made
+    # "was it supplied?" unanswerable, so a deliberate non-default fingerprint was
+    # rewritten to chrome by any lifecycle run that did not re-pass it — and the Host was
+    # re-created every run, since its body then differed from the live one.
+    - name: Resolve the effective fingerprint for each case
+      set_fact:
+        _eff_fp: >-
+          {{ item.caller
+             if ((item.caller | default('')) | length > 0)
+             else (((item.marker | regex_search('^fingerprint=.+', multiline=true) | default('', true))
+                    | regex_replace('^fingerprint=', '')) | default('chrome', true)) }}
+      loop: &fp_cases
+        - { name: "unset caller, marker firefox",   caller: "",        marker: "address=e\nport=443\nfingerprint=firefox\n", want: "firefox" }
+        - { name: "explicit safari beats marker",   caller: "safari",  marker: "address=e\nport=443\nfingerprint=firefox\n", want: "safari"  }
+        - { name: "explicit chrome beats marker",   caller: "chrome",  marker: "address=e\nport=443\nfingerprint=firefox\n", want: "chrome"  }
+        # A marker written BEFORE this change has no fingerprint line.
+        - { name: "legacy 2-line marker",           caller: "",        marker: "address=e\nport=443\n",                      want: "chrome"  }
+        - { name: "no marker at all",               caller: "",        marker: "",                                            want: "chrome"  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _fps
+
+    - name: Assert a deliberate fingerprint survives a lifecycle run
+      assert:
+        that:
+          - (item.0.ansible_facts._eff_fp | string) == (item.1.want | string)
+        fail_msg: >-
+          {{ item.1.name }}: resolved '{{ item.0.ansible_facts._eff_fp }}', expected
+          '{{ item.1.want }}'. Losing a persisted fingerprint silently changes the
+          client's TLS mimicry and re-creates the Host on every run.
+        success_msg: "{{ item.1.name }} -> {{ item.0.ansible_facts._eff_fp }}"
+      loop: "{{ _fps.results | zip(_fp_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _fp_cases_ref: *fp_cases
+
     # The role default must stay EMPTY, or (e) silently stops discriminating.
     - name: Assert remnawave_relay_port ships empty so "unset" is detectable
       assert:
         that:
           - (_role_defaults.remnawave_relay_port | string | length) == 0
           - (_role_defaults.remnawave_relay_address | string | length) == 0
+          - (_role_defaults.remnawave_relay_fingerprint | string | length) == 0
         fail_msg: >-
           remnawave_relay_port must default to EMPTY, not 443. A concrete default
           makes "was a port supplied?" unanswerable, and change/migrate then

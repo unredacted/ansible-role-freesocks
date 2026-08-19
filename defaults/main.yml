@@ -453,7 +453,13 @@ remnawave_relay_port: ""
 # file; keep it out of your creds file so the two cannot disagree (both load as
 # extra-vars, where the later -e wins).
 remnawave_relay_sni: ""
-remnawave_relay_fingerprint: "chrome"
+# Empty means "chrome". Same reasoning as remnawave_relay_port above: with a concrete
+# default, change and migrate cannot tell an operator-supplied value from an untouched
+# one, so a relay deployed with a deliberate non-default fingerprint would silently be
+# rewritten to chrome on every lifecycle run — and, because the Host body then differs
+# from the live Host, re-created on every run as well. Persisted in .relay_address and
+# resolved with `| default('chrome', true)` at the point of use.
+remnawave_relay_fingerprint: ""
 # Informational echo of the node-side listen port, written by bootstrap into the
 # output file so the deploy summary can print the exact "point your proxy backend
 # here" line. Configures nothing.

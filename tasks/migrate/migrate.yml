@@ -132,6 +132,10 @@
       {{ (((source_relay_raw.content | b64decode) if source_relay_raw.content is defined else '')
           | regex_search('^port=[0-9]+', multiline=true) | default('', true))
          | regex_replace('^port=', '') }}
+    migrate_source_relay_fingerprint: >-
+      {{ (((source_relay_raw.content | b64decode) if source_relay_raw.content is defined else '')
+          | regex_search('^fingerprint=.+', multiline=true) | default('', true))
+         | regex_replace('^fingerprint=', '') }}
   when:
     - inventory_hostname == source_hostname
     - migrate_component == 'remnawave'
@@ -184,6 +188,7 @@
     migrate_detected_relay: "{{ hostvars[source_hostname].migrate_detected_relay | default(false) }}"
     migrate_source_relay_address: "{{ hostvars[source_hostname].migrate_source_relay_address | default('') }}"
     migrate_source_relay_port: "{{ hostvars[source_hostname].migrate_source_relay_port | default('') }}"
+    migrate_source_relay_fingerprint: "{{ hostvars[source_hostname].migrate_source_relay_fingerprint | default('') }}"
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
@@ -294,6 +299,10 @@
       {{ remnawave_relay_port
          if ((remnawave_relay_port | default('')) | string | length > 0)
          else ((migrate_source_relay_port | default('')) | default('443', true)) }}
+    _migrate_relay_fingerprint_effective: >-
+      {{ remnawave_relay_fingerprint
+         if ((remnawave_relay_fingerprint | default('')) | length > 0)
+         else ((migrate_source_relay_fingerprint | default('')) | default('chrome', true)) }}
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
@@ -958,6 +967,7 @@
     content: |
       address={{ _migrate_relay_address_effective }}
       port={{ _migrate_relay_port_effective | int }}
+      fingerprint={{ _migrate_relay_fingerprint_effective }}
     dest: "{{ remnawave_node_install_dir }}/.relay_address"
     mode: '0640'
   become: "{{ remnawave_persist_become | default(true) }}"
@@ -972,6 +982,7 @@
   vars:
     remnawave_relay_address: "{{ _migrate_relay_address_effective }}"
     remnawave_relay_port: "{{ _migrate_relay_port_effective }}"
+    remnawave_relay_fingerprint: "{{ _migrate_relay_fingerprint_effective }}"
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'

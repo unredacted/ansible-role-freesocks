@@ -143,6 +143,15 @@
          if ((remnawave_relay_port | default('')) | string | length > 0)
          else (((_change_relay_text | regex_search('^port=[0-9]+', multiline=true) | default('', true))
                 | regex_replace('^port=', '')) | default('443', true)) }}
+    # Same precedence for the fingerprint: explicit -> persisted -> chrome. Without
+    # this, a relay deployed with a deliberate non-default fingerprint is rewritten to
+    # chrome by any rotation that does not re-pass it, and the Host is re-created every
+    # run because its body then differs from the live one.
+    _change_relay_fingerprint: >-
+      {{ remnawave_relay_fingerprint
+         if ((remnawave_relay_fingerprint | default('')) | length > 0)
+         else (((_change_relay_text | regex_search('^fingerprint=.+', multiline=true) | default('', true))
+                | regex_replace('^fingerprint=', '')) | default('chrome', true)) }}
 
 # Mirror migrate's "caller flag OR detected on disk" derivation. Without this, a
 # rotation that omits remnawave_panel_register_node skips Host create, cleanup AND
@@ -493,6 +502,7 @@
     content: |
       address={{ _change_relay_address }}
       port={{ _change_relay_port | int }}
+      fingerprint={{ _change_relay_fingerprint }}
     dest: "{{ remnawave_node_install_dir }}/.relay_address"
     mode: '0640'
   become: "{{ remnawave_persist_become | default(true) }}"
@@ -657,6 +667,7 @@
   vars:
     remnawave_relay_address: "{{ _change_relay_address }}"
     remnawave_relay_port: "{{ _change_relay_port }}"
+    remnawave_relay_fingerprint: "{{ _change_relay_fingerprint }}"
   when:
     - _change_register_node_effective | bool
     - _change_relay_effective | default(false) | bool

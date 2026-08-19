@@ -120,7 +120,7 @@
          and (((_relay_existing.address | default('')) != (remnawave_relay_address | default('')))
               or ((_relay_existing.port | default(0) | int) != (remnawave_relay_port | default(443, true) | int))
               or ((_relay_existing.sni | default('')) != (remnawave_relay_sni | default('')))
-              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome')))
+              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome', true)))
               or (((_relay_existing_inbound.configProfileInboundUuid | default('')) | length > 0)
                   and ((_relay_existing_inbound.configProfileInboundUuid | default('')) != (remnawave_relay_inbound_uuid | default(''))))
               or (((_relay_existing_inbound.configProfileUuid | default('')) | length > 0)
@@ -168,7 +168,7 @@
       address: "{{ remnawave_relay_address }}"
       port: "{{ remnawave_relay_port | default(443, true) | int }}"
       sni: "{{ remnawave_relay_sni }}"
-      fingerprint: "{{ remnawave_relay_fingerprint | default('chrome') }}"
+      fingerprint: "{{ remnawave_relay_fingerprint | default('chrome', true) }}"
       securityLayer: "DEFAULT"
       # address is the edge, sni is the borrowed site — they intentionally differ,
       # so the panel must not overwrite one from the other. No path/host/alpn:
