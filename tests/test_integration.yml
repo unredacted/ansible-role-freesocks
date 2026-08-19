@@ -121,11 +121,28 @@
           vars:
             dns_hostname: "127.0.0.1"
             _relay_edge_candidate: "localhost"
+        # Print both sides unconditionally: when this control fails, the useful
+        # information is what the two lists actually contained, and reconstructing
+        # that from a bare assertion costs a full CI cycle.
+        - name: Show what the resolution check compared
+          debug:
+            msg:
+              - "node addresses      : {{ _relay_node_addresses | default('(undefined)') }}"
+              - "edge normalized     : {{ _relay_edge_normalized | default('(undefined)') }}"
+              - "resolved addrs      : {{ _relay_edge_resolved_addrs | default('(undefined)') }}"
+              - "raw getent facts    : {{ _relay_edge_resolved.ansible_facts | default('(none)') }}"
+              - "getent failed/msg   : {{ _relay_edge_resolved.failed | default('?') }} / {{ _relay_edge_resolved.msg | default('') }}"
+
         - name: Unexpected acceptance
           fail:
-            msg: >-
+            msg: |
               assert_relay_edge accepted 'localhost' while 127.0.0.1 was in the node
               address set — the resolves-back-to-the-node check is not working.
+
+                node addresses  : {{ _relay_node_addresses | default('(undefined)') }}
+                edge normalized : {{ _relay_edge_normalized | default('(undefined)') }}
+                resolved addrs  : {{ _relay_edge_resolved_addrs | default('(undefined)') }}
+                raw getent      : {{ _relay_edge_resolved.ansible_facts | default('(none)') }}
       rescue:
         - name: Assert it failed for the RIGHT reason
           assert:
