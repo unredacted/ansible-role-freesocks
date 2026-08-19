@@ -565,18 +565,23 @@
     # Cannot live in the validation block above: dns_hostname is not derived until
     # the hostname facts are set. Still runs before DNS records and before any
     # install, so a misconfigured relay node never reaches the panel.
+    - name: Collect this node's own addresses (relay anti-leak pre-flight)
+      include_tasks: providers/remnawave/relay_node_addresses.yml
+      when: remnawave_relay_enabled | default(false) | bool
+
     - name: Validate the relay edge address is not the node itself
       fail:
         msg: |
-          remnawave_relay_address ({{ remnawave_relay_address }}) is this node's
-          own hostname — that is a DIRECT Reality deploy, not a relay: clients
-          would connect straight to the node and the external proxy would be
-          bypassed entirely, publishing the node's address to every subscriber.
+          remnawave_relay_address ({{ remnawave_relay_address }}) is one of this
+          node's own addresses ({{ _relay_node_addresses | default([]) | join(', ') }})
+          — that is a DIRECT Reality deploy, not a relay: clients would connect
+          straight to the node and the external proxy would be bypassed entirely,
+          publishing the node's address to every subscriber.
           Point remnawave_relay_address at the external L4 proxy's edge, or use
           remnawave_reality_enabled=true for a genuinely direct node.
       when:
         - remnawave_relay_enabled | default(false) | bool
-        - (remnawave_relay_address | default('')) == (dns_hostname | default(''))
+        - (remnawave_relay_address | default('')) in (_relay_node_addresses | default([]))
 
     # Fastly origin identity: an unguessable per-node origin name
     # (<hostname>-<rand8>.<base_domain>). In shared + fronting modes this

@@ -55,16 +55,8 @@
 # direct-Reality deploy wearing a relay label, and it hands every subscriber
 # exactly the address an IP block needs. Every source is `default`ed so this
 # degrades to the hostname check when facts were not gathered.
-- name: Collect the node's own addresses (for the relay anti-leak check)
-  set_fact:
-    _relay_node_addresses: >-
-      {{ ([dns_hostname | default(''), ansible_facts['default_ipv4']['address'] | default(''),
-           ansible_facts['default_ipv6']['address'] | default('')]
-          + (ansible_facts['all_ipv4_addresses'] | default([]))
-          + (ansible_facts['all_ipv6_addresses'] | default([]))
-          + (envoy_mappings[inventory_hostname]['ipv4'] | default([]) if (envoy_mappings | default({})) is mapping else [])
-          + (envoy_mappings[inventory_hostname]['ipv6'] | default([]) if (envoy_mappings | default({})) is mapping else []))
-         | select('string') | reject('equalto', '') | list }}
+- name: Collect this node's own addresses (shared definition)
+  include_tasks: relay_node_addresses.yml
 
 - name: Assert the relay Host advertises the proxy edge, never this node
   assert:

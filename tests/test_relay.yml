@@ -15,6 +15,11 @@
 #       claims every relay node too (relay runs no Caddy either). The cases
 #       below pin the fix AND pin that legacy nodes still detect identically.
 #   (c) parsing the .relay_address marker file.
+#   (n) STRUCTURAL: every destination gate in migrate.yml appears BEFORE the first
+#       mutating task. This ordering has been got wrong twice, and a comment does
+#       not enforce it — a gate that runs after the transfer strands the node
+#       instead of refusing the run.
+#   (o) squad membership is reconciled PER SQUAD, not against a panel-wide list.
 #   (j) the anti-leak invariant covers the node's own IPs, not just its hostname.
 #   (k) endpoint drift on a same-name op replaces the Host instead of skipping.
 #   (l) migrate refuses a destination where relay and another :443 transport would
@@ -730,6 +735,115 @@
         label: "{{ item.1.name }}"
       vars:
         _contra_cases_ref: *contra_cases
+
+    # --- (n) structural: gates must precede mutations in migrate.yml ----------
+    # Read the real task file and compare positions. Ordering is the one property
+    # these expression tests cannot otherwise see, and it is exactly what went wrong
+    # twice: a pre-flight placed after the transfer does not prevent a bad
+    # migration, it strands one — source stopped, destination running, DNS moved,
+    # and a retry blocked by the clean-destination check.
+    - name: Read tasks/migrate/migrate.yml
+      set_fact:
+        _mig: "{{ lookup('file', playbook_dir ~ '/../tasks/migrate/migrate.yml') }}"
+
+    - name: Locate the destination gates and the first mutating tasks
+      set_fact:
+        _gates_at: >-
+          {{ [_mig.find('Fail on contradictory effective transports for the destination'),
+              _mig.find('Validate the relay endpoint is known before migrating'),
+              _mig.find('Assert the relay edge is not one of the destination'),
+              _mig.find('Require acknowledgement that the relay proxy will be re-pointed')] }}
+        _mutations_at: >-
+          {{ [_mig.find('Include configuration transfer tasks (Remnawave)'),
+              _mig.find('Include container management tasks (Remnawave)'),
+              _mig.find('Include DNS record management tasks (Cloudflare)'),
+              _mig.find('include_tasks: ../providers/remnawave/update_node.yml')] }}
+
+    - name: Assert every gate is present and precedes every mutation
+      assert:
+        that:
+          # -1 would mean a task was renamed and this test silently stopped working.
+          - (_gates_at | min) > 0
+          - (_mutations_at | min) > 0
+          - (_gates_at | max) < (_mutations_at | min)
+        fail_msg: >-
+          Gate/mutation ordering violated in tasks/migrate/migrate.yml.
+          gates at {{ _gates_at }}, mutations at {{ _mutations_at }}. A -1 means a
+          task name changed and this guard went blind; otherwise a gate now runs
+          AFTER a mutation, which strands the node instead of refusing the run.
+        success_msg: "(n) all destination gates precede every mutating task in migrate.yml."
+
+    - name: Read tasks/change/remnawave_change.yml
+      set_fact:
+        _chg: "{{ lookup('file', playbook_dir ~ '/../tasks/change/remnawave_change.yml') }}"
+
+    - name: Assert the rotation gates precede the first mutation
+      vars:
+        _cg: >-
+          {{ [_chg.find('Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)'),
+              _chg.find('Validate the relay endpoint is known before rotating'),
+              _chg.find('Require acknowledgement before deleting the old DNS name of a relay node')] }}
+        _cm: >-
+          {{ [_chg.find('Update persisted hostname file'),
+              _chg.find('Re-persist the relay endpoint (relay marker)')] }}
+      assert:
+        that:
+          - (_cg | min) > 0
+          - (_cm | min) > 0
+          - (_cg | max) < (_cm | min)
+        fail_msg: >-
+          Rotation gates must precede the first mutation in
+          tasks/change/remnawave_change.yml. gates {{ _cg }}, mutations {{ _cm }}.
+        success_msg: "(n2) rotation gates precede the first mutation in change mode."
+
+    # --- (o) squad membership is reconciled PER SQUAD -------------------------
+    # The first version of this predicate flattened every squad's inbounds into one
+    # panel-wide list, so a desired inbound belonging to ANY other squad suppressed
+    # the repair even when the FreeSocks squad was empty — and the extra hand-added
+    # memberships this task deliberately preserves are exactly how that happens.
+    - name: Build a squad name -> members map with the desired inbound parked elsewhere
+      set_fact:
+        _sq_members:
+          FreeSocks-Fastly: ["u-ws"]
+          FreeSocks-Reality: ["u-re"]
+          FreeSocks-Relay: []
+          Operator-Extra: ["u-rl"]
+
+    - name: Plan per squad (the shipped predicate)
+      set_fact:
+        _sq_plan: >-
+          {%- set plan = [] -%}
+          {%- for c in [{'name': 'FreeSocks-Fastly', 'want': 'u-ws'},
+                        {'name': 'FreeSocks-Reality', 'want': 'u-re'},
+                        {'name': 'FreeSocks-Relay', 'want': 'u-rl'}] -%}
+            {%- if (c.want | length > 0) and (c.name in _sq_members)
+                   and (c.want not in _sq_members[c.name]) -%}
+              {%- set _ = plan.append(c) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ plan }}
+
+    - name: Plan with the OLD panel-wide predicate (negative control)
+      set_fact:
+        _sq_plan_old: >-
+          {{ [{'name': 'FreeSocks-Relay', 'want': 'u-rl'}]
+             | rejectattr('want', 'in', (_sq_members.values() | list | sum(start=[]))) | list }}
+
+    - name: Assert the empty squad is repaired even though the inbound lives elsewhere
+      assert:
+        that:
+          - _sq_plan | length == 1
+          - _sq_plan[0].name == 'FreeSocks-Relay'
+          # Healthy squads are left alone — the repair must not churn them.
+          - "'FreeSocks-Fastly' not in (_sq_plan | map(attribute='name') | list)"
+          - "'FreeSocks-Reality' not in (_sq_plan | map(attribute='name') | list)"
+          # And the predicate this replaced would have done nothing at all.
+          - _sq_plan_old | length == 0
+        fail_msg: >-
+          Per-squad membership check failed: planned {{ _sq_plan }}. An empty
+          FreeSocks squad must be repaired regardless of which other squads happen
+          to reference the same inbound, or its FCP mode reaches no node.
+        success_msg: "(o) membership is checked per squad; the old panel-wide predicate is proven blind."
 
     - name: Summary
       debug:

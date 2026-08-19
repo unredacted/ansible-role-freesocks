@@ -181,17 +181,37 @@
 # objects carrying .uuid. CI pins remnawave/backend:2.8.0 and the published spec is
 # newer, so the integration suite deliberately exercises this PATCH (it drops the
 # relay squad's membership and asserts this task restores it).
+# Membership is checked PER SQUAD. An earlier version flattened every squad's
+# inbounds into one panel-wide list, so a desired inbound that happened to belong to
+# ANY other squad — including the extra hand-added memberships this task
+# deliberately preserves — suppressed the repair even when the FreeSocks squad
+# itself was empty. The correlated lookup a `rejectattr` cannot express is done with
+# the same {%- set -%}/append idiom used in create_node_placement.yml.
+- name: Map squad name -> its current inbound UUIDs
+  set_fact:
+    _rw_squad_members: >-
+      {%- set m = {} -%}
+      {%- for sq in _rw_squads2 -%}
+        {%- set _ = m.update({sq.name: (sq.inbounds | default([], true) | map(attribute='uuid') | list)}) -%}
+      {%- endfor -%}
+      {{ m }}
+  no_log: true
+
 - name: Plan squad membership reconciliation
   set_fact:
     _rw_squad_reconcile: >-
-      {{ [{'name': remnawave_bootstrap_fronted_squad_name, 'want': remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('')},
-          {'name': remnawave_bootstrap_reality_squad_name, 'want': remnawave_reality_inbound_uuid | default('')},
-          {'name': remnawave_bootstrap_relay_squad_name,   'want': remnawave_relay_inbound_uuid | default('')}]
-         | selectattr('want', 'ne', '')
-         | selectattr('name', 'in', (_rw_squads2 | map(attribute='name') | list))
-         | rejectattr('want', 'in', (_rw_squads2 | map(attribute='inbounds') | map('default', [], true)
-                                     | map('map', attribute='uuid') | map('list') | sum(start=[])))
-         | list }}
+      {%- set plan = [] -%}
+      {%- set want = [
+            {'name': remnawave_bootstrap_fronted_squad_name, 'want': remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('')},
+            {'name': remnawave_bootstrap_reality_squad_name, 'want': remnawave_reality_inbound_uuid | default('')},
+            {'name': remnawave_bootstrap_relay_squad_name,   'want': remnawave_relay_inbound_uuid | default('')}] -%}
+      {%- for c in want -%}
+        {%- if (c.want | length > 0) and (c.name in _rw_squad_members)
+               and (c.want not in _rw_squad_members[c.name]) -%}
+          {%- set _ = plan.append(c) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ plan }}
   no_log: true
 
 - name: Note which squads need their inbound membership repaired
@@ -214,9 +234,7 @@
     body_format: json
     body:
       uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', item.name) | list | first).uuid }}"
-      inbounds: >-
-        {{ ((_rw_squads2 | selectattr('name', 'equalto', item.name) | list | first).inbounds
-            | default([], true) | map(attribute='uuid') | list) + [item.want] }}
+      inbounds: "{{ (_rw_squad_members[item.name] | default([], true)) + [item.want] }}"
     status_code: [200]
   delegate_to: localhost
   no_log: true
