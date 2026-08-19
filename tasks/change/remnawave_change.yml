@@ -166,6 +166,53 @@
       - "Relay node: {{ _change_relay_effective }}{{ ' (edge ' ~ _change_relay_address ~ ':' ~ _change_relay_port ~ ')' if (_change_relay_effective | bool) else '' }}"
 
 # ============================================================================
+# STEP 2: Generate the NEW hostname (BEFORE the pre-flight gates)
+# ============================================================================
+# Ordered ahead of STEP 1b deliberately. The relay repoint gate has to TELL the
+# operator the new origin — a gate that demands acknowledgement while printing
+# "(not yet generated)" asks them to repoint a proxy at an address it cannot name,
+# and acknowledging then deletes the only hostname the proxy knows. The anti-leak
+# check needs it too: with a custom_hostname an operator can name the FUTURE node
+# FQDN as the edge, which is a self-reference the old dns_hostname cannot detect.
+#
+# The only host mutation here is `apt install wamerican`, and only when no
+# custom_hostname was given. That is idempotent and strands nothing — unlike DNS,
+# the on-disk markers or the panel, which all stay strictly after the gates.
+# base_domain/api_domain/prom_domain are repointed here as well, since
+# dns_hostname is derived from change_target_domain either way.
+- name: Install wamerican package for word list
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+  when: custom_hostname is not defined
+
+- name: Get random words from system dictionary
+  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n {{ hostname_word_count }}'
+  register: random_words
+  when: custom_hostname is not defined
+
+- name: Set NEW hostname facts (random)
+  set_fact:
+    random_hostname: "{{ random_words.stdout_lines | join('-') }}"
+    dns_hostname: "{{ random_words.stdout_lines | join('-') }}.{{ change_target_domain }}"
+    kv_hostname: "{{ random_words.stdout_lines | join('-') }}"
+  when: custom_hostname is not defined
+
+- name: Set NEW hostname facts (custom)
+  set_fact:
+    random_hostname: "{{ custom_hostname }}"
+    dns_hostname: "{{ custom_hostname }}.{{ change_target_domain }}"
+    kv_hostname: "{{ custom_hostname }}"
+  when: custom_hostname is defined
+
+- name: Override base_domain to NEW target
+  set_fact:
+    base_domain: "{{ change_target_domain }}"
+    api_domain: "{{ change_target_domain }}"
+    prom_domain: "{{ change_target_domain }}"
+
+# ============================================================================
 # STEP 1b: relay pre-flight — BEFORE any mutation
 # ============================================================================
 # The deploy-mode validations live inside main.yml's `operation_mode == 'deploy'`
@@ -252,10 +299,14 @@
 # same own-address mistake is reachable here — and create_relay_host.yml's
 # choke-point assert only fires after the DNS records have already been rewritten.
 # All three modes now check it before mutating anything.
+# dns_hostname is the NEW name by now (STEP 2 runs first), so the OLD one is passed
+# explicitly: it still resolves to this node until STEP 6 deletes it, so naming it as
+# the edge is just as much a self-reference as naming the new one.
 - name: Assert the relay edge is not one of this node's own addresses (rotation)
   include_tasks: ../providers/remnawave/assert_relay_edge.yml
   vars:
     _relay_edge_candidate: "{{ _change_relay_address }}"
+    _relay_extra_node_names: "{{ [old_dns_hostname | default('')] }}"
   when:
     - _change_relay_effective | default(false) | bool
     - (_change_relay_address | default('')) | length > 0
@@ -277,9 +328,12 @@
 
         node IP        : {{ ansible_facts['default_ipv4']['address'] | default('(unknown)') }}
         old origin     : {{ old_dns_hostname }}
-        new origin     : {{ dns_hostname | default('(not yet generated)') }}
+        new origin     : {{ dns_hostname }}
         proxy edge     : {{ _change_relay_address }}:{{ _change_relay_port }}
         node-side port : {{ remnawave_relay_node_listen_port | default(443) }}
+
+      The new origin above is final: STEP 2 has already derived it, so you can
+      re-point the proxy console NOW and then acknowledge.
 
       If the console origin is the node's IP:      nothing changes — re-run with
         -e remnawave_relay_repoint_ack=true
@@ -296,7 +350,7 @@
     msg: |
       RELAY REPOINT NOTICE — this node's origin name is rotating.
         old origin : {{ old_dns_hostname }}
-        new origin : {{ dns_hostname | default('(not yet generated)') }}
+        new origin : {{ dns_hostname }}
         proxy edge : {{ _change_relay_address }}:{{ _change_relay_port }} (UNCHANGED — clients keep working)
       The old DNS name is being KEPT (change_delete_old_dns is false), so an
       IP-origin or old-FQDN-origin proxy config both keep resolving. Update the
@@ -305,41 +359,6 @@
   when:
     - _change_relay_effective | bool
     - not (change_delete_old_dns | default(false) | bool)
-
-# ============================================================================
-# STEP 2: Generate NEW hostname
-# ============================================================================
-- name: Install wamerican package for word list
-  apt:
-    name: wamerican
-    state: present
-  become: yes
-  when: custom_hostname is not defined
-
-- name: Get random words from system dictionary
-  shell: 'grep "^[a-z]\{3,8\}$" /usr/share/dict/words | tr "[:upper:]" "[:lower:]" | shuf -n {{ hostname_word_count }}'
-  register: random_words
-  when: custom_hostname is not defined
-
-- name: Set NEW hostname facts (random)
-  set_fact:
-    random_hostname: "{{ random_words.stdout_lines | join('-') }}"
-    dns_hostname: "{{ random_words.stdout_lines | join('-') }}.{{ change_target_domain }}"
-    kv_hostname: "{{ random_words.stdout_lines | join('-') }}"
-  when: custom_hostname is not defined
-
-- name: Set NEW hostname facts (custom)
-  set_fact:
-    random_hostname: "{{ custom_hostname }}"
-    dns_hostname: "{{ custom_hostname }}.{{ change_target_domain }}"
-    kv_hostname: "{{ custom_hostname }}"
-  when: custom_hostname is defined
-
-- name: Override base_domain to NEW target
-  set_fact:
-    base_domain: "{{ change_target_domain }}"
-    api_domain: "{{ change_target_domain }}"
-    prom_domain: "{{ change_target_domain }}"
 
 # Fresh per-rotation origin identity (new suffix → new origin FQDN). In shared
 # + fronting modes this RESHAPES dns_hostname before the DNS pre-delete below,

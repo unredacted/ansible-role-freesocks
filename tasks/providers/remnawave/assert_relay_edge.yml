@@ -6,7 +6,10 @@
 # hands every subscriber exactly what an IP block needs and bypasses the proxy
 # entirely, which is the single thing the relay transport exists to prevent.
 #
-# Caller sets _relay_edge_candidate, then includes this file. Both the list AND the
+# Caller sets _relay_edge_candidate, then includes this file. It may also pass
+# _relay_extra_node_names for names that identify this node but are not dns_hostname —
+# a rotation must reject BOTH the outgoing and incoming FQDN, since the old record still
+# resolves here until it is deleted and the new one will as soon as it is created. Both the list AND the
 # comparison live here on purpose: this invariant has now drifted between modes
 # three times — first existing only in deploy, then only comparing the hostname,
 # then missing from change entirely — and every one of those was a case of the same
@@ -44,9 +47,10 @@
 - name: Collect this node's own addresses (relay anti-leak)
   set_fact:
     _relay_node_addresses: >-
-      {{ ([dns_hostname | default(''),
-           ansible_facts['default_ipv4']['address'] | default(''),
-           ansible_facts['default_ipv6']['address'] | default('')]
+      {{ ((_relay_extra_node_names | default([]))
+          + [dns_hostname | default('')]
+          + [ansible_facts['default_ipv4']['address'] | default('')]
+          + [ansible_facts['default_ipv6']['address'] | default('')]
           + (ansible_facts['all_ipv4_addresses'] | default([]))
           + (ansible_facts['all_ipv6_addresses'] | default([]))
           + ((envoy_mappings[inventory_hostname]['ipv4'] | default([]))

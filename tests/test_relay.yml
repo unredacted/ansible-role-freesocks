@@ -24,6 +24,9 @@
 #       only resolve from the networks clients use).
 #   (t2) the getent_hosts RESULT SHAPE (keyed by address, names as values) — (t)
 #       covered the comparison and passed while the extraction was wrong.
+#   (n4) STRUCTURAL: in change mode the new hostname is derived BEFORE the gates (so
+#       the ack can name the new origin and the anti-leak check sees the future FQDN),
+#       while DNS and the on-disk markers stay after them.
 #   (t3) the KNOWN GAP in IPv6 spelling equivalence, asserted as a gap so it cannot be
 #       mistaken for coverage.
 #   (u) the panel-token pre-flights fire whenever the registered path is effective.
@@ -796,6 +799,29 @@
       set_fact:
         _chg: "{{ lookup('file', playbook_dir ~ '/../tasks/change/remnawave_change.yml') }}"
 
+    # The ack gate must be able to NAME the new origin, so hostname derivation has to
+    # come BEFORE the gates — while DNS, the markers and the panel stay after. This
+    # pins both halves of that sandwich.
+    - name: Assert hostname derivation precedes the gates, and mutations follow them
+      vars:
+        _derive: "{{ _chg.find('- name: Set NEW hostname facts (custom)') }}"
+        _gate: "{{ _chg.find('- name: Require acknowledgement before deleting the old DNS name of a relay node') }}"
+        _mutate: "{{ _chg.find('- name: Update persisted hostname file') }}"
+        _dns: "{{ _chg.find('- name: Include DNS tasks (Cloudflare)') }}"
+      assert:
+        that:
+          - (_derive | int) > 0 and (_gate | int) > 0 and (_mutate | int) > 0 and (_dns | int) > 0
+          - (_derive | int) < (_gate | int)
+          - (_gate | int) < (_mutate | int)
+          - (_gate | int) < (_dns | int)
+        fail_msg: >-
+          Rotation ordering broken: derive={{ _derive }}, gate={{ _gate }},
+          persist={{ _mutate }}, dns={{ _dns }}. Derivation must precede the gate (or
+          the ack message cannot name the new origin, and the anti-leak check cannot
+          see a future-hostname self-reference), and DNS plus the on-disk markers must
+          follow it.
+        success_msg: "(n4) hostname derivation precedes the rotation gates; DNS and markers follow."
+
     - name: Assert the rotation gates precede the first mutation
       vars:
         _cg: >-
@@ -1133,6 +1159,45 @@
         label: "{{ item.1.name }}"
       vars:
         _t2_cases_ref: *t2_cases
+
+    # --- (q2) a rotation must reject BOTH the outgoing and incoming FQDN ----------
+    # dns_hostname is the NEW name once derivation moved ahead of the gates, so the OLD
+    # one is passed via _relay_extra_node_names: it still resolves here until the old
+    # record is deleted, so naming it as the edge is equally a self-reference. And with
+    # custom_hostname an operator can name the FUTURE FQDN, which the old dns_hostname
+    # alone could not have caught.
+    - name: Build the rotation-time node set (old + new)
+      set_fact:
+        _q2_set: >-
+          {{ (["old-name.example.test"] + ["new-name.example.test"])
+             | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+    - name: Test each candidate against the rotation-time set
+      set_fact:
+        _q2_ok: "{{ (item.addr | lower | regex_replace('[.]$', '')) not in _q2_set }}"
+      loop: &q2_cases
+        - { name: "outgoing FQDN",              addr: "old-name.example.test",  want: false }
+        - { name: "incoming FQDN",              addr: "new-name.example.test",  want: false }
+        - { name: "incoming FQDN, mixed + dot", addr: "NEW-NAME.Example.Test.", want: false }
+        - { name: "genuine proxy edge",         addr: "relay-edge.example.test", want: true }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _q2s
+
+    - name: Assert both rotation FQDNs are rejected and a real edge is not
+      assert:
+        that:
+          - (item.0.ansible_facts._q2_ok | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }} ({{ item.1.addr }}): accepted={{ item.0.ansible_facts._q2_ok }},
+          expected {{ item.1.want }}. A rotation that accepts either of its own FQDNs as
+          the edge publishes the origin.
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _q2s.results | zip(_q2_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _q2_cases_ref: *q2_cases
 
     # --- (t3) KNOWN GAP: equivalent IPv6 spellings are not canonicalized -------
     # Documented rather than silently absent. ansible-core has no IP filter, and
