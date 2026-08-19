@@ -90,11 +90,22 @@
     - not (_relay_edge_normalized is match('^[0-9.]+$'))
     - not (':' in _relay_edge_normalized)
 
-- name: Extract the addresses the edge name resolves to
+# getent_hosts is keyed by the FIRST COLUMN of `getent hosts`, which is the ADDRESS,
+# with the names as the values: {'127.0.0.1': ['localhost']}. Taking values() alone
+# collected the names and never the address, so the comparison below could not match a
+# node IP — CI caught exactly that.
+#
+# Both halves are collected deliberately, and both are legitimate signals:
+#   * a KEY matching one of this node's IPs  -> the edge name resolves to the node;
+#   * a VALUE matching this node's hostname  -> the edge name is an alias of the node.
+# No IP-shaped filtering: a hostname made only of hex characters and dots would pass
+# such a filter anyway, and the names are wanted regardless.
+- name: Extract everything the edge name resolves to (addresses and names)
   set_fact:
     _relay_edge_resolved_addrs: >-
-      {{ ((_relay_edge_resolved.ansible_facts.getent_hosts | default({}, true)).values() | list | sum(start=[]))
-         | select('string') | map('lower') | list }}
+      {{ (((_relay_edge_resolved.ansible_facts.getent_hosts | default({}, true)).keys() | list)
+          + ((_relay_edge_resolved.ansible_facts.getent_hosts | default({}, true)).values() | list | sum(start=[])))
+         | select('string') | map('lower') | map('regex_replace', '[.]$', '') | list }}
   when: _relay_edge_resolved.ansible_facts is defined
 
 - name: Assert the relay edge name does not resolve back to this node

@@ -22,6 +22,8 @@
 #   (t) the resolves-back-to-the-node comparison, and its fail-OPEN behaviour when a
 #       name cannot be resolved (getent is absent on macOS controllers, and an edge may
 #       only resolve from the networks clients use).
+#   (t2) the getent_hosts RESULT SHAPE (keyed by address, names as values) — (t)
+#       covered the comparison and passed while the extraction was wrong.
 #   (u) the panel-token pre-flights fire whenever the registered path is effective.
 #   (s) STRUCTURAL: every Host-creation task file fetches the existing Hosts BEFORE
 #       its idempotency decision. Dropping that GET makes every run look like
@@ -1066,6 +1068,58 @@
         label: "{{ item.1.name }}"
       vars:
         _t_cases_ref: *t_cases
+
+    # --- (t2) the getent RESULT SHAPE, not just the comparison -----------------
+    # (t) tested the intersect and passed while the extraction was wrong: getent_hosts
+    # is keyed by the ADDRESS with names as values ({'127.0.0.1': ['localhost']}), and
+    # the first version collected values() only, so a node IP could never match. Testing
+    # the half that worked is the same mistake that made guard (s) vacuous — pin the
+    # shape assumption itself.
+    - name: Extract from the real getent_hosts shape
+      set_fact:
+        _t2_extract: >-
+          {{ (((item.shape | default({}, true)).keys() | list)
+              + ((item.shape | default({}, true)).values() | list | sum(start=[])))
+             | select('string') | map('lower') | map('regex_replace', '[.]$', '') | list }}
+      loop: &t2_cases
+        - name: "name resolving to the node"
+          shape: { "127.0.0.1": ["localhost"] }
+          node_addrs: ["127.0.0.1", "n1.example.test"]
+          reject: true
+        - name: "legitimate CDN edge"
+          shape: { "192.0.2.7": ["relay-edge.example.test"] }
+          node_addrs: ["203.0.113.10", "n1.example.test"]
+          reject: false
+        # An ALIAS of the node: the address differs but a name matches dns_hostname,
+        # which is equally a leak — hence collecting values as well as keys.
+        - name: "alias of the node's own hostname"
+          shape: { "203.0.113.10": ["n1.example.test", "alias.example.test"] }
+          node_addrs: ["n1.example.test"]
+          reject: true
+        - name: "nothing resolved"
+          shape: {}
+          node_addrs: ["203.0.113.10"]
+          reject: false
+      loop_control:
+        label: "{{ item.name }}"
+      register: _t2s
+
+    - name: Assert the extraction collects addresses AND names, and detects overlap
+      assert:
+        that:
+          - ((item.0.ansible_facts._t2_extract | intersect(item.1.node_addrs) | length) > 0) == (item.1.reject | bool)
+        fail_msg: >-
+          {{ item.1.name }}: extracted {{ item.0.ansible_facts._t2_extract }} vs node
+          {{ item.1.node_addrs }} -> overlap
+          {{ item.0.ansible_facts._t2_extract | intersect(item.1.node_addrs) }}, expected
+          reject={{ item.1.reject }}. Collecting only getent's values misses the address
+          and the check can never fire.
+        success_msg: "{{ item.1.name }} -> {{ 'REJECTED' if item.1.reject else 'allowed' }} (extracted {{ item.0.ansible_facts._t2_extract }})"
+      loop: "{{ _t2s.results | zip(_t2_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _t2_cases_ref: *t2_cases
 
     # --- (u) panel-token pre-flights follow the EFFECTIVE registered path ------
     # The token asserts live inside the Host and update_node task files, i.e. at the end
