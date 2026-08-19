@@ -782,6 +782,7 @@
         _cg: >-
           {{ [_chg.find('Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)'),
               _chg.find('Validate the relay endpoint is known before rotating'),
+              _chg.find("Assert the relay edge is not one of this node's own addresses (rotation)"),
               _chg.find('Require acknowledgement before deleting the old DNS name of a relay node')] }}
         _cm: >-
           {{ [_chg.find('Update persisted hostname file'),
@@ -795,6 +796,29 @@
           Rotation gates must precede the first mutation in
           tasks/change/remnawave_change.yml. gates {{ _cg }}, mutations {{ _cm }}.
         success_msg: "(n2) rotation gates precede the first mutation in change mode."
+
+    # --- (n3) all three modes enforce the anti-leak invariant -----------------
+    # change mode shipped without any node-address check at all: deploy and migrate
+    # had one, the rotation path did not, and the choke-point assert in
+    # create_relay_host.yml only fires after the DNS records are rewritten.
+    - name: Read tasks/main.yml
+      set_fact:
+        _mainy: "{{ lookup('file', playbook_dir ~ '/../tasks/main.yml') }}"
+
+    - name: Assert every mode includes the shared node-address definition
+      vars:
+        _incl: 'providers/remnawave/relay_node_addresses.yml'
+      assert:
+        that:
+          - _mainy.find(_incl) > 0
+          - _mig.find(_incl) > 0
+          - _chg.find(_incl) > 0
+        fail_msg: >-
+          A mode is missing the shared relay anti-leak definition
+          ({{ _incl }}): deploy={{ _mainy.find(_incl) }},
+          migrate={{ _mig.find(_incl) }}, change={{ _chg.find(_incl) }}. -1 means
+          that mode can publish the node's own address as the relay edge.
+        success_msg: "(n3) deploy, change and migrate all enforce the anti-leak invariant."
 
     # --- (o) squad membership is reconciled PER SQUAD -------------------------
     # The first version of this predicate flattened every squad's inbounds into one

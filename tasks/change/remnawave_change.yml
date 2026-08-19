@@ -216,6 +216,33 @@
       ((remnawave_relay_inbound_uuid | default('')) | length == 0)
       or ((remnawave_relay_sni | default('')) | length == 0)
 
+# The anti-leak invariant, enforced in this mode's pre-flight too. Rotation lets a
+# caller override the persisted endpoint (-e remnawave_relay_address=...), so the
+# same own-address mistake is reachable here — and create_relay_host.yml's
+# choke-point assert only fires after the DNS records have already been rewritten.
+# All three modes now check it before mutating anything.
+- name: Collect this node's own addresses (relay anti-leak pre-flight)
+  include_tasks: ../providers/remnawave/relay_node_addresses.yml
+  when: _change_relay_effective | default(false) | bool
+
+- name: Assert the relay edge is not one of this node's own addresses (rotation)
+  assert:
+    that:
+      - (_change_relay_address | default('')) not in (_relay_node_addresses | default([]))
+    fail_msg: |
+      The relay edge address ({{ _change_relay_address }}) is one of THIS NODE's own
+      addresses ({{ _relay_node_addresses | default([]) | join(', ') }}).
+
+      Rotating with that value would publish the node's own address to every
+      subscriber — an IP block kills it and the external proxy is bypassed, which is
+      the one thing the relay transport exists to prevent.
+
+      Point remnawave_relay_address at the proxy edge:
+        -e remnawave_relay_address=<proxy edge FQDN or IP>
+  when:
+    - _change_relay_effective | default(false) | bool
+    - (_change_relay_address | default('')) | length > 0
+
 # The manual-repoint gate. Rotation happens on the SAME machine, so the node's IP
 # does not move: if the proxy console's origin is that IP, nothing outside the
 # panel needs touching. If it holds the FQDN, change_delete_old_dns destroys the
