@@ -163,6 +163,67 @@
     - remnawave_bootstrap_relay | default(true) | bool
     - (remnawave_relay_inbound_uuid | default('')) | length > 0
 
+# --- Reconcile membership on squads that ALREADY existed ---------------------
+# The creates above are name-gated, so an existing squad was never touched — but a
+# squad's inbound membership can go stale independently of its name. Deleting and
+# reconciling an inbound mints a NEW uuid (a workflow this role documents, since
+# editing dest/serverNames on an existing tag is not reconciled), after which the
+# captured uuid and the generated deploy vars point nodes at the new inbound while
+# the FCP-bound squad still references the removed one — or none at all. Keys in
+# that mode then reach no node, silently.
+#
+# ADDITIVE on purpose: the desired inbound is appended to whatever the squad
+# already holds, rather than replacing membership wholesale, so an operator who
+# deliberately added extra inbounds by hand does not lose them.
+#
+# Contract verified against the panel OpenAPI: PATCH /api/internal-squads takes
+# { uuid, inbounds: [<uuid string>] }, and GET exposes current membership as
+# objects carrying .uuid. CI pins remnawave/backend:2.8.0 and the published spec is
+# newer, so the integration suite deliberately exercises this PATCH (it drops the
+# relay squad's membership and asserts this task restores it).
+- name: Plan squad membership reconciliation
+  set_fact:
+    _rw_squad_reconcile: >-
+      {{ [{'name': remnawave_bootstrap_fronted_squad_name, 'want': remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('')},
+          {'name': remnawave_bootstrap_reality_squad_name, 'want': remnawave_reality_inbound_uuid | default('')},
+          {'name': remnawave_bootstrap_relay_squad_name,   'want': remnawave_relay_inbound_uuid | default('')}]
+         | selectattr('want', 'ne', '')
+         | selectattr('name', 'in', (_rw_squads2 | map(attribute='name') | list))
+         | rejectattr('want', 'in', (_rw_squads2 | map(attribute='inbounds') | map('default', [], true)
+                                     | map('map', attribute='uuid') | map('list') | sum(start=[])))
+         | list }}
+  no_log: true
+
+- name: Note which squads need their inbound membership repaired
+  debug:
+    msg: >-
+      Repairing inbound membership on {{ _rw_squad_reconcile | length }} existing
+      squad(s): {{ _rw_squad_reconcile | map(attribute='name') | join(', ') }}.
+      Their bound inbound was missing — most likely the inbound was deleted and
+      re-created, which mints a new uuid.
+  when: _rw_squad_reconcile | length > 0
+
+- name: Repair inbound membership on existing squads (additive PATCH)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', item.name) | list | first).uuid }}"
+      inbounds: >-
+        {{ ((_rw_squads2 | selectattr('name', 'equalto', item.name) | list | first).inbounds
+            | default([], true) | map(attribute='uuid') | list) + [item.want] }}
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  loop: "{{ _rw_squad_reconcile | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+
 - name: Summarize squad creation
   debug:
     msg:

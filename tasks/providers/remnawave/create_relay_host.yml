@@ -115,14 +115,32 @@
       {{ (_remnawave_relay_hosts | selectattr('remark', 'equalto', random_hostname ~ '-relay')
           | list | first) | default({}, true) }}
 
-- name: Detect endpoint drift on the existing relay Host
+# The Host's inbound binding drifts independently of its endpoint: deleting and
+# reconciling the relay inbound mints a NEW configProfileInboundUuid (a workflow
+# this role documents, since editing dest/serverNames on an existing tag is not
+# reconciled). The node would then activate the new inbound while the Host still
+# referenced the old one, so subscriptions point at a stale binding.
+#
+# GET /api/hosts exposes it as inbound.{configProfileUuid,configProfileInboundUuid}
+# (verified against the panel OpenAPI). The comparison only claims drift when the
+# response ACTUALLY carries a value — an absent field must not read as a mismatch,
+# or the Host would be deleted and re-created on every single run.
+- name: Materialize the existing relay Host's inbound binding
+  set_fact:
+    _relay_existing_inbound: "{{ (_relay_existing.inbound | default({}, true)) if (_relay_existing.inbound is defined) else {} }}"
+
+- name: Detect drift on the existing relay Host (endpoint or inbound binding)
   set_fact:
     _relay_drift: >-
       {{ ((_relay_existing.uuid | default('')) | length > 0)
          and (((_relay_existing.address | default('')) != (remnawave_relay_address | default('')))
               or ((_relay_existing.port | default(0) | int) != (remnawave_relay_port | default(443, true) | int))
               or ((_relay_existing.sni | default('')) != (remnawave_relay_sni | default('')))
-              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome')))) }}
+              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome')))
+              or (((_relay_existing_inbound.configProfileInboundUuid | default('')) | length > 0)
+                  and ((_relay_existing_inbound.configProfileInboundUuid | default('')) != (remnawave_relay_inbound_uuid | default(''))))
+              or (((_relay_existing_inbound.configProfileUuid | default('')) | length > 0)
+                  and ((_relay_existing_inbound.configProfileUuid | default('')) != (remnawave_panel_config_profile_uuid | default(''))))) }}
 
 - name: Delete the stale relay Host before re-creating it (endpoint drift)
   uri:
@@ -141,7 +159,8 @@
     msg: >-
       Relay Host {{ random_hostname }}-relay is being re-created: its endpoint
       changed from {{ _relay_existing.address | default('?') }}:{{ _relay_existing.port | default('?') }}
-      (sni {{ _relay_existing.sni | default('?') }}) to
+      (sni {{ _relay_existing.sni | default('?') }}, inbound
+      {{ _relay_existing_inbound.configProfileInboundUuid | default('?') }}) to
       {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
       (sni {{ remnawave_relay_sni }}).
   when: _relay_drift | bool

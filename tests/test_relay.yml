@@ -606,6 +606,95 @@
       vars:
         _drift_cases_ref: *drift_cases
 
+    # --- (k2) drift also covers the Host's INBOUND binding --------------------
+    # Deleting and reconciling the relay inbound mints a new uuid (a documented
+    # workflow), after which the node activates the new inbound while an unchanged
+    # Host still references the old one. The subtlety: an ABSENT inbound field in
+    # the response must NOT read as drift, or the Host is destroyed and re-created
+    # on every run.
+    - name: Evaluate the inbound half of the drift decision
+      set_fact:
+        _inb_drift: >-
+          {{ (((item.existing_inbound.configProfileInboundUuid | default('')) | length > 0)
+              and ((item.existing_inbound.configProfileInboundUuid | default('')) != item.want_inbound))
+             or (((item.existing_inbound.configProfileUuid | default('')) | length > 0)
+                 and ((item.existing_inbound.configProfileUuid | default('')) != item.want_profile)) }}
+      loop: &inb_cases
+        - name: "inbound matches"
+          existing_inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "in-1" }
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: false
+        - name: "inbound uuid replaced"
+          existing_inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "in-OLD" }
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: true
+        - name: "config profile replaced"
+          existing_inbound: { configProfileUuid: "cp-OLD", configProfileInboundUuid: "in-1" }
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: true
+        # The churn guard: a panel that omits the field must not look like drift.
+        - name: "inbound absent from response"
+          existing_inbound: {}
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: false
+      loop_control:
+        label: "{{ item.name }}"
+      register: _inbs
+
+    - name: Assert inbound drift is detected but an absent field never churns
+      assert:
+        that:
+          - (item.0.ansible_facts._inb_drift | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: drift={{ item.0.ansible_facts._inb_drift }}, expected
+          {{ item.1.want }}. Missing it leaves subscriptions on a stale binding;
+          claiming it on an absent field re-creates the Host on every run.
+        success_msg: "{{ item.1.name }} -> drift={{ item.1.want }}"
+      loop: "{{ _inbs.results | zip(_inb_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _inb_cases_ref: *inb_cases
+
+    # --- (m) change mode refuses contradictory transports too -----------------
+    # Deploy and migrate both reject relay alongside another :443 transport; change
+    # was missing direct Reality, and change runs BOTH Host includes — so the
+    # rotation published a Reality Host pointing at the node's own hostname.
+    - name: Evaluate the rotation exclusion gate
+      set_fact:
+        _rot_refused: >-
+          {{ (item.relay | bool)
+             and ((item.caddy | bool) or (item.reality | bool) or (item.cdn == 'fastly')) }}
+      loop: &rot_cases
+        - { name: "relay rotation, clean",        relay: true,  caddy: false, reality: false, cdn: none,   want: false }
+        - { name: "relay rotation + caddy",       relay: true,  caddy: true,  reality: false, cdn: none,   want: true  }
+        - { name: "relay rotation + reality",     relay: true,  caddy: false, reality: true,  cdn: none,   want: true  }
+        - { name: "relay rotation + fastly",      relay: true,  caddy: false, reality: false, cdn: fastly, want: true  }
+        - { name: "reality rotation (no relay)",  relay: false, caddy: false, reality: true,  cdn: none,   want: false }
+        - { name: "caddy rotation (no relay)",    relay: false, caddy: true,  reality: false, cdn: fastly, want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _rots
+
+    - name: Assert the rotation gate matches deploy and migrate exclusivity
+      assert:
+        that:
+          - (item.0.ansible_facts._rot_refused | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: refused={{ item.0.ansible_facts._rot_refused }},
+          expected {{ item.1.want }}. All three modes must agree on exclusivity, or
+          a rotation can build a node deploy would have refused.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _rots.results | zip(_rot_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _rot_cases_ref: *rot_cases
+
     # --- (l) migrate refuses contradictory effective transports ---------------
     # The effective facts are OR-combined (caller flag OR source detection), so
     # inventory enabling Caddy/Reality on top of a detected relay source makes both

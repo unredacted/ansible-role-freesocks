@@ -107,6 +107,76 @@
           Bootstrap should create + bind all three shared squads (FreeSocks-Fastly
           / FreeSocks-Reality / FreeSocks-Relay) into their own FCP pools.
 
+    # --- exercise the squad membership repair against the REAL panel ----------
+    # This introduces a PATCH /api/internal-squads call. The contract is verified
+    # against the published OpenAPI, but CI pins remnawave/backend:2.8.0 while that
+    # spec is newer — so prove it here rather than trusting it. Dropping the
+    # membership uses the same PATCH, making this self-proving: a wrong contract
+    # fails on the very first step.
+    - name: Materialize the relay squad
+      set_fact:
+        _t1_relay_squad: >-
+          {{ (_t1_state.results[0].json.response.internalSquads
+              | selectattr('name', 'equalto', 'FreeSocks-Relay') | list | first) | default({}, true) }}
+
+    - name: Strip the relay squad's inbound membership (simulate a replaced inbound)
+      uri:
+        url: "{{ remnawave_panel_url }}/api/internal-squads"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ remnawave_panel_api_token }}"
+          Content-Type: "application/json"
+          Accept: "application/json"
+        body_format: json
+        body:
+          uuid: "{{ _t1_relay_squad.uuid }}"
+          inbounds: []
+        status_code: [200]
+
+    - name: Confirm the membership really is empty before the repair
+      uri:
+        url: "{{ remnawave_panel_url }}/api/internal-squads"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t1_stripped
+    - name: Assert the strip took effect (otherwise the repair proves nothing)
+      assert:
+        that:
+          - ((_t1_stripped.json.response.internalSquads | selectattr('name', 'equalto', 'FreeSocks-Relay')
+              | list | first).inbounds | default([], true) | length) == 0
+        fail_msg: "Could not empty the relay squad's membership — PATCH contract drift on this panel version."
+
+    - name: Re-run squad creation (must repair membership, not just skip on name)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_squad
+
+    - name: Read the squads back after the repair
+      uri:
+        url: "{{ remnawave_panel_url }}/api/internal-squads"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t1_repaired
+    - name: Materialize the repaired membership
+      set_fact:
+        _t1_relay_members: >-
+          {{ (_t1_repaired.json.response.internalSquads | selectattr('name', 'equalto', 'FreeSocks-Relay')
+              | list | first).inbounds | default([], true) | map(attribute='uuid') | list }}
+        _t1_relay_squad_count: >-
+          {{ _t1_repaired.json.response.internalSquads | selectattr('name', 'equalto', 'FreeSocks-Relay') | list | length }}
+
+    - name: Assert the existing squad was repaired rather than skipped or duplicated
+      assert:
+        that:
+          - _t1_relay_members | length == 1
+          - _t1_relay_members[0] == remnawave_relay_inbound_uuid
+          # Name-gated create must not have made a second squad.
+          - (_t1_relay_squad_count | int) == 1
+        fail_msg: >-
+          Relay squad membership was not repaired (members={{ _t1_relay_members }},
+          squads={{ _t1_relay_squad_count }}). An existing squad whose bound inbound
+          went missing leaves freedom-reality keys unable to reach any node.
+
 - name: Integration — phase 2 (node 1, shared model — no clones/squads/appends)
   hosts: localhost
   connection: local

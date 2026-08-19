@@ -160,15 +160,31 @@
 # block and never run here, so relay's invariants have to be re-asserted. All of
 # these fail BEFORE the new hostname is generated and long before cleanup_hosts
 # runs, so a bad invocation can never delete the old Host without a replacement.
-- name: Validate relay is not combined with Caddy or Fastly (rotation)
+# Deploy and migrate both refuse relay alongside another :443 transport; this
+# rotation path has to as well. Direct Reality was the gap: change runs BOTH the
+# Reality Host include and the relay Host include, so a contradictory rotation
+# published a Reality Host pointing at dns_hostname — the node's own origin —
+# defeating the relay's whole reason for existing.
+- name: Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)
   fail:
     msg: |
-      This node is a relay node but remnawave_caddy_enabled=true and/or the
-      target domain's cdn_provider is fastly. Relay terminates REALITY on the
-      node itself and contends for :443; Fastly cannot forward raw TCP.
+      This node is a relay node but the rotation also enables another :443
+      transport:
+
+        caddy   : {{ remnawave_caddy_enabled | default(false) }}
+        reality : {{ remnawave_reality_enabled | default(false) }}
+        cdn     : {{ effective_cdn_provider | default('none') }}
+
+      Relay terminates REALITY on the node itself and contends for :443 with both
+      Caddy and direct Reality; Fastly cannot forward raw TCP. A direct Reality
+      Host would also advertise this node's own hostname to subscribers, which is
+      exactly what the relay exists to avoid.
   when:
     - _change_relay_effective | bool
-    - (remnawave_caddy_enabled | default(false) | bool) or (effective_cdn_provider | default('none') == 'fastly')
+    - >-
+      (remnawave_caddy_enabled | default(false) | bool)
+      or (remnawave_reality_enabled | default(false) | bool)
+      or (effective_cdn_provider | default('none') == 'fastly')
 
 - name: Validate the relay endpoint is known before rotating
   fail:
