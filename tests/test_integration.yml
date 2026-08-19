@@ -458,16 +458,56 @@
           address={{ _t3b_relay_host.address | default('(none)') }},
           port={{ _t3b_relay_host.port | default('(none)') }}).
 
-    - name: Assert the .relay_address marker is written (migrate detection depends on it)
+    # The marker is written by setup/remnawave.yml, which these task-level phases
+    # never run (they include individual files via tasks_from). So mirror the write
+    # exactly as that file does — same pattern as the active-inbound derivation
+    # above — and then round-trip it through migrate.yml's PARSE expressions.
+    #
+    # This closes a real gap: tests/test_relay.yml section (c) parses hand-written
+    # fixtures, so nothing otherwise proves those fixtures are shaped like what the
+    # role actually writes. Here the writer and the reader meet.
+    - name: Persist the relay endpoint the way setup/remnawave.yml does
+      copy:
+        content: |
+          address={{ remnawave_relay_address }}
+          port={{ remnawave_relay_port | default(443) | int }}
+        dest: "{{ remnawave_node_install_dir }}/.relay_address"
+        mode: '0640'
+      become: "{{ remnawave_persist_become | default(true) }}"
+
+    - name: Detect + read the marker the way migrate.yml does
       stat:
         path: "{{ remnawave_node_install_dir }}/.relay_address"
       register: _t3b_marker
-    - name: Marker must exist
+    - name: Slurp the marker
+      slurp:
+        src: "{{ remnawave_node_install_dir }}/.relay_address"
+      register: _t3b_raw
+      failed_when: false
+    - name: Materialize the marker text (as migrate.yml does)
+      set_fact:
+        _t3b_text: >-
+          {{ (_t3b_raw.content | b64decode) if _t3b_raw.content is defined else '' }}
+    - name: Parse the endpoint with migrate.yml's expressions
+      set_fact:
+        _t3b_addr: >-
+          {{ (_t3b_text | regex_search('^address=.+', multiline=true) | default('', true)) | regex_replace('^address=', '') }}
+        _t3b_port: >-
+          {{ (_t3b_text | regex_search('^port=[0-9]+', multiline=true) | default('', true)) | regex_replace('^port=', '') }}
+
+    - name: Assert the marker round-trips through the migrate parse expressions
       assert:
-        that: [_t3b_marker.stat.exists]
+        that:
+          # Existence is the authoritative relay signal — without it migrate
+          # mis-detects this node as direct Reality (it has no Caddyfile either).
+          - _t3b_marker.stat.exists
+          - _t3b_addr == 'relay-edge.example.test'
+          - _t3b_port == '8443'
         fail_msg: >-
-          .relay_address was not persisted — migrate would then mis-detect this
-          node as a direct Reality node (it has no Caddyfile either).
+          The .relay_address marker did not round-trip: exists={{ _t3b_marker.stat.exists }},
+          parsed address='{{ _t3b_addr | default('') }}' port='{{ _t3b_port | default('') }}'.
+          The format setup/remnawave.yml writes and the expressions migrate.yml
+          reads it with have drifted apart.
 
 - name: Integration — phase 4 (teardown node 1; shared state untouched)
   hosts: localhost
@@ -591,12 +631,13 @@
         headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
         return_content: yes
       register: _t4b_hosts_raw
-    - name: Assert the relay Host is gone
-      vars:
+    - name: Materialize the remarks after relay teardown
+      set_fact:
         _t4b_remarks: >-
           {{ (_t4b_hosts_raw.json.response['hosts']
               if (_t4b_hosts_raw.json.response is mapping and 'hosts' in _t4b_hosts_raw.json.response)
               else _t4b_hosts_raw.json.response) | map(attribute='remark') | list }}
+    - name: Assert the relay Host is gone
       assert:
         that:
           - "'ci-node-relay-relay' not in _t4b_remarks"
