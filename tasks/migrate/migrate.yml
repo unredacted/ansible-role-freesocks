@@ -336,6 +336,28 @@
       or (_migrate_reality_effective | bool)
       or (effective_cdn_provider | default('none') == 'fastly')
 
+# The panel token is required by every task the registered path runs (Host create,
+# cleanup, update_node). Detection can turn that path on without the caller passing a
+# token — a source with .node_uuid and an invocation that omits it — and the token
+# asserts live inside those task files, i.e. at the END of the migration. Failing there
+# leaves the source stopped, the destination running, DNS repointed, and a retry blocked
+# by the clean-destination check. Check it here instead.
+- name: Validate the panel token is available for the registered path
+  assert:
+    that:
+      - (remnawave_panel_api_token | default('')) | length > 0
+    fail_msg: >-
+      This migration will use the panel API — either remnawave_panel_register_node was
+      passed, or a .node_uuid was found on the source — but remnawave_panel_api_token is
+      empty. Host creation, Host cleanup and the node address PATCH all need it, and
+      they run after the transfer, so discovering this later would strand the node.
+      Pass the token (vault it) and re-run.
+  no_log: true
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_register_node_effective | bool
+
 - name: Validate the Reality inbound UUID is available before touching Hosts
   fail:
     msg: |

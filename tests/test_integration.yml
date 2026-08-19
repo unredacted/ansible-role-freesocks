@@ -107,6 +107,35 @@
           Bootstrap should create + bind all three shared squads (FreeSocks-Fastly
           / FreeSocks-Reality / FreeSocks-Relay) into their own FCP pools.
 
+    # --- prove the relay anti-leak resolution check on a host that HAS getent --
+    # assert_relay_edge.yml resolves the proposed edge name and rejects it if it comes
+    # back as one of the node's own addresses. That path cannot be exercised on a macOS
+    # controller (no getent) and CI's own edge name does not resolve, so drive it
+    # explicitly here: 'localhost' resolves to 127.0.0.1, which this invocation places
+    # in the node address set. No panel needed.
+    - name: The resolution check must reject a name that resolves back to the node
+      block:
+        - include_role:
+            name: "{{ playbook_dir | dirname | basename }}"
+            tasks_from: providers/remnawave/assert_relay_edge
+          vars:
+            dns_hostname: "127.0.0.1"
+            _relay_edge_candidate: "localhost"
+        - name: Unexpected acceptance
+          fail:
+            msg: >-
+              assert_relay_edge accepted 'localhost' while 127.0.0.1 was in the node
+              address set — the resolves-back-to-the-node check is not working.
+      rescue:
+        - name: Assert it failed for the RIGHT reason
+          assert:
+            that:
+              - "'RESOLVES to this node' in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              assert_relay_edge failed, but not on the resolution check:
+              {{ ansible_failed_result.msg | default('?') }}
+            success_msg: "Relay anti-leak resolution check rejected a name resolving back to the node."
+
     # --- exercise the squad membership repair against the REAL panel ----------
     # This introduces a PATCH /api/internal-squads call. The contract is verified
     # against the published OpenAPI, but CI pins remnawave/backend:2.8.0 while that

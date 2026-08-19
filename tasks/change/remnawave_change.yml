@@ -177,6 +177,25 @@
 # Reality Host include and the relay Host include, so a contradictory rotation
 # published a Reality Host pointing at dns_hostname — the node's own origin —
 # defeating the relay's whole reason for existing.
+# Same reasoning as migrate: a persisted .node_uuid turns the registered path on
+# without the caller passing a token, and the token asserts live inside the Host/
+# update_node task files — reached only after new DNS records and the .hostname /
+# .node_name rewrites. After that failure a retry reads the NEW name as the old one, so
+# neither the original Host nor the old DNS record can be selected for cleanup again.
+- name: Validate the panel token is available for the registered path (rotation)
+  assert:
+    that:
+      - (remnawave_panel_api_token | default('')) | length > 0
+    fail_msg: >-
+      This rotation will use the panel API — either remnawave_panel_register_node was
+      passed, or a .node_uuid was found on disk — but remnawave_panel_api_token is empty.
+      Host creation, Host cleanup and the node address PATCH all need it, and they run
+      after DNS and the on-disk hostname have been rewritten, so discovering this later
+      leaves the old Host and old DNS record unreachable for cleanup. Pass the token
+      (vault it) and re-run.
+  no_log: true
+  when: _change_register_node_effective | bool
+
 - name: Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)
   fail:
     msg: |

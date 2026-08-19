@@ -61,3 +61,70 @@
 
       For a genuinely direct node, use remnawave_reality_enabled=true rather than
       pointing a relay at itself.
+
+# --- Best-effort: does the proposed edge NAME resolve back to this node? ------
+# The comparison above is textual, so an alternate name or a CNAME pointing at the
+# node passes it while clients still resolve and dial the origin directly — the exact
+# exposure this file exists to prevent, reached by a plausible DNS misconfiguration
+# (pointing the "edge" record at the node instead of the proxy).
+#
+# Deliberately BEST-EFFORT, and the limits are real:
+#   * resolution here is not necessarily what a client sees — split-horizon, GeoDNS
+#     and anycast all mean a pass does NOT prove clients cannot reach the origin;
+#   * getent returns what nsswitch gives, which may be a single address rather than
+#     the full RRset.
+# So it fails ONLY on a positive match and never on an inability to resolve: a name
+# that cannot be looked up here proceeds, with a note. Uses ansible.builtin.getent
+# rather than a dig lookup so no new collection dependency is introduced
+# (requirements.yml carries community.docker only).
+- name: Resolve the proposed relay edge name (best effort)
+  getent:
+    database: hosts
+    key: "{{ _relay_edge_normalized }}"
+  register: _relay_edge_resolved
+  failed_when: false
+  changed_when: false
+  when:
+    - (_relay_edge_normalized | length) > 0
+    # Literal IPs are already covered textually above; nothing to resolve.
+    - not (_relay_edge_normalized is match('^[0-9.]+$'))
+    - not (':' in _relay_edge_normalized)
+
+- name: Extract the addresses the edge name resolves to
+  set_fact:
+    _relay_edge_resolved_addrs: >-
+      {{ ((_relay_edge_resolved.ansible_facts.getent_hosts | default({}, true)).values() | list | sum(start=[]))
+         | select('string') | map('lower') | list }}
+  when: _relay_edge_resolved.ansible_facts is defined
+
+- name: Assert the relay edge name does not resolve back to this node
+  assert:
+    that:
+      - (_relay_edge_resolved_addrs | default([])) | intersect(_relay_node_addresses) | length == 0
+    fail_msg: |
+      The relay edge name {{ _relay_edge_candidate }} RESOLVES to this node.
+
+        resolves to      : {{ _relay_edge_resolved_addrs | default([]) | join(', ') }}
+        this node's addrs: {{ _relay_node_addresses | join(', ') }}
+        overlap          : {{ (_relay_edge_resolved_addrs | default([])) | intersect(_relay_node_addresses) | join(', ') }}
+
+      Clients would resolve that name and dial the node directly, bypassing the
+      external L4 proxy and publishing the origin — the same exposure as naming the
+      node outright, just one DNS hop away.
+
+      The edge record should point at the proxy (an A/AAAA or CNAME to the provider's
+      edge), not at this node.
+  when: (_relay_edge_resolved_addrs | default([])) | length > 0
+
+- name: Note that the relay edge name could not be resolved here
+  debug:
+    msg: >-
+      Could not resolve {{ _relay_edge_candidate }} from this host, so the
+      resolves-back-to-the-node check was skipped (the textual checks above still
+      applied). This is not a failure — an edge name may be resolvable only from the
+      networks clients use. Confirm by hand that it points at the proxy, not the node.
+  when:
+    - (_relay_edge_normalized | length) > 0
+    - not (_relay_edge_normalized is match('^[0-9.]+$'))
+    - not (':' in _relay_edge_normalized)
+    - (_relay_edge_resolved_addrs | default([])) | length == 0

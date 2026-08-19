@@ -19,6 +19,10 @@
 #       mutating task. This ordering has been got wrong twice, and a comment does
 #       not enforce it — a gate that runs after the transfer strands the node
 #       instead of refusing the run.
+#   (t) the resolves-back-to-the-node comparison, and its fail-OPEN behaviour when a
+#       name cannot be resolved (getent is absent on macOS controllers, and an edge may
+#       only resolve from the networks clients use).
+#   (u) the panel-token pre-flights fire whenever the registered path is effective.
 #   (s) STRUCTURAL: every Host-creation task file fetches the existing Hosts BEFORE
 #       its idempotency decision. Dropping that GET makes every run look like
 #       "nothing exists", so re-runs duplicate Hosts instead of replacing them.
@@ -760,6 +764,7 @@
       set_fact:
         _gates_at: >-
           {{ [_mig.find('Fail on contradictory effective transports for the destination'),
+              _mig.find('Validate the panel token is available for the registered path'),
               _mig.find('Validate the relay endpoint is known before migrating'),
               _mig.find('Assert the relay edge is not one of the destination'),
               _mig.find('Require acknowledgement that the relay proxy will be re-pointed')] }}
@@ -790,7 +795,8 @@
     - name: Assert the rotation gates precede the first mutation
       vars:
         _cg: >-
-          {{ [_chg.find('Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)'),
+          {{ [_chg.find('Validate the panel token is available for the registered path (rotation)'),
+              _chg.find('Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)'),
               _chg.find('Validate the relay endpoint is known before rotating'),
               _chg.find("Assert the relay edge is not one of this node's own addresses (rotation)"),
               _chg.find('Require acknowledgement before deleting the old DNS name of a relay node')] }}
@@ -1026,6 +1032,76 @@
           A -1 means the GET or the decision marker is missing — without the GET every
           run looks like "nothing exists" and re-runs duplicate Hosts.
         success_msg: "(s) all three Host-creation files fetch existing Hosts before deciding."
+
+    # --- (t) resolves-back-to-the-node comparison + fail-open ------------------
+    # The positive path needs getent, which macOS controllers lack, so the integration
+    # suite drives it for real on the Ubuntu runner. Here we pin the decision logic and
+    # — just as importantly — that an UNRESOLVABLE name proceeds rather than failing:
+    # split-horizon and client-only-resolvable edges are legitimate.
+    - name: Evaluate the resolution comparison
+      set_fact:
+        _t_reject: >-
+          {{ ((item.resolved | default([])) | intersect(item.node_addrs) | length) > 0 }}
+      loop: &t_cases
+        - { name: "edge resolves to the CDN",      resolved: ["192.0.2.7", "192.0.2.8"], node_addrs: ["203.0.113.10"], want: false }
+        - { name: "edge CNAME'd to the node",      resolved: ["203.0.113.10"],           node_addrs: ["203.0.113.10"], want: true  }
+        - { name: "edge resolves to node + CDN",   resolved: ["192.0.2.7", "203.0.113.10"], node_addrs: ["203.0.113.10"], want: true }
+        # Unresolvable / getent missing: empty list -> no rejection (fail OPEN).
+        - { name: "name could not be resolved",    resolved: [],                          node_addrs: ["203.0.113.10"], want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _ts
+
+    - name: Assert the check rejects only a genuine overlap, and never fails closed
+      assert:
+        that:
+          - (item.0.ansible_facts._t_reject | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: reject={{ item.0.ansible_facts._t_reject }}, expected
+          {{ item.1.want }}. Failing closed on an unresolvable name would block
+          legitimate edges that only resolve from client networks.
+        success_msg: "{{ item.1.name }} -> {{ 'REJECTED' if item.1.want else 'allowed' }}"
+      loop: "{{ _ts.results | zip(_t_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _t_cases_ref: *t_cases
+
+    # --- (u) panel-token pre-flights follow the EFFECTIVE registered path ------
+    # The token asserts live inside the Host and update_node task files, i.e. at the end
+    # of a lifecycle run. Detection can enable that path without the caller passing a
+    # token, so the pre-flight has to key on the effective fact, not the raw flag.
+    - name: Evaluate the token pre-flight gate
+      set_fact:
+        _u_fires: >-
+          {{ ((item.flag | bool) or ((item.uuid | default('')) | length > 0))
+             and ((item.token | default('')) | length == 0) }}
+      loop: &u_cases
+        - { name: "flag set, token present",        flag: true,  uuid: "",     token: "t", want: false }
+        - { name: "flag set, token MISSING",        flag: true,  uuid: "",     token: "",  want: true  }
+        # The reported case: registration detected on disk, caller passed no token.
+        - { name: "uuid on disk, token MISSING",    flag: false, uuid: "u-1",  token: "",  want: true  }
+        - { name: "uuid on disk, token present",    flag: false, uuid: "u-1",  token: "t", want: false }
+        # Unregistered node: the panel is never called, so no token is needed.
+        - { name: "no flag, no uuid, no token",     flag: false, uuid: "",     token: "",  want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _us
+
+    - name: Assert the token pre-flight fires exactly when the panel will be called
+      assert:
+        that:
+          - (item.0.ansible_facts._u_fires | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: fires={{ item.0.ansible_facts._u_fires }}, expected
+          {{ item.1.want }}. Missing it strands a lifecycle run after the mutations;
+          firing on an unregistered node blocks a legitimate one.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _us.results | zip(_u_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _u_cases_ref: *u_cases
 
     - name: Summary
       debug:

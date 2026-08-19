@@ -183,7 +183,32 @@
           Delete (or re-point) that proxy in your provider console. The role
           cannot do it. Its Hosts have already been removed from the panel, so no
           subscription still advertises this endpoint.
-      when: _update_relay_is_relay | default(false) | bool
+      when:
+        - _update_relay_is_relay | default(false) | bool
+        - remnawave_panel_api_token | default('') | length > 0
+
+    # Without a token the Host cleanup above was SKIPPED, so the previous message's
+    # claim would be false — and false in the dangerous direction, telling an operator
+    # no panel cleanup is needed while a live Host still advertises an endpoint whose
+    # origin is being destroyed.
+    - name: Warn that the relay Host is STILL LIVE (no panel token supplied)
+      debug:
+        msg: |
+          RELAY HOST STILL ADVERTISED — manual panel cleanup required.
+
+          No remnawave_panel_api_token was supplied, so this node's Hosts were NOT
+          removed from the panel. Every subscriber still receives:
+
+            remark      : {{ random_hostname }}-relay
+            proxy edge  : {{ _update_relay_address | default('(unknown)') }}:{{ _update_relay_port | default('443') }}
+
+          The origin behind that edge is being destroyed by this wipe, so the endpoint
+          is about to start failing for everyone holding it. Delete the Host in the
+          Panel UI (Hosts → find the '{{ random_hostname }}-' entries), then delete or
+          re-point the external proxy in your provider console.
+      when:
+        - _update_relay_is_relay | default(false) | bool
+        - remnawave_panel_api_token | default('') | length == 0
 
     - name: Delete node on Panel (when uuid + token known)
       include_tasks: ../providers/remnawave/delete_node.yml
