@@ -2,10 +2,16 @@
 # tasks/providers/remnawave/cleanup_hosts.yml
 #
 # Delete the Remnawave Hosts that belonged to the OLD hostname during a
-# hostname rotation (change) or migration. Hosts are matched by their exact
-# remark shape ("{old_random_hostname}-{transport}" / "-reality"); the NEW
-# Hosts are (re)created by create_hosts.yml under the new hostname. Tolerates
-# 404 (already gone).
+# hostname rotation (change), a migration, or a wipe. Hosts are matched by their
+# exact remark shape ("{old_random_hostname}-{transport}", where {transport} is
+# either a remnawave_cdn_transports name or one of the direct-transport labels
+# in remnawave_direct_transport_remarks); the NEW Hosts are (re)created by
+# create_hosts.yml / create_reality_host.yml / create_relay_host.yml under the
+# new hostname. Tolerates 404 (already gone).
+#
+# The direct-transport labels live in a DEFAULT rather than inline here so the
+# task and tests/test_relay.yml share one source of truth — this expression
+# previously hardcoded ['reality'] and silently orphaned every relay Host.
 #
 # Requires: old_random_hostname (the pre-rotation / source random part).
 
@@ -34,12 +40,25 @@
 # optional multi-edge 6-hex domain suffix) — a bare prefix match would also hit
 # a DIFFERENT node whose hostname extends this one (e.g. 'quiet-falcon' would
 # match 'quiet-falcon-2-ws').
+# Materialized via set_fact, NOT a task-level `vars:`: a second helper var here
+# would become a chained task-var, which mis-evaluates inside include_role
+# contexts under ansible-core 2.19+ lazy templating (CLAUDE.md HARD RULE) — it
+# would pass tests/run.sh and fail in production. A fact is also what makes this
+# pattern assertable from tests/test_relay.yml.
+#
+# old_random_hostname is regex_escape'd: it derives from custom_hostname, which
+# the role never validates, so an unescaped dot would match another node's
+# Hosts (custom_hostname 'a.b' matching 'axb-relay').
+- name: Build the OLD Host remark pattern
+  set_fact:
+    _old_remark_pattern: >-
+      ^{{ old_random_hostname | regex_escape }}-(({{ (remnawave_cdn_transports | default([]) | map(attribute='name') | list + (remnawave_direct_transport_remarks | default(['reality', 'relay']))) | join('|') }}))(-[0-9a-f]{6})?$
+  when:
+    - old_random_hostname is defined and old_random_hostname | length > 0
+
 - name: Select OLD Host UUIDs by exact remark match
   set_fact:
     _old_host_uuids: "{{ _remnawave_cleanup_hosts | selectattr('remark', 'match', _old_remark_pattern) | map(attribute='uuid') | list }}"
-  vars:
-    _old_remark_pattern: >-
-      ^{{ old_random_hostname }}-(({{ (remnawave_cdn_transports | default([]) | map(attribute='name') | list + ['reality']) | join('|') }}))(-[0-9a-f]{6})?$
   when:
     - old_random_hostname is defined and old_random_hostname | length > 0
     - remnawave_cleanup_hosts_list.json is defined

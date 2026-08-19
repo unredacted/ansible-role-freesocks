@@ -1,0 +1,267 @@
+---
+# tests/test_relay.yml
+#
+# Self-asserting tests for the RELAY transport (VLESS+REALITY behind an external
+# L4 proxy) — pure filter logic, NO API calls.
+#
+#   (a) the cleanup_hosts.yml remark-matching regex. This expression had NO
+#       coverage anywhere before relay was added, which is exactly how it came
+#       to hardcode ['reality'] and silently orphan relay Hosts. It is also not
+#       covered by tests/test_integration.yml: that suite calls cleanup_hosts
+#       but never CREATES a Host, so the regex ran against an empty candidate
+#       set and looked exercised.
+#   (b) the migrate source-capability truth table. Before relay,
+#       migrate_detected_reality fell back to "no Caddyfile on disk", which
+#       claims every relay node too (relay runs no Caddy either). The cases
+#       below pin the fix AND pin that legacy nodes still detect identically.
+#   (c) parsing the .relay_address marker file.
+#   (d) the change/migrate repoint gates. Rotating or moving a relay node changes
+#       the ORIGIN the manual proxy dials, and only a human can update the proxy
+#       console — so the gates decide when the role refuses to proceed.
+#
+# The label list is loaded from defaults/main.yml rather than restated, so the
+# task and this test cannot disagree about which transports get torn down. The
+# regex skeleton itself is mirrored from
+# tasks/providers/remnawave/cleanup_hosts.yml ("Build the OLD Host remark
+# pattern") — keep the two in step.
+#
+# Run: ansible-playbook tests/test_relay.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # One fixture list reused by every case below; only the pattern inputs vary.
+    _hosts_fixture:
+      - { uuid: "u-ws",          remark: "quiet-falcon-ws" }
+      - { uuid: "u-reality",     remark: "quiet-falcon-reality" }
+      - { uuid: "u-relay",       remark: "quiet-falcon-relay" }
+      - { uuid: "u-ws-sfx",      remark: "quiet-falcon-ws-a1b2c3" }
+      - { uuid: "u-relay-sfx",   remark: "quiet-falcon-relay-a1b2c3" }
+      # Must NOT match:
+      - { uuid: "x-other-node",  remark: "quiet-falcon-2-ws" }
+      - { uuid: "x-other-host",  remark: "other-node-relay" }
+      - { uuid: "x-suffixed",    remark: "quiet-falcon-relayx" }
+      - { uuid: "x-hex5",        remark: "quiet-falcon-relay-a1b2c" }
+      - { uuid: "x-hex7",        remark: "quiet-falcon-relay-a1b2c3d" }
+      - { uuid: "x-hexupper",    remark: "quiet-falcon-relay-A1B2C3" }
+      - { uuid: "x-bare",        remark: "quiet-falcon" }
+    _ws_transports:
+      - { name: ws, enabled: true }
+  tasks:
+    # --- (a) cleanup_hosts.yml remark regex ---------------------------------
+    - name: Load the role defaults (single source of truth for the labels)
+      include_vars:
+        file: ../defaults/main.yml
+        name: _role_defaults
+
+    - name: The direct-transport labels ship with relay included
+      assert:
+        that:
+          - "'reality' in _role_defaults.remnawave_direct_transport_remarks"
+          - "'relay' in _role_defaults.remnawave_direct_transport_remarks"
+        fail_msg: >-
+          remnawave_direct_transport_remarks must carry both direct transports —
+          a missing label means cleanup_hosts.yml never tears that transport's
+          Hosts down.
+        success_msg: "(a1) direct-transport labels: reality + relay."
+
+    - name: Build the remark pattern the way cleanup_hosts.yml does
+      set_fact:
+        _pat: >-
+          ^{{ 'quiet-falcon' | regex_escape }}-(({{ (_ws_transports | map(attribute='name') | list + _role_defaults.remnawave_direct_transport_remarks) | join('|') }}))(-[0-9a-f]{6})?$
+
+    - name: Select the matching Hosts
+      set_fact:
+        _matched: "{{ _hosts_fixture | selectattr('remark', 'match', _pat) | map(attribute='uuid') | list }}"
+
+    - name: Exactly the intended remarks match — nothing more, nothing less
+      assert:
+        that:
+          - _matched == ['u-ws', 'u-reality', 'u-relay', 'u-ws-sfx', 'u-relay-sfx']
+        fail_msg: >-
+          Unexpected remark match set: {{ _matched }}. relay/reality/ws (plus the
+          optional 6-lowercase-hex multi-edge suffix) must match; an extending
+          hostname ('quiet-falcon-2-ws'), a different hostname, a longer
+          transport name ('relayx'), and 5/7-char or uppercase hex must not.
+        success_msg: "(a2) remark regex matches ws/reality/relay + 6-hex suffix only."
+
+    # A caller that passes remnawave_cdn_transports: [] (a relay/Reality node is
+    # dedicated and may legitimately do this) must still tear down the DIRECT
+    # transports — they are literals, not derived from the transport list.
+    - name: Build the pattern with no CDN transports at all
+      set_fact:
+        _pat_nocdn: >-
+          ^{{ 'quiet-falcon' | regex_escape }}-(({{ ([] | map(attribute='name') | list + _role_defaults.remnawave_direct_transport_remarks) | join('|') }}))(-[0-9a-f]{6})?$
+
+    - name: Select with no CDN transports
+      set_fact:
+        _matched_nocdn: "{{ _hosts_fixture | selectattr('remark', 'match', _pat_nocdn) | map(attribute='uuid') | list }}"
+
+    - name: Direct transports survive an empty remnawave_cdn_transports
+      assert:
+        that:
+          - _matched_nocdn == ['u-reality', 'u-relay', 'u-relay-sfx']
+        fail_msg: >-
+          With remnawave_cdn_transports: [] the direct transports must still
+          match and the ws ones must drop. Got {{ _matched_nocdn }}.
+        success_msg: "(a3) empty cdn_transports: reality/relay still torn down, ws not."
+
+    # regex_escape: old_random_hostname derives from custom_hostname, which the
+    # role never validates. Unescaped, '.' is a wildcard and would reach another
+    # node's Hosts.
+    - name: Build the pattern for a dotted hostname
+      set_fact:
+        _pat_dotted: >-
+          ^{{ 'a.b' | regex_escape }}-(({{ (_ws_transports | map(attribute='name') | list + _role_defaults.remnawave_direct_transport_remarks) | join('|') }}))(-[0-9a-f]{6})?$
+
+    - name: Select against a dot-collision fixture
+      set_fact:
+        _matched_dotted: "{{ [{'uuid': 'ok', 'remark': 'a.b-relay'}, {'uuid': 'collide', 'remark': 'axb-relay'}] | selectattr('remark', 'match', _pat_dotted) | map(attribute='uuid') | list }}"
+
+    - name: A dot in the hostname is escaped, not treated as a wildcard
+      assert:
+        that:
+          - _matched_dotted == ['ok']
+        fail_msg: >-
+          regex_escape is missing: 'a.b' matched 'axb-relay', which belongs to a
+          different node. Got {{ _matched_dotted }}.
+        success_msg: "(a4) regex_escape prevents dot-wildcard cross-node matches."
+
+    # --- (b) migrate source-capability truth table ---------------------------
+    - name: Run the detection truth table
+      include_tasks: relay_detect_case.yml
+      loop:
+        # A pre-relay Reality node: no Caddy, no marker, no per-node squad file.
+        # This is the regression that matters most — it must stay Reality.
+        - { name: "legacy reality (shared squads)", caddyfile: false, marker: false, squads: "",
+            expect_caddy: false, expect_reality: true,  expect_relay: false }
+        - { name: "legacy caddy/ws",               caddyfile: true,  marker: false, squads: "",
+            expect_caddy: true,  expect_reality: false, expect_relay: false }
+        - { name: "legacy per-node reality",       caddyfile: false, marker: false, squads: "fronted=\nreality=abc-222\n",
+            expect_caddy: false, expect_reality: true,  expect_relay: false }
+        # Proves ^reality=\S does not fire on an EMPTY reality= value.
+        - { name: "legacy per-node ws",            caddyfile: true,  marker: false, squads: "fronted=abc-111\nreality=\n",
+            expect_caddy: true,  expect_reality: false, expect_relay: false }
+        # The bug being fixed: relay must NOT be detected as Reality.
+        - { name: "relay",                         caddyfile: false, marker: true,  squads: "",
+            expect_caddy: false, expect_reality: false, expect_relay: true }
+        # Contradictory evidence -> the role refuses rather than guessing.
+        - { name: "relay + caddy (contradiction)", caddyfile: true,  marker: true,  squads: "",
+            expect_caddy: true,  expect_reality: false, expect_relay: true, expect_contradiction: true }
+        - { name: "no squad file, caddy present",  caddyfile: true,  marker: false, squads: "",
+            expect_caddy: true,  expect_reality: false, expect_relay: false }
+      loop_control:
+        label: "{{ item.name }}"
+
+    # --- (c) .relay_address marker parsing -----------------------------------
+    # Mirrors "Materialize the source relay endpoint" in tasks/migrate/migrate.yml.
+    # Patterns are backslash-free by design: YAML block scalars pass backslashes
+    # through raw while double-quoted scalars consume them, so a \S-style pattern
+    # is silently style-dependent. The non-group regex_search form returns None
+    # rather than raising on no-match (the group form raises
+    # "'NoneType' object has no attribute 'group'").
+    - name: Parse every marker-file shape
+      set_fact:
+        _addr: >-
+          {{ (item.text | regex_search('^address=.+', multiline=true) | default('', true)) | regex_replace('^address=', '') }}
+        _port: >-
+          {{ (item.text | regex_search('^port=[0-9]+', multiline=true) | default('', true)) | regex_replace('^port=', '') }}
+      loop: &marker_cases
+        - { name: "normal",            text: "address=relay-edge.example.test\nport=8443\n", addr: "relay-edge.example.test", port: "8443" }
+        - { name: "no trailing NL",    text: "address=relay-edge.example.test\nport=8443",    addr: "relay-edge.example.test", port: "8443" }
+        - { name: "extra blank lines", text: "address=e.example.test\nport=443\n\n",         addr: "e.example.test",          port: "443" }
+        - { name: "address only",      text: "address=e.example.test\n",                      addr: "e.example.test",          port: "" }
+        - { name: "empty file",        text: "",                                              addr: "",                        port: "" }
+        - { name: "garbage",           text: "who knows\n",                                   addr: "",                        port: "" }
+        - { name: "IPv6 literal",      text: "address=2001:db8::1\nport=443\n",               addr: "2001:db8::1",             port: "443" }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _marker_parsed
+
+    - name: Every shape parses to the expected endpoint (and never raises)
+      assert:
+        that:
+          - item.0.ansible_facts._addr == item.1.addr
+          - item.0.ansible_facts._port == item.1.port
+        fail_msg: >-
+          {{ item.1.name }}: got address='{{ item.0.ansible_facts._addr }}'
+          port='{{ item.0.ansible_facts._port }}', expected
+          address='{{ item.1.addr }}' port='{{ item.1.port }}'.
+        success_msg: "{{ item.1.name }} -> address='{{ item.0.ansible_facts._addr }}' port='{{ item.0.ansible_facts._port }}'"
+      loop: "{{ _marker_parsed.results | zip(_marker_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _marker_cases_ref: *marker_cases
+
+    # --- (d) the change / migrate repoint gates -------------------------------
+    # change mode rotates on the SAME machine, so the node's IP does not move:
+    # an IP-origin proxy console keeps working and only an FQDN-origin one breaks
+    # — and it only breaks irrecoverably when change_delete_old_dns destroys the
+    # old name in the same run. So change hard-fails ONLY in that combination.
+    # migrate always moves machines, so it always requires the ack.
+    - name: Evaluate the repoint gates across every combination
+      set_fact:
+        _change_fails: >-
+          {{ (item.relay | bool) and (item.delete_old_dns | bool) and (not (item.ack | bool)) }}
+        _change_warns: >-
+          {{ (item.relay | bool) and (not (item.delete_old_dns | bool)) }}
+        _migrate_fails: >-
+          {{ (item.relay | bool) and (not (item.ack | bool)) }}
+      loop: &gate_cases
+        # Not a relay node: never gated, whatever the other flags say.
+        - { name: "non-relay, delete dns",     relay: false, delete_old_dns: true,  ack: false, cf: false, cw: false, mf: false }
+        - { name: "non-relay, keep dns",       relay: false, delete_old_dns: false, ack: false, cf: false, cw: false, mf: false }
+        # Relay, old name KEPT: recoverable, so warn only — but migrate still fails.
+        - { name: "relay, keep dns, no ack",   relay: true,  delete_old_dns: false, ack: false, cf: false, cw: true,  mf: true  }
+        # Relay, old name DELETED, unacknowledged: the irrecoverable case.
+        - { name: "relay, delete dns, no ack", relay: true,  delete_old_dns: true,  ack: false, cf: true,  cw: false, mf: true  }
+        # Acknowledged: change proceeds; migrate proceeds.
+        - { name: "relay, delete dns, ack",    relay: true,  delete_old_dns: true,  ack: true,  cf: false, cw: false, mf: false }
+        - { name: "relay, keep dns, ack",      relay: true,  delete_old_dns: false, ack: true,  cf: false, cw: true,  mf: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _gates
+
+    - name: Assert each gate fires exactly when it should
+      assert:
+        that:
+          - (item.0.ansible_facts._change_fails | bool) == (item.1.cf | bool)
+          - (item.0.ansible_facts._change_warns | bool) == (item.1.cw | bool)
+          - (item.0.ansible_facts._migrate_fails | bool) == (item.1.mf | bool)
+        fail_msg: >-
+          {{ item.1.name }}: change_fails={{ item.0.ansible_facts._change_fails }}
+          (want {{ item.1.cf }}), change_warns={{ item.0.ansible_facts._change_warns }}
+          (want {{ item.1.cw }}), migrate_fails={{ item.0.ansible_facts._migrate_fails }}
+          (want {{ item.1.mf }}).
+        success_msg: "{{ item.1.name }} -> change_fail={{ item.1.cf }} change_warn={{ item.1.cw }} migrate_fail={{ item.1.mf }}"
+      loop: "{{ _gates.results | zip(_gate_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _gate_cases_ref: *gate_cases
+
+    # Blast-radius check: map through `bool` first — a set_fact from a block scalar
+    # can surface as the STRING "False", which select('equalto', True) would miss,
+    # making this assert silently vacuous.
+    - name: The gates fire on exactly the intended number of cases
+      vars:
+        _cf: "{{ _gates.results | map(attribute='ansible_facts._change_fails') | map('bool') | select | list }}"
+        _mf: "{{ _gates.results | map(attribute='ansible_facts._migrate_fails') | map('bool') | select | list }}"
+      assert:
+        that:
+          # Only "relay + delete old DNS + no ack" is irrecoverable.
+          - _cf | length == 1
+          # migrate always needs the ack, so both unacknowledged relay cases fail.
+          - _mf | length == 2
+        fail_msg: >-
+          Gates fired on {{ _cf | length }} change / {{ _mf | length }} migrate
+          cases (want 1 / 2). A gate that fires too broadly blocks ordinary
+          Reality and WS rotations; too narrowly and a relay node breaks silently.
+        success_msg: "(d) repoint gates fire on exactly the intended cases (1 change, 2 migrate)."
+
+    - name: Summary
+      debug:
+        msg: >-
+          relay: cleanup_hosts remark regex, migrate detection truth table,
+          .relay_address parsing, and the change/migrate repoint gates all verified.

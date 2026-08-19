@@ -1,0 +1,48 @@
+---
+# tests/relay_detect_case.yml
+#
+# One case of the migrate source-capability truth table. NOT named test_*.yml on
+# purpose: tests/run.sh globs test_*.yml and would try to run this as a playbook.
+# Included with `loop:` from tests/test_relay.yml.
+#
+# Mirrors the DERIVATION SHAPE of tasks/migrate/migrate.yml ("Derive the detected
+# relay capability on source" + "Derive the remaining detected Remnawave
+# capabilities on source"). The split into two set_fact tasks is the point of the
+# exercise: migrate_detected_reality reads migrate_detected_relay, and
+# cross-referencing keys inside a single set_fact mis-evaluates under
+# ansible-core 2.19+ lazy templating (CLAUDE.md HARD RULE). A one-task version
+# of this helper would assert behaviour the role cannot actually produce.
+#
+# Case fields: name, caddyfile (bool), marker (bool), squads (str),
+#              expect_caddy / expect_reality / expect_relay (bool)
+
+- name: "Derive relay ({{ item.name }})"
+  set_fact:
+    _d_relay: "{{ item.marker | bool }}"
+
+- name: "Derive caddy + reality ({{ item.name }})"
+  set_fact:
+    _d_caddy: "{{ item.caddyfile | bool }}"
+    _d_reality: >-
+      {{ ((item.squads is search('^reality=\S', multiline=true))
+          or ((not (item.caddyfile | bool))
+              and (not (_d_relay | bool)))) }}
+
+- name: "Derive the contradiction guard ({{ item.name }})"
+  set_fact:
+    _d_contradiction: "{{ (_d_relay | bool) and (item.caddyfile | bool) }}"
+
+- name: "Assert detection ({{ item.name }})"
+  assert:
+    that:
+      - (_d_caddy | bool) == (item.expect_caddy | bool)
+      - (_d_reality | bool) == (item.expect_reality | bool)
+      - (_d_relay | bool) == (item.expect_relay | bool)
+      - (_d_contradiction | bool) == (item.expect_contradiction | default(false) | bool)
+    fail_msg: >-
+      {{ item.name }}: got caddy={{ _d_caddy }} reality={{ _d_reality }}
+      relay={{ _d_relay }} contradiction={{ _d_contradiction }}; expected
+      caddy={{ item.expect_caddy }} reality={{ item.expect_reality }}
+      relay={{ item.expect_relay }}
+      contradiction={{ item.expect_contradiction | default(false) }}.
+    success_msg: "{{ item.name }} -> caddy={{ _d_caddy }} reality={{ _d_reality }} relay={{ _d_relay }}"

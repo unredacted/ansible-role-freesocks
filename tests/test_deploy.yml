@@ -45,7 +45,7 @@
     # gateway — the node container runs on the RUNNER's host network.
     remnawave_node_address: "host.docker.internal"
     remnawave_reality_enabled: true
-    remnawave_reality_sni: "dl.google.com"
+    remnawave_reality_sni: "decoy-direct.example"
     # remnawave_reality_inbound_uuid + remnawave_panel_config_profile_uuid +
     # remnawave_cdn_transports come from the bootstrap output (vars_files below);
     # the shared model activates the BASE inbounds verbatim (no per-node clones).

@@ -368,6 +368,62 @@
         - remnawave_reality_enabled | default(false) | bool
         - (remnawave_caddy_enabled | default(false) | bool) or (effective_cdn_provider | default('none') == 'fastly')
 
+    # Relay transport validation (VLESS+REALITY behind a MANUAL external L4 proxy)
+    - name: Validate relay requires Remnawave + node registration
+      fail:
+        msg: |
+          remnawave_relay_enabled=true requires remnawave_enabled=true and
+          remnawave_panel_register_node=true (the role creates the relay Host
+          via the panel API).
+      when:
+        - remnawave_relay_enabled | default(false) | bool
+        - not (remnawave_enabled | default(false) | bool and remnawave_panel_register_node | default(false) | bool)
+
+    - name: Validate the relay inbound UUID, edge address and SNI are set
+      fail:
+        msg: |
+          remnawave_relay_enabled=true requires:
+            remnawave_relay_inbound_uuid  the VLESS_REALITY_RELAY inbound from the
+                                          Config Profile (operation_mode=bootstrap
+                                          writes it into remnawave_bootstrap_output_file)
+            remnawave_relay_address       the EXTERNAL L4 proxy's edge (FQDN or IP)
+                                          that clients dial — NOT this node
+            remnawave_relay_sni           a serverName the relay inbound borrows
+      when:
+        - remnawave_relay_enabled | default(false) | bool
+        - >-
+          (remnawave_relay_inbound_uuid | default('') | length == 0)
+          or (remnawave_relay_address | default('') | length == 0)
+          or (remnawave_relay_sni | default('') | length == 0)
+
+    - name: Validate relay, Caddy, direct Reality and Fastly are mutually exclusive
+      fail:
+        msg: |
+          remnawave_relay_enabled=true cannot be combined with
+          remnawave_caddy_enabled=true or remnawave_reality_enabled=true (all
+          three contend for the node's :443), nor with a Fastly CDN (an L4 relay
+          has no Caddy origin to front, and Fastly cannot forward raw TCP).
+          A relay node is DEDICATED: Caddy off, direct Reality off, and the
+          domain's cdn_provider set to none.
+      when:
+        - remnawave_relay_enabled | default(false) | bool
+        - >-
+          (remnawave_caddy_enabled | default(false) | bool)
+          or (remnawave_reality_enabled | default(false) | bool)
+          or (effective_cdn_provider | default('none') == 'fastly')
+
+    - name: Validate relay is incompatible with legacy per-node placement
+      fail:
+        msg: |
+          remnawave_relay_enabled=true cannot be combined with
+          remnawave_per_node_placement=true — the legacy placement planner
+          (providers/remnawave/create_node_placement.yml) only knows the ws and
+          reality inbound kinds, so a relay node would register with an empty
+          active-inbound set. Use the shared-squad model (the default).
+      when:
+        - remnawave_relay_enabled | default(false) | bool
+        - remnawave_per_node_placement | default(false) | bool
+
     - name: Validate WSS does not collide with the Shadowsocks keys port
       fail:
         msg: |
@@ -506,6 +562,22 @@
           - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
           - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
 
+    # Cannot live in the validation block above: dns_hostname is not derived until
+    # the hostname facts are set. Still runs before DNS records and before any
+    # install, so a misconfigured relay node never reaches the panel.
+    - name: Validate the relay edge address is not the node itself
+      fail:
+        msg: |
+          remnawave_relay_address ({{ remnawave_relay_address }}) is this node's
+          own hostname — that is a DIRECT Reality deploy, not a relay: clients
+          would connect straight to the node and the external proxy would be
+          bypassed entirely, publishing the node's address to every subscriber.
+          Point remnawave_relay_address at the external L4 proxy's edge, or use
+          remnawave_reality_enabled=true for a genuinely direct node.
+      when:
+        - remnawave_relay_enabled | default(false) | bool
+        - (remnawave_relay_address | default('')) == (dns_hostname | default(''))
+
     # Fastly origin identity: an unguessable per-node origin name
     # (<hostname>-<rand8>.<base_domain>). In shared + fronting modes this
     # RESHAPES dns_hostname to the origin FQDN before DNS records are written
@@ -537,6 +609,15 @@
         dns_proxied: false
       when:
         - remnawave_reality_enabled | default(false) | bool
+
+    # An orange-cloud A record would break BOTH legs of a relay node: the
+    # operator's L4 proxy could not dial the origin (Cloudflare will not carry
+    # raw TCP on an arbitrary port) and the panel could not reach :2222.
+    - name: Override dns_proxied for relay (edge proxy + panel dial the node directly)
+      set_fact:
+        dns_proxied: false
+      when:
+        - remnawave_relay_enabled | default(false) | bool
 
     - name: Include DNS tasks (Cloudflare)
       include_tasks: providers/cloudflare/dns.yml
@@ -689,6 +770,17 @@
         - remnawave_panel_register_node | default(false) | bool
         - remnawave_reality_enabled | default(false) | bool
 
+    # Relay node (VLESS+REALITY behind a manual external L4 proxy) — the Host
+    # advertises the PROXY EDGE, never this node. Deliberately outside the Fastly
+    # block above: relay needs no Fastly facts and no Caddy origin.
+    - name: Create Remnawave relay Host
+      include_tasks: providers/remnawave/create_relay_host.yml
+      when:
+        - component_install_success | bool
+        - remnawave_enabled | default(false) | bool
+        - remnawave_panel_register_node | default(false) | bool
+        - remnawave_relay_enabled | default(false) | bool
+
     # =========================================================================
     # COMPONENT: slipstream DNS Tunnel
     # =========================================================================
@@ -783,6 +875,13 @@
           {% endif %}
           {% if slipstream_enabled | default(false) | bool %}
             ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
+          {% endif %}
+          {% if remnawave_relay_enabled | default(false) | bool %}
+            ✓ relay transport (VLESS+REALITY via a manual external L4 proxy)
+                clients dial : {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443) }} (sni {{ remnawave_relay_sni }})
+                CONFIGURE BY HAND: point the proxy's backend at
+                  {{ dns_hostname }}:{{ remnawave_relay_node_listen_port | default(443) }}  (raw TCP, no TLS at the edge)
+                The role cannot do this — it talks to no proxy provider.
           {% endif %}
   when: operation_mode == 'deploy'
 
@@ -1190,12 +1289,18 @@
 # ============================================================================
 # BOOTSTRAP MODE (panel-only, host-agnostic, run once per panel)
 # ============================================================================
-# Create the panel objects a working key needs — a Config Profile with the
-# BASE WS/Reality inbounds (the templates node deploys clone per node) and an
-# x25519 keypair for Reality. Per-node squads are created at NODE deploy time
-# (create_node_placement.yml) and appended to FCP's mode pools there; the
-# legacy panel-wide squads are only created when
-# remnawave_bootstrap_shared_squads=true (simple single-unit topology).
+# Create the panel objects a working key needs — a Config Profile with the BASE
+# WS / Reality / relay inbounds, plus a SEPARATE x25519 keypair for each of the
+# two REALITY inbounds. In the default shared-squad topology this also creates
+# one panel-wide squad per transport and binds them as FCP's per-mode pools
+# (freedom-ws / privacy-reality / freedom-reality). The legacy per-node model
+# (remnawave_per_node_placement=true) creates squads at NODE deploy instead and
+# appends them to the pools there.
+#
+# On a panel that ALREADY has the Config Profile, newly-added base inbounds are
+# reconciled in by tag (remnawave_bootstrap_reconcile_inbounds) — the create POST
+# only runs when the profile is absent, so without that step an existing panel
+# would never gain the relay inbound.
 # Fully idempotent (GET-before-POST); touches NO host (delegate_to: localhost).
 # This replaces the manual "Phase 0" panel setup. Run once, e.g.:
 #   ansible-playbook playbook.yml -e operation_mode=bootstrap \
@@ -1217,7 +1322,19 @@
 
     - name: Generate the Reality x25519 keypair (panel API)
       include_tasks: providers/remnawave/gen_x25519.yml
+      vars:
+        _x25519_target: reality
       when: remnawave_bootstrap_reality | default(true) | bool
+
+    # A SEPARATE keypair for relay: sharing one would render an empty privateKey
+    # (a dead inbound) whenever remnawave_bootstrap_reality is false, and a seized
+    # direct-Reality node would burn the relay transport too. Both includes must
+    # precede create_config_profile.yml, which embeds the keys.
+    - name: Generate the relay x25519 keypair (panel API)
+      include_tasks: providers/remnawave/gen_x25519.yml
+      vars:
+        _x25519_target: relay
+      when: remnawave_bootstrap_relay | default(true) | bool
 
     - name: Ensure the Config Profile + inbounds exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_config_profile.yml
@@ -1246,6 +1363,13 @@
           # creds file:  -e @<creds>.yml -e @{{ remnawave_bootstrap_output_file }}
           remnawave_panel_config_profile_uuid: "{{ remnawave_panel_config_profile_uuid }}"
           remnawave_reality_inbound_uuid: "{{ remnawave_reality_inbound_uuid | default('') }}"
+          # Relay transport. remnawave_relay_sni is emitted HERE and must NOT also
+          # be set in your creds file: both load as extra-vars, where the later -e
+          # wins, so duplicating it makes the effective value depend on argument
+          # order. Load this file SECOND (as the header above shows).
+          remnawave_relay_inbound_uuid: "{{ remnawave_relay_inbound_uuid | default('') }}"
+          remnawave_relay_sni: "{{ (remnawave_bootstrap_relay_server_names | default([])) | first | default('', true) }}"
+          remnawave_relay_node_listen_port: {{ remnawave_bootstrap_relay_listen_port | default(443) | int }}
           remnawave_cdn_transports:
             - name: ws
               network: ws
@@ -1267,7 +1391,15 @@
         _fcp_placement_modes: >-
           {{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}}
              | combine({'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}}
-              if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {}) }}
+              if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {})
+             | combine({'freedom-reality': {'squadUuids': [remnawave_relay_squad_uuid]}}
+              if ((remnawave_relay_squad_uuid | default('')) | length > 0) else {}) }}
+        # FCP SKIPS unknown mode slugs silently rather than 400ing, so without
+        # this the pools could be bound to nothing and no one would notice.
+        _fcp_placement_expect_bound: >-
+          {{ ['freedom-ws']
+             + (['privacy-reality'] if ((remnawave_reality_squad_uuid | default('')) | length > 0) else [])
+             + (['freedom-reality'] if ((remnawave_relay_squad_uuid | default('')) | length > 0) else []) }}
       when:
         - fcp_enabled | default(false) | bool
         - remnawave_bootstrap_shared_squads | default(true) | bool
@@ -1293,13 +1425,31 @@
           these shared inbounds; legacy per-node placement clones them instead):
             remnawave_cdn_transports[ws].inbound_uuid:    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}
             remnawave_reality_inbound_uuid:               {{ remnawave_reality_inbound_uuid | default('(disabled)') }}
+            remnawave_relay_inbound_uuid:                 {{ remnawave_relay_inbound_uuid | default('(disabled)') }}
 
           {% if remnawave_bootstrap_shared_squads | default(true) | bool %}
           Shared squads (fleet-spanning; nodes never create their own):
             fronted ({{ remnawave_bootstrap_fronted_squad_name }}): {{ 'uuid resolved' if (remnawave_fronted_squad_uuid | default('') | length > 0) else '(none)' }}
             reality ({{ remnawave_bootstrap_reality_squad_name }}): {{ 'uuid resolved' if (remnawave_reality_squad_uuid | default('') | length > 0) else '(disabled)' }}
+            relay   ({{ remnawave_bootstrap_relay_squad_name }}): {{ 'uuid resolved' if (remnawave_relay_squad_uuid | default('') | length > 0) else '(disabled)' }}
           {% if fcp_enabled | default(false) | bool %}
-          FCP mode placements bound (freedom-ws -> fronted squad, privacy-reality -> reality squad).
+          FCP mode placements bound (freedom-ws -> fronted, privacy-reality -> reality,
+          freedom-reality -> relay). Each bind is a FULL REPLACE of that pool, so
+          anything an admin bound there by hand is clobbered.
+          {% if (remnawave_relay_squad_uuid | default('')) | length > 0 %}
+
+          NOTE: freedom-reality ships DISABLED in FCP's mode catalog and this role
+          CANNOT enable it (that needs admin:settings:write, which the role's token
+          deliberately does not hold). Enable it in FCP Admin -> Connection modes
+          only AFTER at least one relay node is deployed — otherwise members can
+          select a mode whose squad has no Hosts.
+          {% endif %}
+          {% endif %}
+          {% if (remnawave_relay_inbound_uuid | default('')) | length > 0 %}
+
+          Relay nodes: the inbound listens ON THE NODE at
+          0.0.0.0:{{ remnawave_bootstrap_relay_listen_port | default(443) }} — point your external L4 proxy's
+          backend at <node>:{{ remnawave_bootstrap_relay_listen_port | default(443) }} (raw TCP, no TLS at the edge).
           {% endif %}
           {% else %}
           No squads created at bootstrap: legacy per-node placement

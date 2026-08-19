@@ -68,3 +68,21 @@
       {%- for p in _fcp_placement_result.json.placements | default([]) %}
       {{ ' ' }}{{ p.modeId }}={{ p.boundCount }}{{ '' if loop.last else ',' }}
       {%- endfor %}
+
+# FCP SKIPS unknown mode slugs instead of 400ing (see the header), so a pool
+# bound to a mode row that does not exist "succeeds" silently and the squads end
+# up bound to nothing — keys issued in that mode would reach no node. Callers
+# that know which modes MUST land pass _fcp_placement_expect_bound and get a loud
+# failure instead. `bound` carries only mode ids + pool sizes, so it is safe to
+# print (same reasoning as the debug above).
+- name: Assert FCP reported every expected mode as bound
+  assert:
+    that:
+      - (_fcp_placement_expect_bound | default([])) | difference(_fcp_placement_result.json.bound | default([])) | length == 0
+    fail_msg: >-
+      FCP did not report these modes as bound:
+      {{ (_fcp_placement_expect_bound | default([])) | difference(_fcp_placement_result.json.bound | default([])) | join(', ') }}.
+      Unknown mode slugs are SKIPPED silently (never a 400), so the usual cause is
+      a slug missing from FCP's mode catalog (Admin -> Connection modes) — e.g.
+      'freedom-reality' on an older FCP. Those squads are bound to NOTHING.
+  when: (_fcp_placement_expect_bound | default([])) | length > 0

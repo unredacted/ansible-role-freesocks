@@ -35,6 +35,13 @@
     fcp_default_connection_mode: "freedom-ws"
     remnawave_bootstrap_output_file: "/tmp/role-ci/bootstrap-vars.yml"
     remnawave_persist_become: false
+    # The role ships NO decoy defaults (they live in private inventory), so CI has
+    # to supply them. RFC-2606 reserved names only — never a real decoy in a
+    # public repo. These are never dialled: the panel only stores the inbound.
+    remnawave_bootstrap_reality_dest: "decoy-direct.example:443"
+    remnawave_bootstrap_reality_server_names: ["decoy-direct.example"]
+    remnawave_bootstrap_relay_dest: "decoy-relay.example:443"
+    remnawave_bootstrap_relay_server_names: ["decoy-relay.example"]
   pre_tasks:
     - name: Ensure the CI scratch dir exists
       file: { path: /tmp/role-ci, state: directory, mode: '0755' }
@@ -66,6 +73,7 @@
           - _t1_profile.config.policy.levels['0'].statsUserOnline == false
           - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_WS_CDN') | list | length == 1
           - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_REALITY') | list | length == 1
+          - _t1_profile.config.inbounds | selectattr('tag', 'equalto', 'VLESS_REALITY_RELAY') | list | length == 1
         fail_msg: "Bootstrap profile missing or not born with the no-log Xray posture"
     - name: Read back the squads + mock FCP state
       uri:
@@ -85,10 +93,19 @@
         that:
           - _t1_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
           - _t1_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
+          - _t1_squads | select('equalto', 'FreeSocks-Relay') | list | length == 1
           - _t1_fcp.defaultMode == 'freedom-ws'
+          # Assert pool CONTENTS, never just a 2xx: FCP (and the mock, see
+          # mock_fcp.py) SKIPS unknown mode slugs silently, so a typo'd pool key
+          # returns 200 while binding nothing.
           - _t1_fcp.pools['freedom-ws'] | length == 1
           - _t1_fcp.pools['privacy-reality'] | length == 1
-        fail_msg: "Bootstrap should create + bind the shared squads (FreeSocks-Fastly / FreeSocks-Reality)"
+          - _t1_fcp.pools['freedom-reality'] | length == 1
+          # Each transport owns its own pool — no cross-contamination.
+          - _t1_fcp.pools['freedom-reality'] != _t1_fcp.pools['privacy-reality']
+        fail_msg: >-
+          Bootstrap should create + bind all three shared squads (FreeSocks-Fastly
+          / FreeSocks-Reality / FreeSocks-Relay) into their own FCP pools.
 
 - name: Integration — phase 2 (node 1, shared model — no clones/squads/appends)
   hosts: localhost
@@ -123,6 +140,8 @@
       set_fact:
         remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
         remnawave_reality_inbound_uuid: "{{ _boot.remnawave_reality_inbound_uuid }}"
+        remnawave_relay_inbound_uuid: "{{ _boot.remnawave_relay_inbound_uuid }}"
+        remnawave_relay_sni: "{{ _boot.remnawave_relay_sni }}"
         remnawave_cdn_transports: "{{ _boot.remnawave_cdn_transports }}"
       vars:
         _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
@@ -183,6 +202,42 @@
           - _t2_patched.address == 'ci-node-one-moved.example.test'
         fail_msg: "PATCH /api/nodes did not update the node address (contract drift)"
 
+    # Create the node's Hosts. This is what makes phase 4's cleanup_hosts
+    # meaningful: before relay was added, NO phase created a Host, so the remark
+    # regex was matched against an empty list and the coverage was illusory.
+    - name: Create the WS Hosts for node 1
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_hosts
+
+    - name: Create the Reality Host for node 1
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_reality_host
+      vars:
+        remnawave_reality_sni: "decoy-direct.example"
+
+    - name: Read back the Hosts
+      uri:
+        url: "{{ remnawave_panel_url }}/api/hosts"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t2_hosts_raw
+    - name: Materialize the Host remarks
+      set_fact:
+        _t2_remarks: >-
+          {{ (_t2_hosts_raw.json.response['hosts']
+              if (_t2_hosts_raw.json.response is mapping and 'hosts' in _t2_hosts_raw.json.response)
+              else _t2_hosts_raw.json.response) | map(attribute='remark') | list }}
+    - name: Assert node 1's Hosts exist under the expected remarks
+      assert:
+        that:
+          - "'ci-node-one-ws' in _t2_remarks"
+          - "'ci-node-one-reality' in _t2_remarks"
+        fail_msg: >-
+          Host creation did not produce the expected remarks (got {{ _t2_remarks }}).
+          Phase 4's cleanup assertions depend on these existing.
+
     - name: Register the panel with FCP (maxKeys/priority + strict probe)
       include_role:
         name: "{{ playbook_dir | dirname | basename }}"
@@ -231,6 +286,7 @@
           - _t2_tags | select('search', '_CI_NODE') | list | length == 0
           - _t2_state.pools['freedom-ws'] | length == 1
           - _t2_state.pools['privacy-reality'] | length == 1
+          - _t2_state.pools['freedom-reality'] | length == 1
           - _t2_state.servers['ci-panel'].maxKeys == 100
           - _t2_state.servers['ci-panel'].priority == 5
         fail_msg: "Shared-model node registration created per-node objects or drifted FCP state"
@@ -293,8 +349,125 @@
         that:
           - _t3_fcp.pools['freedom-ws'] | length == 1
           - _t3_fcp.pools['privacy-reality'] | length == 1
+          - _t3_fcp.pools['freedom-reality'] | length == 1
           - _t3_squads | select('search', '-ci-node') | list | length == 0
         fail_msg: "A shared-model node disturbed the pools or created per-node squads"
+
+- name: "Integration — phase 3b (relay node: Host advertises the EDGE, not the node)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    <<: *ci_vars
+    operation_mode: deploy
+    random_hostname: "ci-node-relay"
+    dns_hostname: "ci-node-relay.example.test"
+    remnawave_node_address: "127.0.0.1"
+    # A relay node is DEDICATED: Caddy and direct Reality both off.
+    remnawave_caddy_enabled: false
+    remnawave_reality_enabled: false
+    remnawave_relay_enabled: true
+    remnawave_relay_address: "relay-edge.example.test"
+    remnawave_relay_port: 8443
+    remnawave_node_install_dir: "/tmp/role-ci/node-relay"
+    remnawave_panel_register_node: true
+  pre_tasks:
+    - meta: clear_facts
+    - name: Ensure the relay node install dir exists
+      file: { path: "{{ remnawave_node_install_dir }}", state: directory, mode: '0755' }
+    - name: Reload node-deploy vars from the bootstrap output (fresh-host simulation)
+      set_fact:
+        remnawave_panel_config_profile_uuid: "{{ _boot.remnawave_panel_config_profile_uuid }}"
+        remnawave_relay_inbound_uuid: "{{ _boot.remnawave_relay_inbound_uuid }}"
+        remnawave_relay_sni: "{{ _boot.remnawave_relay_sni }}"
+        remnawave_relay_node_listen_port: "{{ _boot.remnawave_relay_node_listen_port }}"
+        # A relay node is dedicated — it must not also activate the WS inbound it
+        # would otherwise inherit from the generated vars file.
+        remnawave_cdn_transports: []
+      vars:
+        _boot: "{{ lookup('file', '/tmp/role-ci/bootstrap-vars.yml') | from_yaml }}"
+  tasks:
+    - name: Assert bootstrap actually emitted the relay keys
+      assert:
+        that:
+          - remnawave_relay_inbound_uuid | length > 0
+          - remnawave_relay_sni | length > 0
+        fail_msg: >-
+          The bootstrap output file carries no relay keys — every phase reloads
+          node-deploy vars from that file, so relay cannot be exercised without
+          them being written by tasks/main.yml's output-file template.
+
+    # The relay-only active-inbound derivation: this is the case whose missing
+    # `when:` disjunct would fall through to the empty default and die in
+    # register_node's assert.
+    - name: Derive active inbounds for a relay-only node (as setup/remnawave.yml does)
+      set_fact:
+        _cdn_transport_inbounds: >-
+          {{ remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+             | select('string') | reject('equalto', '') | list }}
+    - name: Derive the active inbound set
+      set_fact:
+        remnawave_panel_active_inbounds: >-
+          {{ _cdn_transport_inbounds
+             + ([remnawave_relay_inbound_uuid]
+                if (remnawave_relay_enabled | default(false) | bool
+                     and (remnawave_relay_inbound_uuid | default('') | length > 0))
+                else []) }}
+    - name: Assert a relay-only node activates exactly the relay inbound
+      assert:
+        that:
+          - remnawave_panel_active_inbounds == [remnawave_relay_inbound_uuid]
+        fail_msg: >-
+          A relay-only node must activate exactly its own inbound, got
+          {{ remnawave_panel_active_inbounds }}.
+
+    - name: Register the relay node
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/register_node
+
+    - name: Create the relay Host
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/create_relay_host
+
+    - name: Read back the Hosts
+      uri:
+        url: "{{ remnawave_panel_url }}/api/hosts"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t3b_hosts_raw
+    - name: Materialize the relay Host
+      set_fact:
+        _t3b_relay_host: >-
+          {{ ((_t3b_hosts_raw.json.response['hosts']
+               if (_t3b_hosts_raw.json.response is mapping and 'hosts' in _t3b_hosts_raw.json.response)
+               else _t3b_hosts_raw.json.response)
+              | selectattr('remark', 'equalto', 'ci-node-relay-relay') | list | first) | default({}, true) }}
+    - name: Assert the relay Host advertises the EDGE and never the node
+      assert:
+        that:
+          - _t3b_relay_host.remark | default('') == 'ci-node-relay-relay'
+          - _t3b_relay_host.address | default('') == 'relay-edge.example.test'
+          # THE anti-leak invariant, pinned against a live panel: publishing the
+          # origin would hand every subscriber the address an IP block needs.
+          - _t3b_relay_host.address | default('') != dns_hostname
+          - (_t3b_relay_host.port | default(0) | int) == 8443
+        fail_msg: >-
+          The relay Host did not advertise the proxy edge (got
+          address={{ _t3b_relay_host.address | default('(none)') }},
+          port={{ _t3b_relay_host.port | default('(none)') }}).
+
+    - name: Assert the .relay_address marker is written (migrate detection depends on it)
+      stat:
+        path: "{{ remnawave_node_install_dir }}/.relay_address"
+      register: _t3b_marker
+    - name: Marker must exist
+      assert:
+        that: [_t3b_marker.stat.exists]
+        fail_msg: >-
+          .relay_address was not persisted — migrate would then mis-detect this
+          node as a direct Reality node (it has no Caddyfile either).
 
 - name: Integration — phase 4 (teardown node 1; shared state untouched)
   hosts: localhost
@@ -369,12 +542,69 @@
         that:
           - _t4_nodes | selectattr('name', 'equalto', 'ci-node-one') | list | length == 0
           - _t4_nodes | selectattr('name', 'equalto', 'ci-node-two') | list | length == 1
-          - _t4_tags | length == 2  # the two base inbounds, nothing cloned
+          - _t4_tags | length == 3  # the three base inbounds, nothing cloned
           - _t4_squads | select('equalto', 'FreeSocks-Fastly') | list | length == 1
           - _t4_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
+          - _t4_squads | select('equalto', 'FreeSocks-Relay') | list | length == 1
           - _t4_state.pools['freedom-ws'] | length == 1
           - _t4_state.pools['privacy-reality'] | length == 1
+          - _t4_state.pools['freedom-reality'] | length == 1
         fail_msg: "Shared-model teardown left node-1 residue or disturbed the fleet state"
+
+    # The remark regex, end to end and for real: node 1's Hosts must be gone while
+    # OTHER nodes' Hosts survive. This is the "extending hostname / different
+    # hostname" property that unit tests assert on fixtures.
+    - name: Read back the Hosts after node-1 teardown
+      uri:
+        url: "{{ remnawave_panel_url }}/api/hosts"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t4_hosts_raw
+    - name: Materialize the surviving Host remarks
+      set_fact:
+        _t4_remarks: >-
+          {{ (_t4_hosts_raw.json.response['hosts']
+              if (_t4_hosts_raw.json.response is mapping and 'hosts' in _t4_hosts_raw.json.response)
+              else _t4_hosts_raw.json.response) | map(attribute='remark') | list }}
+    - name: Assert only node 1's Hosts were removed
+      assert:
+        that:
+          - "'ci-node-one-ws' not in _t4_remarks"
+          - "'ci-node-one-reality' not in _t4_remarks"
+          # A different node's Hosts must be untouched by a hostname-anchored match.
+          - "'ci-node-relay-relay' in _t4_remarks"
+        fail_msg: >-
+          cleanup_hosts removed the wrong set (surviving remarks: {{ _t4_remarks }}).
+
+    # Now retire the RELAY node — this is what proves 'relay' is actually in the
+    # remark alternation. Before the fix, this Host would survive forever.
+    - name: Delete the relay node's Hosts
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/cleanup_hosts
+      vars:
+        old_random_hostname: "ci-node-relay"
+
+    - name: Read back the Hosts after relay teardown
+      uri:
+        url: "{{ remnawave_panel_url }}/api/hosts"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t4b_hosts_raw
+    - name: Assert the relay Host is gone
+      vars:
+        _t4b_remarks: >-
+          {{ (_t4b_hosts_raw.json.response['hosts']
+              if (_t4b_hosts_raw.json.response is mapping and 'hosts' in _t4b_hosts_raw.json.response)
+              else _t4b_hosts_raw.json.response) | map(attribute='remark') | list }}
+      assert:
+        that:
+          - "'ci-node-relay-relay' not in _t4b_remarks"
+        fail_msg: >-
+          The relay Host survived cleanup — 'relay' is missing from
+          cleanup_hosts.yml's remark alternation
+          (remnawave_direct_transport_remarks). Every retired relay node would
+          keep advertising a dead origin.
 
 - name: "Integration — phase 5 (LEGACY per-node placement: clones, squads, pools, teardown)"
   hosts: localhost
@@ -543,6 +773,9 @@
           - _t6b_squads | select('equalto', 'FreeSocks-Reality') | list | length == 1
           - _t6b_state.pools['freedom-ws'] | length == 2   # shared + node4
           - _t6b_state.pools['privacy-reality'] | length == 1 # shared
+          # The legacy per-node path never participates in relay (asserted
+          # incompatible), so the relay pool must be exactly the shared squad.
+          - _t6b_state.pools['freedom-reality'] | length == 1 # shared
         fail_msg: "Legacy teardown left node-3 residue or disturbed node 4 / shared state"
 
     - name: All integration phases passed

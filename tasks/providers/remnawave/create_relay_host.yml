@@ -1,0 +1,103 @@
+---
+# tasks/providers/remnawave/create_relay_host.yml
+#
+# Create the Remnawave Host for a RELAY node: VLESS+REALITY reached through a
+# MANUALLY-CONFIGURED external L4/TCP proxy. The client dials the proxy's edge;
+# the proxy forwards raw TCP to this node's relay inbound, where REALITY
+# terminates. Nothing TLS happens at the edge, so there is no cert, no ACME, no
+# Caddy and no decoy web root — and the Host advertises the EDGE, never the node.
+#
+# Reality params (publicKey/shortIds/flow) live on the PANEL inbound; the Host
+# only references that inbound and sets address/port/sni. securityLayer is
+# DEFAULT — the Host schema has no REALITY enum, the security comes from the
+# inbound, and the panel derives pbk/sid/flow. Idempotent: GET-first by remark,
+# tolerate 409.
+#
+# The proxy side is entirely the operator's: this file never talks to a proxy
+# provider. It assumes the operator pointed the edge's backend at
+# <node>:<remnawave_relay_node_listen_port> (printed by bootstrap and by the
+# deploy summary).
+#
+# VERIFY on a live panel that the generated vless:// line carries
+# security=reality + pbk/sid/flow AND the EDGE address (not this node's).
+
+# remnawave_relay_address is ASSERTED, never defaulted to dns_hostname. A
+# default would mean any run that forgot the var silently publishes this node's
+# real hostname to every subscriber — an unblocking-vector disclosure, strictly
+# worse than a dead Host.
+- name: Validate relay Host prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid is defined and remnawave_panel_config_profile_uuid | length > 0
+      - remnawave_relay_inbound_uuid | default('') | length > 0
+      - remnawave_relay_address | default('') | length > 0
+      - remnawave_relay_sni | default('') | length > 0
+      - random_hostname is defined and random_hostname | length > 0
+    fail_msg: >-
+      Relay Host creation requires remnawave_panel_api_token,
+      remnawave_panel_config_profile_uuid, remnawave_relay_inbound_uuid,
+      remnawave_relay_address (the EXTERNAL proxy edge — never this node) and
+      remnawave_relay_sni (a serverName the relay inbound borrows).
+  no_log: true
+
+# Distinct fact name on purpose: create_hosts.yml and create_reality_host.yml
+# both write _remnawave_hosts, and set_facts outlive the task file — sharing the
+# name would cross-contaminate the idempotency check when two of these run in
+# one play.
+- name: List existing Remnawave Hosts (relay)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_relay_hosts_list
+
+- name: Normalize the Hosts list payload (relay; bare array or hosts-wrapped)
+  set_fact:
+    _remnawave_relay_hosts: "{{ remnawave_relay_hosts_list.json.response['hosts'] if (remnawave_relay_hosts_list.json.response is mapping and 'hosts' in remnawave_relay_hosts_list.json.response) else (remnawave_relay_hosts_list.json.response | default([])) }}"
+
+- name: Create the relay Host
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      inbound:
+        configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
+        configProfileInboundUuid: "{{ remnawave_relay_inbound_uuid }}"
+      remark: "{{ random_hostname }}-relay"
+      # The PROXY EDGE plus the edge port mapped to THIS node — one edge can
+      # front several nodes on different ports.
+      address: "{{ remnawave_relay_address }}"
+      port: "{{ remnawave_relay_port | default(443) | int }}"
+      sni: "{{ remnawave_relay_sni }}"
+      fingerprint: "{{ remnawave_relay_fingerprint | default('chrome') }}"
+      securityLayer: "DEFAULT"
+      # address is the edge, sni is the borrowed site — they intentionally differ,
+      # so the panel must not overwrite one from the other. No path/host/alpn:
+      # this is raw TCP, not WebSocket.
+      overrideSniFromAddress: false
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_relay_host_result
+  when: (random_hostname ~ '-relay') not in (_remnawave_relay_hosts | map(attribute='remark') | list)
+
+- name: Summarize relay Host creation
+  debug:
+    msg: >-
+      Relay Host ensured: {{ random_hostname }}-relay ->
+      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443) }}
+      (sni {{ remnawave_relay_sni }}). The proxy edge must forward raw TCP to
+      {{ dns_hostname | default('<node>') }}:{{ remnawave_relay_node_listen_port | default(443) }}.

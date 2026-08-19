@@ -12,16 +12,25 @@
   gather_facts: false
   vars:
     remnawave_bootstrap_reality_network: "raw"
-    remnawave_bootstrap_reality_dest: "dl.google.com:443"
-    remnawave_bootstrap_reality_server_names: ["dl.google.com"]
+    # RFC-2606 reserved names only. The role ships NO decoy defaults (they live in
+    # private inventory), and a public test fixture must never name a real one.
+    remnawave_bootstrap_reality_dest: "decoy-direct.example:443"
+    remnawave_bootstrap_reality_server_names: ["decoy-direct.example"]
     remnawave_bootstrap_reality_short_ids: [""]
     remnawave_reality_private_key: "PRIV-KEY-xyz"
+    remnawave_bootstrap_relay_network: "raw"
+    remnawave_bootstrap_relay_dest: "decoy-relay.example:443"
+    remnawave_bootstrap_relay_server_names: ["decoy-relay.example", "decoy-relay-2.example"]
+    remnawave_bootstrap_relay_short_ids: [""]
+    remnawave_bootstrap_relay_listen_port: 443
+    remnawave_relay_private_key: "PRIV-KEY-relay"
     fcp_default_connection_mode: "freedom-ws"
     # A fake GET /api/config-profiles/inbounds response (both plausible shapes).
     _fake_inbounds_flat:
       response:
         - { uuid: "uuid-ws", tag: "VLESS_WS_CDN", network: "ws" }
         - { uuid: "uuid-re", tag: "VLESS_REALITY", network: "raw" }
+        - { uuid: "uuid-rl", tag: "VLESS_REALITY_RELAY", network: "raw" }
     _fake_inbounds_nested:
       response:
         inbounds:
@@ -69,8 +78,59 @@
           - _reality_inbound.streamSettings.network == 'raw'
           - _reality_inbound.streamSettings.security == 'reality'
           - _reality_inbound.streamSettings.realitySettings.privateKey == 'PRIV-KEY-xyz'
-          - _reality_inbound.streamSettings.realitySettings.serverNames == ['dl.google.com']
+          - _reality_inbound.streamSettings.realitySettings.serverNames == ['decoy-direct.example']
         success_msg: "Reality inbound assembly OK (raw network, injected key)."
+
+    # (b2) The relay inbound: its OWN key, its OWN decoy, and a templated listen
+    # port (the direct inbound hardcodes 443). Mirrors create_config_profile.yml.
+    - name: Build the relay inbound
+      set_fact:
+        _relay_inbound:
+          tag: "VLESS_REALITY_RELAY"
+          listen: "0.0.0.0"
+          port: "{{ remnawave_bootstrap_relay_listen_port | int }}"
+          protocol: "vless"
+          settings: { clients: [], decryption: "none" }
+          streamSettings:
+            network: "{{ remnawave_bootstrap_relay_network }}"
+            security: "reality"
+            realitySettings:
+              dest: "{{ remnawave_bootstrap_relay_dest }}"
+              serverNames: "{{ remnawave_bootstrap_relay_server_names }}"
+              privateKey: "{{ remnawave_relay_private_key }}"
+              shortIds: "{{ remnawave_bootstrap_relay_short_ids }}"
+          sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+    - name: Assert relay inbound shape + key separation from direct Reality
+      assert:
+        that:
+          - _relay_inbound.tag == 'VLESS_REALITY_RELAY'
+          - _relay_inbound.streamSettings.security == 'reality'
+          - _relay_inbound.streamSettings.realitySettings.privateKey == 'PRIV-KEY-relay'
+          # The two REALITY inbounds must NOT share a keypair: one seized node
+          # must not burn the other transport.
+          - _relay_inbound.streamSettings.realitySettings.privateKey != _reality_inbound.streamSettings.realitySettings.privateKey
+          - _relay_inbound.streamSettings.realitySettings.serverNames | length == 2
+          # A single dest must serve every serverName, so dest's host is one of them.
+          - (_relay_inbound.streamSettings.realitySettings.dest | split(':') | first) in _relay_inbound.streamSettings.realitySettings.serverNames
+          - "'rawSettings' not in _relay_inbound.streamSettings"
+        success_msg: "(b2) relay inbound OK (own key, own decoy, dest serves its serverNames)."
+
+    # (b3) PROXY-protocol opt-in lands on the CARRIER settings block, whose key is
+    # derived from the network name ("raw" on v2.8, "tcp" on older panels). Getting
+    # this wrong = every connection fails with no useful error.
+    - name: Apply the PROXY-protocol variant
+      set_fact:
+        _relay_pp: >-
+          {{ _relay_inbound | combine({'streamSettings':
+               _relay_inbound.streamSettings
+               | combine({ (remnawave_bootstrap_relay_network ~ 'Settings'): {'acceptProxyProtocol': true} }) }) }}
+    - name: Assert the PROXY-protocol key is carrier-derived and additive
+      assert:
+        that:
+          - _relay_pp.streamSettings.rawSettings.acceptProxyProtocol
+          - _relay_pp.streamSettings.security == 'reality'
+          - _relay_pp.streamSettings.realitySettings.privateKey == 'PRIV-KEY-relay'
+        success_msg: "(b3) acceptProxyProtocol lands on rawSettings without clobbering realitySettings."
 
     # (c) Config-profiles / inbounds response normalization (flat list vs nested).
     - name: Normalize a flat response
@@ -86,7 +146,7 @@
     - name: Assert normalization yields a list of inbounds either way
       assert:
         that:
-          - _norm_flat | length == 2
+          - _norm_flat | length == 3
           - _norm_nested | length == 1
           - (_norm_flat | selectattr('tag', 'equalto', 'VLESS_WS_CDN') | map(attribute='uuid') | first) == 'uuid-ws'
         success_msg: "Inbound response normalization OK (flat + nested)."
@@ -105,6 +165,7 @@
         that:
           - _uuid_by_tag['VLESS_WS_CDN'] == 'uuid-ws'
           - _uuid_by_tag['VLESS_REALITY'] == 'uuid-re'
+          - _uuid_by_tag['VLESS_REALITY_RELAY'] == 'uuid-rl'
           - _fronted == ['uuid-ws']
         success_msg: "tag->uuid map + fronted squad inbound selection OK."
 
@@ -116,31 +177,81 @@
         that: ["_partial == ['uuid-ws']"]
         success_msg: "Fronted squad selection drops unbound inbounds."
 
-    # (f) FCP mode-placements PATCH body (shared-squad full replace) — both pools.
-    - name: Build FCP placement body (shared squads, with Reality)
+    # (f) FCP mode-placements PATCH body (shared-squad full replace) — all three
+    # pools. Relay binds freedom-reality; direct Reality keeps privacy-reality.
+    - name: Build FCP placement body (shared squads, all three transports)
       vars:
         remnawave_fronted_squad_uuid: "sq-front"
         remnawave_reality_squad_uuid: "sq-reality"
+        remnawave_relay_squad_uuid: "sq-relay"
         _privacy_entry: "{{ {'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
+        _relay_entry: "{{ {'freedom-reality': {'squadUuids': [remnawave_relay_squad_uuid]}} if ((remnawave_relay_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) | combine(_relay_entry) }}"
+        _fcp_placement_expect_bound: >-
+          {{ ['freedom-ws']
+             + (['privacy-reality'] if ((remnawave_reality_squad_uuid | default('')) | length > 0) else [])
+             + (['freedom-reality'] if ((remnawave_relay_squad_uuid | default('')) | length > 0) else []) }}
       assert:
         that:
           - _fcp_placement_modes['freedom-ws'].squadUuids == ['sq-front']
           - _fcp_placement_modes['privacy-reality'].squadUuids == ['sq-reality']
-        success_msg: "FCP placement body OK (freedom-ws -> fronted pool, privacy-reality -> reality pool)."
+          - _fcp_placement_modes['freedom-reality'].squadUuids == ['sq-relay']
+          # Each transport gets its OWN pool: sharing one would make the modes
+          # indistinguishable to a member.
+          - _fcp_placement_modes | length == 3
+          - _fcp_placement_expect_bound | sort == ['freedom-reality', 'freedom-ws', 'privacy-reality']
+        success_msg: "(f) FCP placement body OK (freedom-ws/privacy-reality/freedom-reality pools)."
 
-    # (g) The pool body omits privacy-reality when Reality is disabled (empty squad).
-    - name: Build FCP placement body (Reality disabled)
+    # (g) Each pool key is omitted when its squad is absent — an empty squadUuids
+    # would CLEAR a live pool on a full-replace PATCH.
+    - name: Build FCP placement body (Reality + relay disabled)
       vars:
         remnawave_fronted_squad_uuid: "sq-front"
         remnawave_reality_squad_uuid: ""
+        remnawave_relay_squad_uuid: ""
         _privacy_entry: "{{ {'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
-        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) }}"
+        _relay_entry: "{{ {'freedom-reality': {'squadUuids': [remnawave_relay_squad_uuid]}} if ((remnawave_relay_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) | combine(_relay_entry) }}"
+        _fcp_placement_expect_bound: >-
+          {{ ['freedom-ws']
+             + (['privacy-reality'] if ((remnawave_reality_squad_uuid | default('')) | length > 0) else [])
+             + (['freedom-reality'] if ((remnawave_relay_squad_uuid | default('')) | length > 0) else []) }}
       assert:
         that:
           - _fcp_placement_modes['freedom-ws'].squadUuids == ['sq-front']
           - "'privacy-reality' not in _fcp_placement_modes"
-        success_msg: "FCP placement body omits privacy-reality when Reality is disabled."
+          - "'freedom-reality' not in _fcp_placement_modes"
+          - _fcp_placement_expect_bound == ['freedom-ws']
+        success_msg: "(g) pool keys omitted when their squads are absent; expectation shrinks with them."
+
+    # (g2) relay-only: the freedom-reality pool binds without privacy-reality.
+    - name: Build FCP placement body (relay enabled, direct Reality disabled)
+      vars:
+        remnawave_fronted_squad_uuid: "sq-front"
+        remnawave_reality_squad_uuid: ""
+        remnawave_relay_squad_uuid: "sq-relay"
+        _privacy_entry: "{{ {'privacy-reality': {'squadUuids': [remnawave_reality_squad_uuid]}} if ((remnawave_reality_squad_uuid | default('')) | length > 0) else {} }}"
+        _relay_entry: "{{ {'freedom-reality': {'squadUuids': [remnawave_relay_squad_uuid]}} if ((remnawave_relay_squad_uuid | default('')) | length > 0) else {} }}"
+        _fcp_placement_modes: "{{ {'freedom-ws': {'squadUuids': [remnawave_fronted_squad_uuid]}} | combine(_privacy_entry) | combine(_relay_entry) }}"
+      assert:
+        that:
+          - _fcp_placement_modes['freedom-reality'].squadUuids == ['sq-relay']
+          - "'privacy-reality' not in _fcp_placement_modes"
+        success_msg: "(g2) relay pool binds independently of direct Reality."
+
+    # (g3) The expect-bound assert itself: FCP SKIPS unknown mode slugs instead of
+    # 400ing, so a pool bound to a nonexistent mode "succeeds" silently. This is
+    # the difference() guard from bind_placements.yml.
+    - name: Assert the expect-bound difference guard catches a silently-skipped mode
+      vars:
+        _expect: ["freedom-ws", "privacy-reality", "freedom-reality"]
+        _bound_ok: ["freedom-ws", "privacy-reality", "freedom-reality"]
+        _bound_missing_relay: ["freedom-ws", "privacy-reality"]
+      assert:
+        that:
+          - (_expect | difference(_bound_ok)) | length == 0
+          - (_expect | difference(_bound_missing_relay)) == ['freedom-reality']
+        success_msg: "(g3) expect-bound guard detects a mode FCP skipped (older catalog)."
 
     # (h) Per-node deploy: the append-only add body (never disturbs the pool).
     - name: Build FCP placement body (per-node addSquadUuids)

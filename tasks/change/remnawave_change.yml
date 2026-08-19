@@ -96,6 +96,49 @@
     - old_uuid_raw.content is defined
     - (old_uuid_raw.content | b64decode | trim) | length > 0
 
+- name: Read the relay marker (if present)
+  stat:
+    path: "{{ remnawave_node_install_dir }}/.relay_address"
+  register: change_relay_marker
+  become: yes
+
+- name: Read the persisted relay endpoint (if present)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.relay_address"
+  register: change_relay_raw
+  become: yes
+  failed_when: false
+
+# Change mode has NO on-disk capability detection of its own (unlike migrate), so
+# a rotation that forgets to re-pass the transport flags silently skips both Host
+# create and cleanup and leaves the old Host pointing at a deleted DNS name. The
+# relay marker closes that hole for relay: disk evidence OR the caller's var
+# counts. Two set_facts — the parse reads the materialized text, and chaining
+# them in one task mis-evaluates under 2.19 lazy templating.
+- name: Materialize the persisted relay endpoint text
+  set_fact:
+    _change_relay_text: >-
+      {{ (change_relay_raw.content | b64decode) if change_relay_raw.content is defined else '' }}
+
+# Backslash-free patterns on purpose (see tasks/migrate/migrate.yml for why), and
+# the caller's vars win over disk so an operator can re-point the edge in the same
+# run that rotates the hostname.
+- name: Derive the effective relay facts for this rotation
+  set_fact:
+    _change_relay_effective: >-
+      {{ (remnawave_relay_enabled | default(false) | bool)
+         or (change_relay_marker.stat.exists | default(false) | bool) }}
+    _change_relay_address: >-
+      {{ remnawave_relay_address
+         if ((remnawave_relay_address | default('')) | length > 0)
+         else ((_change_relay_text | regex_search('^address=.+', multiline=true) | default('', true))
+               | regex_replace('^address=', '')) }}
+    _change_relay_port: >-
+      {{ remnawave_relay_port
+         if ((remnawave_relay_port | default('')) | string | length > 0 and (remnawave_relay_port | default(0) | int) > 0)
+         else (((_change_relay_text | regex_search('^port=[0-9]+', multiline=true) | default('', true))
+                | regex_replace('^port=', '')) | default('443', true)) }}
+
 - name: Debug existing state
   debug:
     msg:
@@ -103,6 +146,100 @@
       - "Old random part: {{ old_random_hostname }}"
       - "Old base domain: {{ old_base_domain }}"
       - "Old node UUID: {{ remnawave_node_uuid | default('(none — register_node was not used at deploy)') }}"
+      - "Relay node: {{ _change_relay_effective }}{{ ' (edge ' ~ _change_relay_address ~ ':' ~ _change_relay_port ~ ')' if (_change_relay_effective | bool) else '' }}"
+
+# ============================================================================
+# STEP 1b: relay pre-flight — BEFORE any mutation
+# ============================================================================
+# The deploy-mode validations live inside main.yml's `operation_mode == 'deploy'`
+# block and never run here, so relay's invariants have to be re-asserted. All of
+# these fail BEFORE the new hostname is generated and long before cleanup_hosts
+# runs, so a bad invocation can never delete the old Host without a replacement.
+- name: Validate relay is not combined with Caddy or Fastly (rotation)
+  fail:
+    msg: |
+      This node is a relay node but remnawave_caddy_enabled=true and/or the
+      target domain's cdn_provider is fastly. Relay terminates REALITY on the
+      node itself and contends for :443; Fastly cannot forward raw TCP.
+  when:
+    - _change_relay_effective | bool
+    - (remnawave_caddy_enabled | default(false) | bool) or (effective_cdn_provider | default('none') == 'fastly')
+
+- name: Validate the relay endpoint is known before rotating
+  fail:
+    msg: |
+      This node is a relay node (marker:
+      {{ remnawave_node_install_dir }}/.relay_address) but no proxy edge address
+      is available: nothing on disk and no remnawave_relay_address passed.
+
+      Re-supply it:
+        -e remnawave_relay_address=<proxy edge> -e remnawave_relay_port=<port>
+
+      Without it the rotation would publish THIS NODE's hostname to every
+      subscriber instead of the proxy edge, bypassing the proxy entirely.
+  when:
+    - _change_relay_effective | bool
+    - (_change_relay_address | default('')) | length == 0
+
+- name: Validate the relay inbound UUID and SNI are available before rotating
+  fail:
+    msg: |
+      This node is a relay node but remnawave_relay_inbound_uuid and/or
+      remnawave_relay_sni is unset, so the new relay Host cannot be created —
+      and cleanup would then remove the old Host with nothing to replace it.
+      Load your generated bootstrap vars file for this rotation:
+        -e @<env>-remnawave.generated.yml
+  when:
+    - _change_relay_effective | bool
+    - >-
+      ((remnawave_relay_inbound_uuid | default('')) | length == 0)
+      or ((remnawave_relay_sni | default('')) | length == 0)
+
+# The manual-repoint gate. Rotation happens on the SAME machine, so the node's IP
+# does not move: if the proxy console's origin is that IP, nothing outside the
+# panel needs touching. If it holds the FQDN, change_delete_old_dns destroys the
+# old name in THIS run and the relay breaks for every user on it — unrecoverable
+# by re-running. So: hard-fail only in that combination, warn otherwise.
+- name: Require acknowledgement before deleting the old DNS name of a relay node
+  fail:
+    msg: |
+      Relay repoint acknowledgement required.
+
+      This rotation will DELETE the old DNS name ({{ old_dns_hostname }}) because
+      change_delete_old_dns=true. If your proxy console's origin is set to that
+      FQDN, the relay breaks the moment this run finishes and re-running the role
+      cannot repair it.
+
+        node IP        : {{ ansible_facts['default_ipv4']['address'] | default('(unknown)') }}
+        old origin     : {{ old_dns_hostname }}
+        new origin     : {{ dns_hostname | default('(not yet generated)') }}
+        proxy edge     : {{ _change_relay_address }}:{{ _change_relay_port }}
+        node-side port : {{ remnawave_relay_node_listen_port | default(443) }}
+
+      If the console origin is the node's IP:      nothing changes — re-run with
+        -e remnawave_relay_repoint_ack=true
+      If the console origin is the old FQDN:       update it to the new origin
+        FIRST (or switch it to the IP), then re-run with the same flag.
+      To keep the old name alive instead:          -e change_delete_old_dns=false
+  when:
+    - _change_relay_effective | bool
+    - change_delete_old_dns | default(false) | bool
+    - not (remnawave_relay_repoint_ack | default(false) | bool)
+
+- name: Warn that a relay node's origin is changing (old DNS name retained)
+  debug:
+    msg: |
+      RELAY REPOINT NOTICE — this node's origin name is rotating.
+        old origin : {{ old_dns_hostname }}
+        new origin : {{ dns_hostname | default('(not yet generated)') }}
+        proxy edge : {{ _change_relay_address }}:{{ _change_relay_port }} (UNCHANGED — clients keep working)
+      The old DNS name is being KEPT (change_delete_old_dns is false), so an
+      IP-origin or old-FQDN-origin proxy config both keep resolving. Update the
+      proxy console's origin to the new name at your convenience; the role cannot
+      do it for you.
+  when:
+    - _change_relay_effective | bool
+    - not (change_delete_old_dns | default(false) | bool)
 
 # ============================================================================
 # STEP 2: Generate NEW hostname
@@ -165,6 +302,13 @@
     dns_proxied: false
   when: remnawave_reality_enabled | default(false) | bool
 
+# A proxied record breaks BOTH legs: the L4 proxy cannot dial the origin through
+# Cloudflare on an arbitrary port, and the panel cannot reach :2222.
+- name: Override dns_proxied for relay (edge proxy + panel dial the node directly)
+  set_fact:
+    dns_proxied: false
+  when: _change_relay_effective | default(false) | bool
+
 # Pre-delete any existing records for the NEW hostname (re-run / custom_hostname
 # reuse would otherwise 400 on duplicates) — mirrors outline_change.yml.
 - name: Get existing DNS records for new hostname (Cloudflare)
@@ -215,6 +359,23 @@
     dest: "{{ remnawave_node_install_dir }}/.node_name"
     mode: '0640'
   become: yes
+
+# Re-persist the relay marker so a later change/migrate/wipe still sees it (and
+# picks up an endpoint the operator re-pointed in this run). Deliberately NO
+# state=absent counterpart here: change mode is not authoritative about capability
+# flags, so a caller who simply omitted the relay vars must not have the marker
+# deleted out from under them.
+- name: Re-persist the relay endpoint (relay marker)
+  copy:
+    content: |
+      address={{ _change_relay_address }}
+      port={{ _change_relay_port | int }}
+    dest: "{{ remnawave_node_install_dir }}/.relay_address"
+    mode: '0640'
+  become: "{{ remnawave_persist_become | default(true) }}"
+  when:
+    - _change_relay_effective | default(false) | bool
+    - (_change_relay_address | default('')) | length > 0
 
 - name: Ensure decoy site exists before re-render
   include_tasks: ../setup/decoy.yml
@@ -362,12 +523,30 @@
     - remnawave_panel_register_node | default(false) | bool
     - remnawave_reality_enabled | default(false) | bool
 
+# The relay Host's ADDRESS (the proxy edge) does not rotate — only its remark
+# does. It still has to be re-created: cleanup_hosts.yml and the wipe path find
+# Hosts solely by hostname-anchored remark, so a Host left under the old remark
+# becomes permanently unreachable to the role and is orphaned at the next
+# teardown. The endpoint is passed as a single-level include var; a
+# self-referential set_fact on remnawave_relay_address would recurse under 2.19.
+- name: Create NEW relay Host for the rotated hostname
+  include_tasks: ../providers/remnawave/create_relay_host.yml
+  vars:
+    remnawave_relay_address: "{{ _change_relay_address }}"
+    remnawave_relay_port: "{{ _change_relay_port }}"
+  when:
+    - remnawave_panel_register_node | default(false) | bool
+    - _change_relay_effective | default(false) | bool
+
 # Old objects come down only after their replacements exist.
 - name: Clean up OLD Remnawave Hosts on the panel
   include_tasks: ../providers/remnawave/cleanup_hosts.yml
   when:
     - remnawave_panel_register_node | default(false) | bool
-    - (remnawave_caddy_enabled | default(false) | bool) or (remnawave_reality_enabled | default(false) | bool)
+    - >-
+      (remnawave_caddy_enabled | default(false) | bool)
+      or (remnawave_reality_enabled | default(false) | bool)
+      or (_change_relay_effective | default(false) | bool)
 
 - name: Delete OLD Fastly service (after the NEW one is live)
   include_tasks: ../providers/fastly/cleanup.yml
@@ -526,3 +705,16 @@
 
       Old: {{ old_dns_hostname }}
       New: {{ dns_hostname }}
+      {% if _change_relay_effective | default(false) | bool %}
+
+      RELAY NODE — the client-facing edge did NOT change:
+        clients still dial : {{ _change_relay_address }}:{{ _change_relay_port }}
+        proxy backend must now point at:
+          {{ dns_hostname }}:{{ remnawave_relay_node_listen_port | default(443) }}   (raw TCP)
+        old origin : {{ old_dns_hostname }}{{ ' (DELETED in this run)' if (change_delete_old_dns | default(false) | bool) else ' (retained)' }}
+        node IP    : {{ ansible_facts['default_ipv4']['address'] | default('(unknown)') }}
+
+      If the proxy console's origin is the node IP, nothing needs doing. If it
+      holds the old FQDN, update it now — the role cannot reach your proxy
+      provider.
+      {% endif %}
