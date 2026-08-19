@@ -1096,6 +1096,17 @@
           shape: { "203.0.113.10": ["n1.example.test", "alias.example.test"] }
           node_addrs: ["n1.example.test"]
           reject: true
+        # getent returns ONE line and the family depends on /etc/hosts ordering, so a
+        # name may come back as IPv6 only. The node address set must cover both, and
+        # the comparison must work on either.
+        - name: "name resolving to the node over IPv6"
+          shape: { "::1": ["localhost"] }
+          node_addrs: ["127.0.0.1", "::1"]
+          reject: true
+        - name: "IPv6 resolution, node set IPv4 only (mis-specified set)"
+          shape: { "::1": ["localhost"] }
+          node_addrs: ["127.0.0.1"]
+          reject: false
         - name: "nothing resolved"
           shape: {}
           node_addrs: ["203.0.113.10"]

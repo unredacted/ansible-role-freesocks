@@ -119,7 +119,17 @@
             name: "{{ playbook_dir | dirname | basename }}"
             tasks_from: providers/remnawave/assert_relay_edge
           vars:
+            # `getent hosts localhost` returns ONE line, and which family it is depends
+            # on /etc/hosts ordering — GitHub runners list `::1 localhost` before
+            # `127.0.0.1 localhost`, so a control naming only the IPv4 loopback compares
+            # against an address the resolver never returned. Cover both families via
+            # envoy_mappings (inventory_hostname is 'localhost' in this play) so the
+            # control holds whichever line getent picks.
             dns_hostname: "127.0.0.1"
+            envoy_mappings:
+              localhost:
+                ipv4: ["127.0.0.1"]
+                ipv6: ["::1"]
             _relay_edge_candidate: "localhost"
         # Print both sides unconditionally: when this control fails, the useful
         # information is what the two lists actually contained, and reconstructing
