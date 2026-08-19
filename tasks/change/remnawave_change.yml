@@ -133,9 +133,14 @@
          if ((remnawave_relay_address | default('')) | length > 0)
          else ((_change_relay_text | regex_search('^address=.+', multiline=true) | default('', true))
                | regex_replace('^address=', '')) }}
+    # Precedence: an explicitly-supplied port wins, else the port persisted on
+    # disk, else 443. remnawave_relay_port defaults to EMPTY precisely so the
+    # first branch is a real test — with a concrete 443 default it was always
+    # true, so a node on a non-443 edge port silently got rewritten to 443 here
+    # and in the marker.
     _change_relay_port: >-
       {{ remnawave_relay_port
-         if ((remnawave_relay_port | default('')) | string | length > 0 and (remnawave_relay_port | default(0) | int) > 0)
+         if ((remnawave_relay_port | default('')) | string | length > 0)
          else (((_change_relay_text | regex_search('^port=[0-9]+', multiline=true) | default('', true))
                 | regex_replace('^port=', '')) | default('443', true)) }}
 

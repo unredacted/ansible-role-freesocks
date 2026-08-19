@@ -30,7 +30,7 @@
       response:
         - { uuid: "uuid-ws", tag: "VLESS_WS_CDN", network: "ws" }
         - { uuid: "uuid-re", tag: "VLESS_REALITY", network: "raw" }
-        - { uuid: "uuid-rl", tag: "VLESS_REALITY_RELAY", network: "raw" }
+        - { uuid: "uuid-rl", tag: "VLESS_RELAY_REALITY", network: "raw" }
     _fake_inbounds_nested:
       response:
         inbounds:
@@ -86,7 +86,7 @@
     - name: Build the relay inbound
       set_fact:
         _relay_inbound:
-          tag: "VLESS_REALITY_RELAY"
+          tag: "VLESS_RELAY_REALITY"
           listen: "0.0.0.0"
           port: "{{ remnawave_bootstrap_relay_listen_port | int }}"
           protocol: "vless"
@@ -103,7 +103,7 @@
     - name: Assert relay inbound shape + key separation from direct Reality
       assert:
         that:
-          - _relay_inbound.tag == 'VLESS_REALITY_RELAY'
+          - _relay_inbound.tag == 'VLESS_RELAY_REALITY'
           - _relay_inbound.streamSettings.security == 'reality'
           - _relay_inbound.streamSettings.realitySettings.privateKey == 'PRIV-KEY-relay'
           # The two REALITY inbounds must NOT share a keypair: one seized node
@@ -165,7 +165,7 @@
         that:
           - _uuid_by_tag['VLESS_WS_CDN'] == 'uuid-ws'
           - _uuid_by_tag['VLESS_REALITY'] == 'uuid-re'
-          - _uuid_by_tag['VLESS_REALITY_RELAY'] == 'uuid-rl'
+          - _uuid_by_tag['VLESS_RELAY_REALITY'] == 'uuid-rl'
           - _fronted == ['uuid-ws']
         success_msg: "tag->uuid map + fronted squad inbound selection OK."
 

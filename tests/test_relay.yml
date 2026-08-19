@@ -15,6 +15,9 @@
 #       claims every relay node too (relay runs no Caddy either). The cases
 #       below pin the fix AND pin that legacy nodes still detect identically.
 #   (c) parsing the .relay_address marker file.
+#   (e) relay port precedence across lifecycle ops (regression: a concrete 443
+#       default made "was it supplied?" always true, so a non-443 edge port was
+#       silently rewritten to 443 on every rotation/migration).
 #   (d) the change/migrate repoint gates. Rotating or moving a relay node changes
 #       the ORIGIN the manual proxy dials, and only a human can update the proxy
 #       console — so the gates decide when the role refuses to proceed.
@@ -260,8 +263,65 @@
           Reality and WS rotations; too narrowly and a relay node breaks silently.
         success_msg: "(d) repoint gates fire on exactly the intended cases (1 change, 2 migrate)."
 
+    # --- (e) relay port precedence ------------------------------------------
+    # Mirrors _change_relay_port / _migrate_relay_port_effective. The bug this
+    # pins: remnawave_relay_port used to default to 443, so
+    # `(remnawave_relay_port | length > 0)` was ALWAYS true and the persisted port
+    # was never read — a relay on edge port 8443 would come back from `change`
+    # advertising 443, and its marker would be overwritten with 443 too. The
+    # default is now empty so the branch actually discriminates.
+    - name: Resolve the effective relay port for each precedence case
+      set_fact:
+        _eff_port: >-
+          {{ item.caller
+             if ((item.caller | default('')) | string | length > 0)
+             else (((item.marker | regex_search('^port=[0-9]+', multiline=true) | default('', true))
+                    | regex_replace('^port=', '')) | default('443', true)) }}
+      loop: &port_cases
+        # The regression case: nothing passed, node persisted a non-443 port.
+        - { name: "unset caller, marker 8443",  caller: "",     marker: "address=e.example.test\nport=8443\n", want: "8443" }
+        # An explicit port still wins, so an operator can re-point the edge.
+        - { name: "explicit 9000 beats marker", caller: 9000,   marker: "address=e.example.test\nport=8443\n", want: "9000" }
+        # Explicitly choosing 443 must be honoured even against a non-443 marker.
+        - { name: "explicit 443 beats marker",  caller: 443,    marker: "address=e.example.test\nport=8443\n", want: "443"  }
+        # No marker at all (fresh/foreign node) falls back to 443.
+        - { name: "unset caller, no marker",    caller: "",     marker: "",                                     want: "443"  }
+        - { name: "unset caller, marker w/o port", caller: "",  marker: "address=e.example.test\n",             want: "443"  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _ports
+
+    - name: Assert the persisted port survives a lifecycle op
+      assert:
+        that:
+          - (item.0.ansible_facts._eff_port | string) == (item.1.want | string)
+        fail_msg: >-
+          {{ item.1.name }}: resolved port
+          '{{ item.0.ansible_facts._eff_port }}', expected '{{ item.1.want }}'.
+          A non-443 relay must not be silently rewritten to 443 by change/migrate.
+        success_msg: "{{ item.1.name }} -> {{ item.0.ansible_facts._eff_port }}"
+      loop: "{{ _ports.results | zip(_port_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _port_cases_ref: *port_cases
+
+    # The role default must stay EMPTY, or (e) silently stops discriminating.
+    - name: Assert remnawave_relay_port ships empty so "unset" is detectable
+      assert:
+        that:
+          - (_role_defaults.remnawave_relay_port | string | length) == 0
+          - (_role_defaults.remnawave_relay_address | string | length) == 0
+        fail_msg: >-
+          remnawave_relay_port must default to EMPTY, not 443. A concrete default
+          makes "was a port supplied?" unanswerable, and change/migrate then
+          overwrite a non-443 relay's persisted port with 443. Consumers resolve
+          it with `| default(443, true)`.
+        success_msg: "(e) relay port precedence OK; the empty default keeps 'unset' detectable."
+
     - name: Summary
       debug:
         msg: >-
           relay: cleanup_hosts remark regex, migrate detection truth table,
-          .relay_address parsing, and the change/migrate repoint gates all verified.
+          .relay_address parsing, the repoint gates, and relay port precedence
+          all verified.

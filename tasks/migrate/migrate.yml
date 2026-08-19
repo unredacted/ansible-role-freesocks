@@ -619,9 +619,13 @@
       {{ remnawave_relay_address
          if ((remnawave_relay_address | default('')) | length > 0)
          else (migrate_source_relay_address | default('')) }}
+    # Same precedence rule as change mode: explicit port -> the source node's
+    # persisted port -> 443. remnawave_relay_port's default is EMPTY so the first
+    # branch actually discriminates (a concrete default made it always true, which
+    # would silently move a non-443 relay onto 443 during a migration).
     _migrate_relay_port_effective: >-
       {{ remnawave_relay_port
-         if ((remnawave_relay_port | default('')) | string | length > 0 and (remnawave_relay_port | default(0) | int) > 0)
+         if ((remnawave_relay_port | default('')) | string | length > 0)
          else ((migrate_source_relay_port | default('')) | default('443', true)) }}
   when:
     - inventory_hostname == destination_hostname

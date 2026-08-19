@@ -433,7 +433,7 @@ remnawave_reality_fingerprint: "chrome"
 # — the panel derives pbk/sid/flow when it injects users — so they are not role
 # variables. The role only creates the Host.
 remnawave_relay_enabled: false
-# The VLESS_REALITY_RELAY inbound's configProfileInboundUuid.
+# The VLESS_RELAY_REALITY inbound's configProfileInboundUuid.
 # operation_mode=bootstrap writes this into remnawave_bootstrap_output_file.
 remnawave_relay_inbound_uuid: ""
 # The EXTERNAL proxy edge clients dial (FQDN or IP). REQUIRED when enabled, and
@@ -442,7 +442,12 @@ remnawave_relay_inbound_uuid: ""
 # proxy entirely — a direct-Reality deploy wearing a relay label. The role
 # asserts it is set and that it differs from dns_hostname.
 remnawave_relay_address: ""
-remnawave_relay_port: 443
+# Empty means "443". It is deliberately NOT defaulted to 443 outright: change and
+# migrate have to tell an operator-supplied port from an untouched default so they
+# can fall back to the port persisted in .relay_address. With a concrete default
+# that distinction is impossible and a non-443 relay would silently be rewritten
+# to 443 on every rotation. Consumers resolve it with `| default(443, true)`.
+remnawave_relay_port: ""
 # A serverName the relay inbound borrows — must be one of
 # remnawave_bootstrap_relay_server_names. Bootstrap writes it into the output
 # file; keep it out of your creds file so the two cannot disagree (both load as

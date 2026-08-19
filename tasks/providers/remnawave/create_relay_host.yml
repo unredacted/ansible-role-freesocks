@@ -79,7 +79,7 @@
       # The PROXY EDGE plus the edge port mapped to THIS node — one edge can
       # front several nodes on different ports.
       address: "{{ remnawave_relay_address }}"
-      port: "{{ remnawave_relay_port | default(443) | int }}"
+      port: "{{ remnawave_relay_port | default(443, true) | int }}"
       sni: "{{ remnawave_relay_sni }}"
       fingerprint: "{{ remnawave_relay_fingerprint | default('chrome') }}"
       securityLayer: "DEFAULT"
@@ -98,6 +98,6 @@
   debug:
     msg: >-
       Relay Host ensured: {{ random_hostname }}-relay ->
-      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443) }}
+      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
       (sni {{ remnawave_relay_sni }}). The proxy edge must forward raw TCP to
       {{ dns_hostname | default('<node>') }}:{{ remnawave_relay_node_listen_port | default(443) }}.

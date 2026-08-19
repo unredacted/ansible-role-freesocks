@@ -383,7 +383,7 @@
       fail:
         msg: |
           remnawave_relay_enabled=true requires:
-            remnawave_relay_inbound_uuid  the VLESS_REALITY_RELAY inbound from the
+            remnawave_relay_inbound_uuid  the VLESS_RELAY_REALITY inbound from the
                                           Config Profile (operation_mode=bootstrap
                                           writes it into remnawave_bootstrap_output_file)
             remnawave_relay_address       the EXTERNAL L4 proxy's edge (FQDN or IP)
@@ -878,7 +878,7 @@
           {% endif %}
           {% if remnawave_relay_enabled | default(false) | bool %}
             ✓ relay transport (VLESS+REALITY via a manual external L4 proxy)
-                clients dial : {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443) }} (sni {{ remnawave_relay_sni }})
+                clients dial : {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }} (sni {{ remnawave_relay_sni }})
                 CONFIGURE BY HAND: point the proxy's backend at
                   {{ dns_hostname }}:{{ remnawave_relay_node_listen_port | default(443) }}  (raw TCP, no TLS at the edge)
                 The role cannot do this — it talks to no proxy provider.

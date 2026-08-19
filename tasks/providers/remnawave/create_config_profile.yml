@@ -62,7 +62,7 @@
 - name: Build the relay Reality inbound (inject the generated relay x25519 key)
   set_fact:
     _rw_relay_inbound:
-      tag: "VLESS_REALITY_RELAY"
+      tag: "VLESS_RELAY_REALITY"
       listen: "0.0.0.0"
       port: "{{ remnawave_bootstrap_relay_listen_port | int }}"
       protocol: "vless"
@@ -292,15 +292,20 @@
   set_fact:
     _rw_inbounds: "{{ _rw_inbounds_list.json.response['inbounds'] if (_rw_inbounds_list.json.response is mapping and 'inbounds' in _rw_inbounds_list.json.response) else _rw_inbounds_list.json.response }}"
 
-# Map tag -> uuid. Our tags (VLESS_WS_CDN / VLESS_REALITY / VLESS_REALITY_RELAY)
+# Map tag -> uuid. Our tags (VLESS_WS_CDN / VLESS_REALITY / VLESS_RELAY_REALITY)
 # are FreeSocks-specific, so matching by tag across all returned inbounds is
 # safe; when the panel scopes inbounds by profile we still only read our tags.
 #
-# The match is PANEL-WIDE, so a tag must be globally unique. Note the legacy
-# per-node clone shape is VLESS_REALITY_<HOSTNAME> — a node literally named
-# 'relay' would mint VLESS_REALITY_RELAY and hijack this entry. The
-# relay-vs-per-node-placement exclusion asserted in tasks/main.yml makes that
-# combination unreachable.
+# The match is PANEL-WIDE, so a tag must be globally unique — and it must stay
+# OUT of the legacy per-node clone namespaces. create_node_placement.yml builds
+# clone tags as `<base_tag>_<HOSTNAME>`, i.e. VLESS_REALITY_<HOSTNAME> and
+# VLESS_WS_CDN_<HOSTNAME>. That is why the relay tag is VLESS_RELAY_REALITY and
+# NOT VLESS_REALITY_RELAY: the latter is exactly what a DIRECT-Reality node named
+# 'relay' mints under per-node placement — and such a node has relay DISABLED, so
+# the relay/per-node exclusion assert in tasks/main.yml never fires for it. The
+# collision would make create_node_placement treat this base relay inbound as
+# that node's existing clone and repoint its Reality Host and squad onto it.
+# Do not "tidy" the word order back.
 - name: Map inbound tag -> uuid
   set_fact:
     remnawave_bootstrap_inbound_uuids: "{{ remnawave_bootstrap_inbound_uuids | default({}) | combine({ item.tag: item.uuid }) }}"
@@ -319,21 +324,21 @@
 
 - name: Capture the relay inbound UUID (for node deploys + the relay squad)
   set_fact:
-    remnawave_relay_inbound_uuid: "{{ remnawave_bootstrap_inbound_uuids['VLESS_REALITY_RELAY'] | default('') }}"
+    remnawave_relay_inbound_uuid: "{{ remnawave_bootstrap_inbound_uuids['VLESS_RELAY_REALITY'] | default('') }}"
   when: remnawave_bootstrap_relay | default(true) | bool
 
 - name: Assert the relay inbound UUID was read back
   assert:
     that:
-      - (remnawave_bootstrap_inbound_uuids['VLESS_REALITY_RELAY'] | default('')) | length > 0
+      - (remnawave_bootstrap_inbound_uuids['VLESS_RELAY_REALITY'] | default('')) | length > 0
     fail_msg: >-
-      No VLESS_REALITY_RELAY inbound UUID came back from
+      No VLESS_RELAY_REALITY inbound UUID came back from
       /api/config-profiles/inbounds. On a panel that ALREADY had
       '{{ remnawave_bootstrap_config_profile_name }}' the create POST is skipped
       by design and the relay inbound is added by the reconcile PATCH above —
       which is disabled when remnawave_bootstrap_reconcile_inbounds=false (then
       add the inbound in the panel UI by hand). Otherwise verify the tag the
-      panel returns matches VLESS_REALITY_RELAY.
+      panel returns matches VLESS_RELAY_REALITY.
   when: remnawave_bootstrap_relay | default(true) | bool
 
 - name: Assert the CDN inbound UUIDs were read back
@@ -352,5 +357,5 @@
       - "remnawave_panel_config_profile_uuid: {{ remnawave_panel_config_profile_uuid }}"
       - "WS inbound  (VLESS_WS_CDN):    {{ remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('(none)') }}"
       - "Reality inbound (VLESS_REALITY): {{ remnawave_reality_inbound_uuid | default('(disabled)') }}"
-      - "relay inbound (VLESS_REALITY_RELAY): {{ remnawave_relay_inbound_uuid | default('(disabled)') }}"
+      - "relay inbound (VLESS_RELAY_REALITY): {{ remnawave_relay_inbound_uuid | default('(disabled)') }}"
       - "relay inbound listens ON THE NODE at 0.0.0.0:{{ remnawave_bootstrap_relay_listen_port | default(443) }} — point your external L4 proxy's backend there."

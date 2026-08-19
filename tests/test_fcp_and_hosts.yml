@@ -72,7 +72,7 @@
           inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "rlin-1" }
           remark: "{{ 'apple-banana-cherry' ~ '-relay' }}"
           address: "{{ remnawave_relay_address }}"
-          port: "{{ remnawave_relay_port | default(443) | int }}"
+          port: "{{ remnawave_relay_port | default(443, true) | int }}"
           sni: "{{ remnawave_relay_sni }}"
           securityLayer: "DEFAULT"
           overrideSniFromAddress: false
