@@ -1,9 +1,13 @@
 ---
 # tasks/providers/remnawave/create_squad.yml
 #
-# Ensure the two connection-mode internal squads exist and capture their UUIDs:
-#   * fronted squad  = WS inbound           -> FCP Freedom Mode (freedom-ws)
-#   * Reality squad  = the Reality inbound  -> FCP Privacy Mode (privacy-reality)
+# Ensure the connection-mode internal squads exist and capture their UUIDs:
+#   * fronted squad  = WS inbound           -> FCP freedom-ws
+#   * Reality squad  = the Reality inbound  -> FCP privacy-reality
+#   * relay squad    = the relay inbound    -> FCP freedom-reality
+# (freedom-reality ships DISABLED in FCP's catalog; binding its pool succeeds but
+# the mode stays invisible to members until an operator enables it in the FCP
+# admin CMS — that needs admin:settings:write, which this role does not hold.)
 # These are the LEGACY shared (panel-wide) squads, created only when
 # remnawave_bootstrap_shared_squads=true; per-node squads are created at node
 # deploy time by create_node_placement.yml instead. FCP homes keys to a squad
@@ -14,7 +18,8 @@
 # VERIFY on your panel /docs: POST /api/internal-squads { name, inbounds: [uuid] }
 # and the list read-back (response[].{uuid,name}).
 #
-# Requires remnawave_bootstrap_inbound_uuids (set by create_config_profile.yml).
+# Requires remnawave_bootstrap_inbound_uuids + remnawave_reality_inbound_uuid +
+# remnawave_relay_inbound_uuid (all set by create_config_profile.yml).
 
 - name: List existing internal squads
   uri:
@@ -91,6 +96,28 @@
     - (remnawave_reality_inbound_uuid | default('')) | length > 0
     - remnawave_bootstrap_reality_squad_name not in _rw_squad_names
 
+- name: Create the relay squad when absent
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      name: "{{ remnawave_bootstrap_relay_squad_name }}"
+      inbounds: "{{ [remnawave_relay_inbound_uuid] }}"
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_relay_create
+  when:
+    - remnawave_bootstrap_relay | default(true) | bool
+    - (remnawave_relay_inbound_uuid | default('')) | length > 0
+    - remnawave_bootstrap_relay_squad_name not in _rw_squad_names
+
 - name: Re-list internal squads (resolve UUIDs uniformly)
   uri:
     url: "{{ remnawave_panel_url }}/api/internal-squads"
@@ -112,6 +139,7 @@
   set_fact:
     remnawave_fronted_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_fronted_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
     remnawave_reality_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_reality_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
+    remnawave_relay_squad_uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', remnawave_bootstrap_relay_squad_name) | map(attribute='uuid') | list | first) | default('', true) }}"
   no_log: true  # squad UUIDs are never logged
 
 - name: Assert the fronted squad UUID resolved
@@ -120,8 +148,103 @@
       - remnawave_fronted_squad_uuid | length > 0
     fail_msg: "Could not resolve the fronted squad UUID after create. Check /api/internal-squads."
 
+# Gated, but loud: an unresolved relay squad UUID would silently drop out of the
+# combine that builds FCP's mode-placement body, leaving the freedom-reality pool
+# bound to NOTHING — keys issued in that mode would reach no node.
+- name: Assert the relay squad UUID resolved
+  assert:
+    that:
+      - (remnawave_relay_squad_uuid | default('')) | length > 0
+    fail_msg: >-
+      Could not resolve the '{{ remnawave_bootstrap_relay_squad_name }}' squad
+      UUID after create. Without it the FCP freedom-reality pool is left bound to
+      nothing. Check /api/internal-squads and the panel's 30-char squad-name cap.
+  when:
+    - remnawave_bootstrap_relay | default(true) | bool
+    - (remnawave_relay_inbound_uuid | default('')) | length > 0
+
+# --- Reconcile membership on squads that ALREADY existed ---------------------
+# The creates above are name-gated, so an existing squad was never touched — but a
+# squad's inbound membership can go stale independently of its name. Deleting and
+# reconciling an inbound mints a NEW uuid (a workflow this role documents, since
+# editing dest/serverNames on an existing tag is not reconciled), after which the
+# captured uuid and the generated deploy vars point nodes at the new inbound while
+# the FCP-bound squad still references the removed one — or none at all. Keys in
+# that mode then reach no node, silently.
+#
+# ADDITIVE on purpose: the desired inbound is appended to whatever the squad
+# already holds, rather than replacing membership wholesale, so an operator who
+# deliberately added extra inbounds by hand does not lose them.
+#
+# Contract verified against the panel OpenAPI: PATCH /api/internal-squads takes
+# { uuid, inbounds: [<uuid string>] }, and GET exposes current membership as
+# objects carrying .uuid. CI pins remnawave/backend:2.8.0 and the published spec is
+# newer, so the integration suite deliberately exercises this PATCH (it drops the
+# relay squad's membership and asserts this task restores it).
+# Membership is checked PER SQUAD. An earlier version flattened every squad's
+# inbounds into one panel-wide list, so a desired inbound that happened to belong to
+# ANY other squad — including the extra hand-added memberships this task
+# deliberately preserves — suppressed the repair even when the FreeSocks squad
+# itself was empty. The correlated lookup a `rejectattr` cannot express is done with
+# the same {%- set -%}/append idiom used in create_node_placement.yml.
+- name: Map squad name -> its current inbound UUIDs
+  set_fact:
+    _rw_squad_members: >-
+      {%- set m = {} -%}
+      {%- for sq in _rw_squads2 -%}
+        {%- set _ = m.update({sq.name: (sq.inbounds | default([], true) | map(attribute='uuid') | list)}) -%}
+      {%- endfor -%}
+      {{ m }}
+  no_log: true
+
+- name: Plan squad membership reconciliation
+  set_fact:
+    _rw_squad_reconcile: >-
+      {%- set plan = [] -%}
+      {%- set want = [
+            {'name': remnawave_bootstrap_fronted_squad_name, 'want': remnawave_bootstrap_inbound_uuids['VLESS_WS_CDN'] | default('')},
+            {'name': remnawave_bootstrap_reality_squad_name, 'want': remnawave_reality_inbound_uuid | default('')},
+            {'name': remnawave_bootstrap_relay_squad_name,   'want': remnawave_relay_inbound_uuid | default('')}] -%}
+      {%- for c in want -%}
+        {%- if (c.want | length > 0) and (c.name in _rw_squad_members)
+               and (c.want not in _rw_squad_members[c.name]) -%}
+          {%- set _ = plan.append(c) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ plan }}
+  no_log: true
+
+- name: Note which squads need their inbound membership repaired
+  debug:
+    msg: >-
+      Repairing inbound membership on {{ _rw_squad_reconcile | length }} existing
+      squad(s): {{ _rw_squad_reconcile | map(attribute='name') | join(', ') }}.
+      Their bound inbound was missing — most likely the inbound was deleted and
+      re-created, which mints a new uuid.
+  when: _rw_squad_reconcile | length > 0
+
+- name: Repair inbound membership on existing squads (additive PATCH)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/internal-squads"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      uuid: "{{ (_rw_squads2 | selectattr('name', 'equalto', item.name) | list | first).uuid }}"
+      inbounds: "{{ (_rw_squad_members[item.name] | default([], true)) + [item.want] }}"
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  loop: "{{ _rw_squad_reconcile | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+
 - name: Summarize squad creation
   debug:
     msg:
       - "Fronted squad '{{ remnawave_bootstrap_fronted_squad_name }}': {{ 'uuid resolved' if (remnawave_fronted_squad_uuid | length > 0) else '(none)' }}"
       - "Reality squad '{{ remnawave_bootstrap_reality_squad_name }}': {{ 'uuid resolved' if (remnawave_reality_squad_uuid | default('') | length > 0) else '(disabled)' }}"
+      - "relay squad '{{ remnawave_bootstrap_relay_squad_name }}': {{ 'uuid resolved' if (remnawave_relay_squad_uuid | default('') | length > 0) else '(disabled)' }}"

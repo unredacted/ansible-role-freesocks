@@ -949,6 +949,83 @@
     - ansible-role-freesocks
 
 ###############################################################################
+# DEPLOY MODE: Remnawave node + relay (REALITY behind an external L4 proxy)
+###############################################################################
+# The heaviest-censorship transport. Clients dial an EXTERNAL L4/TCP proxy edge
+# that YOU create by hand; it forwards raw TCP to this node, where REALITY
+# terminates. No TLS at the edge (no cert/ACME/Caddy/decoy), and the node's own
+# address never appears in a client config.
+#
+# A relay node is DEDICATED — the role asserts Caddy off, direct Reality off,
+# cdn_provider none, and per-node placement off.
+#
+# TWO PORTS: remnawave_relay_port is the CLIENT-facing port ON THE EDGE.
+# remnawave_bootstrap_relay_listen_port is what the inbound binds ON THE NODE —
+# point the proxy's BACKEND at <node>:<that port>. Bootstrap and the deploy
+# summary both print the exact target.
+###############################################################################
+- name: "Deploy: Remnawave node + relay (REALITY via an external L4 proxy)"
+  hosts: remnawave_relay_servers
+  remote_user: root
+  vars:
+    operation_mode: deploy
+    deploy_target_domain: "example.com"
+
+    outline_enabled: false
+    remnawave_enabled: true
+
+    # Dedicated relay node: everything that would contend for :443 stays off.
+    remnawave_caddy_enabled: false
+    remnawave_reality_enabled: false
+    remnawave_per_node_placement: false
+    # No need to blank remnawave_cdn_transports: the role drops inherited CDN
+    # transports on a relay node itself. (It has to — the bootstrap output file is
+    # loaded as extra-vars, which outrank anything set here.)
+
+    remnawave_relay_enabled: true
+    remnawave_relay_inbound_uuid: "your-relay-inbound-uuid"   # from bootstrap output
+    # The EXTERNAL proxy edge clients dial. No default on purpose: defaulting it
+    # to the node would publish the origin to every subscriber.
+    remnawave_relay_address: "relay-edge.example.net"
+    remnawave_relay_sni: "your-relay-decoy.example"           # a serverName on the inbound
+    # remnawave_relay_port: 443            # client-facing port ON THE EDGE
+    # remnawave_relay_fingerprint: chrome
+
+    # Panel connection + API (register_node needs the API token)
+    remnawave_panel_url: "https://panel.example.com"
+    remnawave_panel_api_token: "your-remnawave-panel-token"   # vault me
+    remnawave_panel_register_node: true
+    remnawave_panel_config_profile_uuid: "your-config-profile-uuid"
+    remnawave_panel_country_code: "US"
+    remnawave_panel_secret_key: "your-panel-secret-key"       # vault me
+
+    # No CDN — an L4 relay is incompatible with Fastly (it cannot forward raw TCP).
+    domain_providers:
+      example.com:
+        dns_provider: cloudflare
+        zone_id: "your-cloudflare-zone-id"
+
+    cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
+    cloudflare_api_token: "your-cloudflare-api-token"
+    cloudflare_account_id: "your-account-id"
+
+    # FCP: the relay squad is bound to the freedom-reality pool at bootstrap.
+    # That mode ships DISABLED in FCP and the role cannot enable it — turn it on
+    # in FCP Admin -> Connection modes once a relay node exists.
+    fcp_enabled: true
+    fcp_api_url: "https://fcp.example.org"
+    fcp_api_token: "your-fcp-fsv1-token"   # vault me — fsv1_ service token
+    fcp_register_remnawave_panel: true
+
+    envoy_mappings:
+      remnawave-relay-1:
+        ipv4: ["1.2.3.4"]
+        ipv6: ["2001:db8::1"]
+
+  roles:
+    - ansible-role-freesocks
+
+###############################################################################
 # DEPLOY MODE: Outline + WSS via Fastly CDN (custom domain)
 ###############################################################################
 # Uses your own domain with Fastly TLS subscription (Let's Encrypt).

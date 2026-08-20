@@ -1,0 +1,1335 @@
+---
+# tests/test_relay.yml
+#
+# Self-asserting tests for the RELAY transport (VLESS+REALITY behind an external
+# L4 proxy) — pure filter logic, NO API calls.
+#
+#   (a) the cleanup_hosts.yml remark-matching regex. This expression had NO
+#       coverage anywhere before relay was added, which is exactly how it came
+#       to hardcode ['reality'] and silently orphan relay Hosts. It is also not
+#       covered by tests/test_integration.yml: that suite calls cleanup_hosts
+#       but never CREATES a Host, so the regex ran against an empty candidate
+#       set and looked exercised.
+#   (b) the migrate source-capability truth table. Before relay,
+#       migrate_detected_reality fell back to "no Caddyfile on disk", which
+#       claims every relay node too (relay runs no Caddy either). The cases
+#       below pin the fix AND pin that legacy nodes still detect identically.
+#   (c) parsing the .relay_address marker file.
+#   (n) STRUCTURAL: every destination gate in migrate.yml appears BEFORE the first
+#       mutating task. This ordering has been got wrong twice, and a comment does
+#       not enforce it — a gate that runs after the transfer strands the node
+#       instead of refusing the run.
+#   (t) the resolves-back-to-the-node comparison, and its fail-OPEN behaviour when a
+#       name cannot be resolved (getent is absent on macOS controllers, and an edge may
+#       only resolve from the networks clients use).
+#   (t2) the getent_hosts RESULT SHAPE (keyed by address, names as values) — (t)
+#       covered the comparison and passed while the extraction was wrong.
+#   (n4) STRUCTURAL: in change mode the new hostname is derived BEFORE the gates (so
+#       the ack can name the new origin and the anti-leak check sees the future FQDN),
+#       while DNS and the on-disk markers stay after them.
+#   (t3) the KNOWN GAP in IPv6 spelling equivalence, asserted as a gap so it cannot be
+#       mistaken for coverage.
+#   (u) the panel-token pre-flights fire whenever the registered path is effective.
+#   (s) STRUCTURAL: every Host-creation task file fetches the existing Hosts BEFORE
+#       its idempotency decision. Dropping that GET makes every run look like
+#       "nothing exists", so re-runs duplicate Hosts instead of replacing them.
+#   (q) DNS-equivalent spellings of the node's own address are rejected too
+#       (case, terminal dot, IPv6 hex case) — a byte compare let those through.
+#   (r) bootstrap refuses relay without the shared-squad topology, the combination
+#       that produced a healthy-looking relay with no squad at all.
+#   (p) STRUCTURAL: migrate.yml gates on the *_effective facts only, never on a raw
+#       transport flag — mixing the two made Hosts follow detection while the panel
+#       address update followed the raw flag.
+#   (o) squad membership is reconciled PER SQUAD, not against a panel-wide list.
+#   (j) the anti-leak invariant covers the node's own IPs, not just its hostname.
+#   (k) endpoint drift on a same-name op replaces the Host instead of skipping.
+#   (l) migrate refuses a destination where relay and another :443 transport would
+#       both be effective.
+#   (g) the same-name guard on Host cleanup: a same-name rotation/migration must
+#       NOT delete the Host it is meant to keep, while the wipe path (which sets
+#       old == new deliberately) must still clean.
+#   (f) a relay node activates ONLY its relay inbound, even when an enabled CDN
+#       transport is inherited from the bootstrap output (which arrives as
+#       extra-vars and cannot be overridden from inventory).
+#   (e) relay port precedence across lifecycle ops (regression: a concrete 443
+#       default made "was it supplied?" always true, so a non-443 edge port was
+#       silently rewritten to 443 on every rotation/migration).
+#   (d) the change/migrate repoint gates. Rotating or moving a relay node changes
+#       the ORIGIN the manual proxy dials, and only a human can update the proxy
+#       console — so the gates decide when the role refuses to proceed.
+#
+# The label list is loaded from defaults/main.yml rather than restated, so the
+# task and this test cannot disagree about which transports get torn down. The
+# regex skeleton itself is mirrored from
+# tasks/providers/remnawave/cleanup_hosts.yml ("Build the OLD Host remark
+# pattern") — keep the two in step.
+#
+# Run: ansible-playbook tests/test_relay.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # One fixture list reused by every case below; only the pattern inputs vary.
+    _hosts_fixture:
+      - { uuid: "u-ws",          remark: "quiet-falcon-ws" }
+      - { uuid: "u-reality",     remark: "quiet-falcon-reality" }
+      - { uuid: "u-relay",       remark: "quiet-falcon-relay" }
+      - { uuid: "u-ws-sfx",      remark: "quiet-falcon-ws-a1b2c3" }
+      - { uuid: "u-relay-sfx",   remark: "quiet-falcon-relay-a1b2c3" }
+      # Must NOT match:
+      - { uuid: "x-other-node",  remark: "quiet-falcon-2-ws" }
+      - { uuid: "x-other-host",  remark: "other-node-relay" }
+      - { uuid: "x-suffixed",    remark: "quiet-falcon-relayx" }
+      - { uuid: "x-hex5",        remark: "quiet-falcon-relay-a1b2c" }
+      - { uuid: "x-hex7",        remark: "quiet-falcon-relay-a1b2c3d" }
+      - { uuid: "x-hexupper",    remark: "quiet-falcon-relay-A1B2C3" }
+      - { uuid: "x-bare",        remark: "quiet-falcon" }
+    _ws_transports:
+      - { name: ws, enabled: true }
+  tasks:
+    # --- (a) cleanup_hosts.yml remark regex ---------------------------------
+    - name: Load the role defaults (single source of truth for the labels)
+      include_vars:
+        file: ../defaults/main.yml
+        name: _role_defaults
+
+    - name: The direct-transport labels ship with relay included
+      assert:
+        that:
+          - "'reality' in _role_defaults.remnawave_direct_transport_remarks"
+          - "'relay' in _role_defaults.remnawave_direct_transport_remarks"
+        fail_msg: >-
+          remnawave_direct_transport_remarks must carry both direct transports —
+          a missing label means cleanup_hosts.yml never tears that transport's
+          Hosts down.
+        success_msg: "(a1) direct-transport labels: reality + relay."
+
+    - name: Build the remark pattern the way cleanup_hosts.yml does
+      set_fact:
+        _pat: >-
+          ^{{ 'quiet-falcon' | regex_escape }}-(({{ (_ws_transports | map(attribute='name') | list + _role_defaults.remnawave_direct_transport_remarks) | join('|') }}))(-[0-9a-f]{6})?$
+
+    - name: Select the matching Hosts
+      set_fact:
+        _matched: "{{ _hosts_fixture | selectattr('remark', 'match', _pat) | map(attribute='uuid') | list }}"
+
+    - name: Exactly the intended remarks match — nothing more, nothing less
+      assert:
+        that:
+          - _matched == ['u-ws', 'u-reality', 'u-relay', 'u-ws-sfx', 'u-relay-sfx']
+        fail_msg: >-
+          Unexpected remark match set: {{ _matched }}. relay/reality/ws (plus the
+          optional 6-lowercase-hex multi-edge suffix) must match; an extending
+          hostname ('quiet-falcon-2-ws'), a different hostname, a longer
+          transport name ('relayx'), and 5/7-char or uppercase hex must not.
+        success_msg: "(a2) remark regex matches ws/reality/relay + 6-hex suffix only."
+
+    # A caller that passes remnawave_cdn_transports: [] (a relay/Reality node is
+    # dedicated and may legitimately do this) must still tear down the DIRECT
+    # transports — they are literals, not derived from the transport list.
+    - name: Build the pattern with no CDN transports at all
+      set_fact:
+        _pat_nocdn: >-
+          ^{{ 'quiet-falcon' | regex_escape }}-(({{ ([] | map(attribute='name') | list + _role_defaults.remnawave_direct_transport_remarks) | join('|') }}))(-[0-9a-f]{6})?$
+
+    - name: Select with no CDN transports
+      set_fact:
+        _matched_nocdn: "{{ _hosts_fixture | selectattr('remark', 'match', _pat_nocdn) | map(attribute='uuid') | list }}"
+
+    - name: Direct transports survive an empty remnawave_cdn_transports
+      assert:
+        that:
+          - _matched_nocdn == ['u-reality', 'u-relay', 'u-relay-sfx']
+        fail_msg: >-
+          With remnawave_cdn_transports: [] the direct transports must still
+          match and the ws ones must drop. Got {{ _matched_nocdn }}.
+        success_msg: "(a3) empty cdn_transports: reality/relay still torn down, ws not."
+
+    # regex_escape: old_random_hostname derives from custom_hostname, which the
+    # role never validates. Unescaped, '.' is a wildcard and would reach another
+    # node's Hosts.
+    - name: Build the pattern for a dotted hostname
+      set_fact:
+        _pat_dotted: >-
+          ^{{ 'a.b' | regex_escape }}-(({{ (_ws_transports | map(attribute='name') | list + _role_defaults.remnawave_direct_transport_remarks) | join('|') }}))(-[0-9a-f]{6})?$
+
+    - name: Select against a dot-collision fixture
+      set_fact:
+        _matched_dotted: "{{ [{'uuid': 'ok', 'remark': 'a.b-relay'}, {'uuid': 'collide', 'remark': 'axb-relay'}] | selectattr('remark', 'match', _pat_dotted) | map(attribute='uuid') | list }}"
+
+    - name: A dot in the hostname is escaped, not treated as a wildcard
+      assert:
+        that:
+          - _matched_dotted == ['ok']
+        fail_msg: >-
+          regex_escape is missing: 'a.b' matched 'axb-relay', which belongs to a
+          different node. Got {{ _matched_dotted }}.
+        success_msg: "(a4) regex_escape prevents dot-wildcard cross-node matches."
+
+    # --- (b) migrate source-capability truth table ---------------------------
+    - name: Run the detection truth table
+      include_tasks: relay_detect_case.yml
+      loop:
+        # A pre-relay Reality node: no Caddy, no marker, no per-node squad file.
+        # This is the regression that matters most — it must stay Reality.
+        - { name: "legacy reality (shared squads)", caddyfile: false, marker: false, squads: "",
+            expect_caddy: false, expect_reality: true,  expect_relay: false }
+        - { name: "legacy caddy/ws",               caddyfile: true,  marker: false, squads: "",
+            expect_caddy: true,  expect_reality: false, expect_relay: false }
+        - { name: "legacy per-node reality",       caddyfile: false, marker: false, squads: "fronted=\nreality=abc-222\n",
+            expect_caddy: false, expect_reality: true,  expect_relay: false }
+        # Proves ^reality=\S does not fire on an EMPTY reality= value.
+        - { name: "legacy per-node ws",            caddyfile: true,  marker: false, squads: "fronted=abc-111\nreality=\n",
+            expect_caddy: true,  expect_reality: false, expect_relay: false }
+        # The bug being fixed: relay must NOT be detected as Reality.
+        - { name: "relay",                         caddyfile: false, marker: true,  squads: "",
+            expect_caddy: false, expect_reality: false, expect_relay: true }
+        # Contradictory evidence -> the role refuses rather than guessing.
+        - { name: "relay + caddy (contradiction)", caddyfile: true,  marker: true,  squads: "",
+            expect_caddy: true,  expect_reality: false, expect_relay: true, expect_contradiction: true }
+        - { name: "no squad file, caddy present",  caddyfile: true,  marker: false, squads: "",
+            expect_caddy: true,  expect_reality: false, expect_relay: false }
+      loop_control:
+        label: "{{ item.name }}"
+
+    # --- (c) .relay_address marker parsing -----------------------------------
+    # Mirrors "Materialize the source relay endpoint" in tasks/migrate/migrate.yml.
+    # Patterns are backslash-free by design: YAML block scalars pass backslashes
+    # through raw while double-quoted scalars consume them, so a \S-style pattern
+    # is silently style-dependent. The non-group regex_search form returns None
+    # rather than raising on no-match (the group form raises
+    # "'NoneType' object has no attribute 'group'").
+    - name: Parse every marker-file shape
+      set_fact:
+        _addr: >-
+          {{ (item.text | regex_search('^address=.+', multiline=true) | default('', true)) | regex_replace('^address=', '') }}
+        _port: >-
+          {{ (item.text | regex_search('^port=[0-9]+', multiline=true) | default('', true)) | regex_replace('^port=', '') }}
+      loop: &marker_cases
+        - { name: "normal",            text: "address=relay-edge.example.test\nport=8443\n", addr: "relay-edge.example.test", port: "8443" }
+        - { name: "no trailing NL",    text: "address=relay-edge.example.test\nport=8443",    addr: "relay-edge.example.test", port: "8443" }
+        - { name: "extra blank lines", text: "address=e.example.test\nport=443\n\n",         addr: "e.example.test",          port: "443" }
+        - { name: "address only",      text: "address=e.example.test\n",                      addr: "e.example.test",          port: "" }
+        - { name: "empty file",        text: "",                                              addr: "",                        port: "" }
+        - { name: "garbage",           text: "who knows\n",                                   addr: "",                        port: "" }
+        - { name: "IPv6 literal",      text: "address=2001:db8::1\nport=443\n",               addr: "2001:db8::1",             port: "443" }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _marker_parsed
+
+    - name: Every shape parses to the expected endpoint (and never raises)
+      assert:
+        that:
+          - item.0.ansible_facts._addr == item.1.addr
+          - item.0.ansible_facts._port == item.1.port
+        fail_msg: >-
+          {{ item.1.name }}: got address='{{ item.0.ansible_facts._addr }}'
+          port='{{ item.0.ansible_facts._port }}', expected
+          address='{{ item.1.addr }}' port='{{ item.1.port }}'.
+        success_msg: "{{ item.1.name }} -> address='{{ item.0.ansible_facts._addr }}' port='{{ item.0.ansible_facts._port }}'"
+      loop: "{{ _marker_parsed.results | zip(_marker_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _marker_cases_ref: *marker_cases
+
+    # --- (d) the change / migrate repoint gates -------------------------------
+    # change mode rotates on the SAME machine, so the node's IP does not move:
+    # an IP-origin proxy console keeps working and only an FQDN-origin one breaks
+    # — and it only breaks irrecoverably when change_delete_old_dns destroys the
+    # old name in the same run. So change hard-fails ONLY in that combination.
+    # migrate always moves machines, so it always requires the ack.
+    - name: Evaluate the repoint gates across every combination
+      set_fact:
+        _change_fails: >-
+          {{ (item.relay | bool) and (item.delete_old_dns | bool) and (not (item.ack | bool)) }}
+        _change_warns: >-
+          {{ (item.relay | bool) and (not (item.delete_old_dns | bool)) }}
+        _migrate_fails: >-
+          {{ (item.relay | bool) and (not (item.ack | bool)) }}
+        # The second half of the rotation hazard: acknowledging without a
+        # custom_hostname means the name the operator re-pointed to cannot be
+        # reproduced, because it came from `shuf`.
+        _change_needs_name: >-
+          {{ (item.relay | bool) and (item.delete_old_dns | bool)
+             and (item.ack | bool) and (not (item.custom | default(false) | bool)) }}
+      loop: &gate_cases
+        # Not a relay node: never gated, whatever the other flags say.
+        - { name: "non-relay, delete dns",     relay: false, delete_old_dns: true,  ack: false, cf: false, cw: false, mf: false }
+        - { name: "non-relay, keep dns",       relay: false, delete_old_dns: false, ack: false, cf: false, cw: false, mf: false }
+        # Relay, old name KEPT: recoverable, so warn only — but migrate still fails.
+        - { name: "relay, keep dns, no ack",   relay: true,  delete_old_dns: false, ack: false, cf: false, cw: true,  mf: true  }
+        # Relay, old name DELETED, unacknowledged: the irrecoverable case.
+        - { name: "relay, delete dns, no ack", relay: true,  delete_old_dns: true,  ack: false, cf: true,  cw: false, mf: true  }
+        # Acknowledged: change proceeds; migrate proceeds.
+        # Acknowledged WITHOUT an explicit name: the generated origin is not
+        # reproducible, so this must be refused rather than deleting the old record
+        # and publishing a third name.
+        - { name: "relay, delete dns, ack, random name", relay: true, delete_old_dns: true, ack: true, custom: false, cf: false, cw: false, mf: false, needs_name: true }
+        # Acknowledged WITH the name passed back: the only completable form.
+        - { name: "relay, delete dns, ack, name given",  relay: true, delete_old_dns: true, ack: true, custom: true,  cf: false, cw: false, mf: false, needs_name: false }
+        # Old name retained: the new name is live either way, nothing to pass back.
+        - { name: "relay, keep dns, ack",      relay: true,  delete_old_dns: false, ack: true,  cf: false, cw: true,  mf: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _gates
+
+    - name: Assert each gate fires exactly when it should
+      assert:
+        that:
+          - (item.0.ansible_facts._change_fails | bool) == (item.1.cf | bool)
+          - (item.0.ansible_facts._change_warns | bool) == (item.1.cw | bool)
+          - (item.0.ansible_facts._migrate_fails | bool) == (item.1.mf | bool)
+          - (item.0.ansible_facts._change_needs_name | bool) == (item.1.needs_name | default(false) | bool)
+        fail_msg: >-
+          {{ item.1.name }}: change_fails={{ item.0.ansible_facts._change_fails }}
+          (want {{ item.1.cf }}), change_warns={{ item.0.ansible_facts._change_warns }}
+          (want {{ item.1.cw }}), migrate_fails={{ item.0.ansible_facts._migrate_fails }}
+          (want {{ item.1.mf }}),
+          needs_name={{ item.0.ansible_facts._change_needs_name }} (want
+          {{ item.1.needs_name | default(false) }}).
+        success_msg: "{{ item.1.name }} -> change_fail={{ item.1.cf }} change_warn={{ item.1.cw }} migrate_fail={{ item.1.mf }} needs_name={{ item.0.ansible_facts._change_needs_name }}"
+      loop: "{{ _gates.results | zip(_gate_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _gate_cases_ref: *gate_cases
+
+    # Blast-radius check: map through `bool` first — a set_fact from a block scalar
+    # can surface as the STRING "False", which select('equalto', True) would miss,
+    # making this assert silently vacuous.
+    - name: The gates fire on exactly the intended number of cases
+      vars:
+        _cf: "{{ _gates.results | map(attribute='ansible_facts._change_fails') | map('bool') | select | list }}"
+        _mf: "{{ _gates.results | map(attribute='ansible_facts._migrate_fails') | map('bool') | select | list }}"
+      assert:
+        that:
+          # Only "relay + delete old DNS + no ack" is irrecoverable.
+          - _cf | length == 1
+          # migrate always needs the ack, so both unacknowledged relay cases fail.
+          - _mf | length == 2
+        fail_msg: >-
+          Gates fired on {{ _cf | length }} change / {{ _mf | length }} migrate
+          cases (want 1 / 2). A gate that fires too broadly blocks ordinary
+          Reality and WS rotations; too narrowly and a relay node breaks silently.
+        success_msg: "(d) repoint gates fire on exactly the intended cases (1 change, 2 migrate)."
+
+    # --- (e) relay port precedence ------------------------------------------
+    # Mirrors _change_relay_port / _migrate_relay_port_effective. The bug this
+    # pins: remnawave_relay_port used to default to 443, so
+    # `(remnawave_relay_port | length > 0)` was ALWAYS true and the persisted port
+    # was never read — a relay on edge port 8443 would come back from `change`
+    # advertising 443, and its marker would be overwritten with 443 too. The
+    # default is now empty so the branch actually discriminates.
+    - name: Resolve the effective relay port for each precedence case
+      set_fact:
+        _eff_port: >-
+          {{ item.caller
+             if ((item.caller | default('')) | string | length > 0)
+             else (((item.marker | regex_search('^port=[0-9]+', multiline=true) | default('', true))
+                    | regex_replace('^port=', '')) | default('443', true)) }}
+      loop: &port_cases
+        # The regression case: nothing passed, node persisted a non-443 port.
+        - { name: "unset caller, marker 8443",  caller: "",     marker: "address=e.example.test\nport=8443\n", want: "8443" }
+        # An explicit port still wins, so an operator can re-point the edge.
+        - { name: "explicit 9000 beats marker", caller: 9000,   marker: "address=e.example.test\nport=8443\n", want: "9000" }
+        # Explicitly choosing 443 must be honoured even against a non-443 marker.
+        - { name: "explicit 443 beats marker",  caller: 443,    marker: "address=e.example.test\nport=8443\n", want: "443"  }
+        # No marker at all (fresh/foreign node) falls back to 443.
+        - { name: "unset caller, no marker",    caller: "",     marker: "",                                     want: "443"  }
+        - { name: "unset caller, marker w/o port", caller: "",  marker: "address=e.example.test\n",             want: "443"  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _ports
+
+    - name: Assert the persisted port survives a lifecycle op
+      assert:
+        that:
+          - (item.0.ansible_facts._eff_port | string) == (item.1.want | string)
+        fail_msg: >-
+          {{ item.1.name }}: resolved port
+          '{{ item.0.ansible_facts._eff_port }}', expected '{{ item.1.want }}'.
+          A non-443 relay must not be silently rewritten to 443 by change/migrate.
+        success_msg: "{{ item.1.name }} -> {{ item.0.ansible_facts._eff_port }}"
+      loop: "{{ _ports.results | zip(_port_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _port_cases_ref: *port_cases
+
+    # --- (e2) fingerprint precedence + marker backward compatibility -----------
+    # The last Host field that had the port bug's shape: a concrete 'chrome' default made
+    # "was it supplied?" unanswerable, so a deliberate non-default fingerprint was
+    # rewritten to chrome by any lifecycle run that did not re-pass it — and the Host was
+    # re-created every run, since its body then differed from the live one.
+    - name: Resolve the effective fingerprint for each case
+      set_fact:
+        _eff_fp: >-
+          {{ item.caller
+             if ((item.caller | default('')) | length > 0)
+             else (((item.marker | regex_search('^fingerprint=.+', multiline=true) | default('', true))
+                    | regex_replace('^fingerprint=', '')) | default('chrome', true)) }}
+      loop: &fp_cases
+        - { name: "unset caller, marker firefox",   caller: "",        marker: "address=e\nport=443\nfingerprint=firefox\n", want: "firefox" }
+        - { name: "explicit safari beats marker",   caller: "safari",  marker: "address=e\nport=443\nfingerprint=firefox\n", want: "safari"  }
+        - { name: "explicit chrome beats marker",   caller: "chrome",  marker: "address=e\nport=443\nfingerprint=firefox\n", want: "chrome"  }
+        # A marker written BEFORE this change has no fingerprint line.
+        - { name: "legacy 2-line marker",           caller: "",        marker: "address=e\nport=443\n",                      want: "chrome"  }
+        - { name: "no marker at all",               caller: "",        marker: "",                                            want: "chrome"  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _fps
+
+    - name: Assert a deliberate fingerprint survives a lifecycle run
+      assert:
+        that:
+          - (item.0.ansible_facts._eff_fp | string) == (item.1.want | string)
+        fail_msg: >-
+          {{ item.1.name }}: resolved '{{ item.0.ansible_facts._eff_fp }}', expected
+          '{{ item.1.want }}'. Losing a persisted fingerprint silently changes the
+          client's TLS mimicry and re-creates the Host on every run.
+        success_msg: "{{ item.1.name }} -> {{ item.0.ansible_facts._eff_fp }}"
+      loop: "{{ _fps.results | zip(_fp_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _fp_cases_ref: *fp_cases
+
+    # The role default must stay EMPTY, or (e) silently stops discriminating.
+    - name: Assert remnawave_relay_port ships empty so "unset" is detectable
+      assert:
+        that:
+          - (_role_defaults.remnawave_relay_port | string | length) == 0
+          - (_role_defaults.remnawave_relay_address | string | length) == 0
+          - (_role_defaults.remnawave_relay_fingerprint | string | length) == 0
+        fail_msg: >-
+          remnawave_relay_port must default to EMPTY, not 443. A concrete default
+          makes "was a port supplied?" unanswerable, and change/migrate then
+          overwrite a non-443 relay's persisted port with 443. Consumers resolve
+          it with `| default(443, true)`.
+        success_msg: "(e) relay port precedence OK; the empty default keeps 'unset' detectable."
+
+    # --- (f) relay nodes drop inherited CDN transports ------------------------
+    # Mirrors the derivation in tasks/setup/remnawave.yml. The hazard: the
+    # bootstrap output vars file carries an ENABLED ws transport and is loaded with
+    # `-e @file`, so it outranks an inventory-level `remnawave_cdn_transports: []`.
+    # If the derivation did not drop it, a "dedicated" relay node would also
+    # activate the WS inbound.
+    - name: Resolve the active inbound set for each node kind
+      set_fact:
+        _decl: >-
+          {{ item.transports | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+             | select('string') | reject('equalto', '') | list }}
+        _cdn: >-
+          {{ []
+             if (item.relay | bool)
+             else (item.transports | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+                   | select('string') | reject('equalto', '') | list) }}
+      loop: &inbound_cases
+        # The real-world relay case: WS transport inherited and enabled.
+        - name: "relay node, WS inherited"
+          relay: true
+          transports: [{ name: ws, inbound_uuid: "uuid-ws", enabled: true }]
+          want_cdn: []
+        # A non-relay node must be completely unaffected by this change.
+        - name: "ws node, WS enabled"
+          relay: false
+          transports: [{ name: ws, inbound_uuid: "uuid-ws", enabled: true }]
+          want_cdn: ["uuid-ws"]
+        - name: "ws node, WS disabled"
+          relay: false
+          transports: [{ name: ws, inbound_uuid: "uuid-ws", enabled: false }]
+          want_cdn: []
+      loop_control:
+        label: "{{ item.name }}"
+      register: _inbounds
+
+    - name: Assert relay drops inherited transports and others keep theirs
+      assert:
+        that:
+          - item.0.ansible_facts._cdn == item.1.want_cdn
+        fail_msg: >-
+          {{ item.1.name }}: active CDN inbounds {{ item.0.ansible_facts._cdn }},
+          expected {{ item.1.want_cdn }}. A relay node must activate only its relay
+          inbound; a non-relay node must be untouched by that rule.
+        success_msg: "{{ item.1.name }} -> cdn={{ item.0.ansible_facts._cdn }}"
+      loop: "{{ _inbounds.results | zip(_inbound_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _inbound_cases_ref: *inbound_cases
+
+    - name: The relay case must still have SEEN a declared transport
+      assert:
+        that:
+          - _inbounds.results[0].ansible_facts._decl == ['uuid-ws']
+        fail_msg: >-
+          The relay fixture no longer carries an enabled transport, so (f) is not
+          testing that it gets dropped.
+        success_msg: "(f) relay nodes activate only the relay inbound; non-relay nodes unaffected."
+
+    # --- (g) same-name Host-cleanup guard -------------------------------------
+    # The create tasks are GET-first by remark, so on a same-name rotation or
+    # migration they find the remark already present and skip. Cleaning up "the old
+    # hostname" would then delete the very Host meant to survive and put nothing
+    # back — the node silently leaves every subscription. This affects ws, reality
+    # AND relay: they all share the skip-by-remark shape.
+    #
+    # The guard is at the change/migrate CALL SITES, not inside cleanup_hosts.yml,
+    # because force_wipe_remnawave deliberately calls it with old == new to remove a
+    # decommissioned node's own Hosts.
+    - name: Evaluate the cleanup gate for each scenario
+      set_fact:
+        _cleanup_runs: >-
+          {{ ((item.old | default('')) != (item.new | default('')))
+             if (item.path == 'lifecycle') else true }}
+      loop: &cleanup_cases
+        - { name: "rotation to a new name",    path: lifecycle, old: "quiet-falcon", new: "brave-otter",  want: true  }
+        - { name: "same-name rotation",        path: lifecycle, old: "quiet-falcon", new: "quiet-falcon", want: false }
+        - { name: "migration to a new name",   path: lifecycle, old: "node-one",     new: "node-two",     want: true  }
+        - { name: "same-name migration",       path: lifecycle, old: "node-one",     new: "node-one",     want: false }
+        # The wipe path is NOT gated — it must delete this node's own Hosts.
+        - { name: "wipe (old == new by design)", path: wipe,    old: "quiet-falcon", new: "quiet-falcon", want: true  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _cleanups
+
+    - name: Assert cleanup runs exactly when there is something old to remove
+      assert:
+        that:
+          - (item.0.ansible_facts._cleanup_runs | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: cleanup_runs={{ item.0.ansible_facts._cleanup_runs }},
+          expected {{ item.1.want }}. Running it on a same-name lifecycle op deletes
+          the surviving Host; skipping it on a wipe orphans a dead node's Hosts.
+        success_msg: "{{ item.1.name }} -> cleanup {{ 'runs' if item.1.want else 'skipped' }}"
+      loop: "{{ _cleanups.results | zip(_cleanup_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _cleanup_cases_ref: *cleanup_cases
+
+    # --- (h) the anti-leak invariant is enforced at the choke point ------------
+    # create_relay_host.yml asserts address != dns_hostname itself, because change
+    # and migrate include it WITHOUT passing through the deploy-block guard and both
+    # let a caller override the persisted endpoint.
+    - name: Evaluate the choke-point invariant
+      set_fact:
+        _addr_ok: >-
+          {{ ((item.addr | default('')) | length > 0)
+             and ((item.addr | default('')) != (item.node | default(''))) }}
+      loop: &addr_cases
+        - { name: "edge address",              addr: "relay-edge.example.test", node: "n1.example.test", want: true  }
+        - { name: "address == node (leak)",    addr: "n1.example.test",         node: "n1.example.test", want: false }
+        - { name: "empty address",             addr: "",                        node: "n1.example.test", want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _addrs
+
+    - name: Assert the invariant rejects both the leak and the empty case
+      assert:
+        that:
+          - (item.0.ansible_facts._addr_ok | bool) == (item.1.want | bool)
+        fail_msg: "{{ item.1.name }}: accepted={{ item.0.ansible_facts._addr_ok }}, expected {{ item.1.want }}."
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _addrs.results | zip(_addr_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _addr_cases_ref: *addr_cases
+
+    # --- (i) reconcile must populate a pre-created EMPTY profile ---------------
+    - name: Evaluate the reconcile PATCH gate
+      set_fact:
+        _patches: >-
+          {{ (item.exists | bool) and (item.has_config | bool) and ((item.missing | length) > 0) }}
+      loop: &reconcile_cases
+        - { name: "existing profile, relay inbound missing", exists: true,  has_config: true, missing: ["VLESS_RELAY_REALITY"], want: true  }
+        # The case the old length>0 guard broke: a hand-created, empty profile.
+        - { name: "existing EMPTY profile",                  exists: true,  has_config: true, missing: ["VLESS_WS_CDN", "VLESS_REALITY", "VLESS_RELAY_REALITY"], want: true }
+        - { name: "existing profile, nothing missing",       exists: true,  has_config: true, missing: [],                      want: false }
+        # Freshly created by this run — the POST already carried every inbound.
+        - { name: "profile just created",                    exists: false, has_config: true, missing: ["VLESS_RELAY_REALITY"], want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _recs
+
+    - name: Assert reconcile fires for every existing profile that lacks an inbound
+      assert:
+        that:
+          - (item.0.ansible_facts._patches | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: patches={{ item.0.ansible_facts._patches }}, expected
+          {{ item.1.want }}. An existing profile with an EMPTY inbound list must be
+          populated, not skipped — skipping it fails the read-back assertions.
+        success_msg: "{{ item.1.name }} -> {{ 'PATCH' if item.1.want else 'skip' }}"
+      loop: "{{ _recs.results | zip(_rec_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _rec_cases_ref: *reconcile_cases
+
+    # --- (j) anti-leak covers IPs, not just the hostname ----------------------
+    # remnawave_relay_address accepts an IP as well as an FQDN, so comparing only
+    # against dns_hostname let the node's own IP through — same disclosure, and it
+    # is the form an operator is most likely to paste by mistake.
+    - name: Build the node-address set the way create_relay_host.yml does
+      set_fact:
+        _node_addrs: >-
+          {{ (['n1.example.test', '203.0.113.10', '2001:db8::10']
+              + ['198.51.100.7'])
+             | select('string') | reject('equalto', '') | list }}
+
+    - name: Evaluate the anti-leak invariant against each candidate address
+      set_fact:
+        _leak_ok: "{{ (item.addr | default('')) not in _node_addrs }}"
+      loop: &leak_cases
+        - { name: "proxy edge FQDN",        addr: "relay-edge.example.test", want: true  }
+        - { name: "proxy edge IP",          addr: "192.0.2.50",              want: true  }
+        - { name: "node hostname",          addr: "n1.example.test",         want: false }
+        - { name: "node default IPv4",      addr: "203.0.113.10",            want: false }
+        - { name: "node IPv6",              addr: "2001:db8::10",            want: false }
+        - { name: "node envoy_mappings IP", addr: "198.51.100.7",            want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _leaks
+
+    - name: Assert every form of the node's own address is rejected
+      assert:
+        that:
+          - (item.0.ansible_facts._leak_ok | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }} ({{ item.1.addr }}): accepted={{ item.0.ansible_facts._leak_ok }},
+          expected {{ item.1.want }}. Publishing any of the node's own addresses
+          defeats the whole point of the relay.
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _leaks.results | zip(_leak_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _leak_cases_ref: *leak_cases
+
+    # --- (k) endpoint drift replaces a same-name Host -------------------------
+    # The remark does not encode the endpoint, and the relay edge is the one field
+    # an operator changes independently of the hostname. Without drift detection a
+    # same-name op keeps advertising the old edge while .relay_address records the
+    # new one — subscriptions and the marker silently disagree.
+    - name: Evaluate the drift decision for each existing-Host shape
+      set_fact:
+        _drift: >-
+          {{ ((item.existing.uuid | default('')) | length > 0)
+             and (((item.existing.address | default('')) != item.want_addr)
+                  or ((item.existing.port | default(0) | int) != (item.want_port | int))
+                  or ((item.existing.sni | default('')) != item.want_sni)
+                  or ((item.existing.fingerprint | default('chrome')) != 'chrome')) }}
+        _creates: >-
+          {{ ((item.existing.uuid | default('')) | length == 0)
+             or (((item.existing.uuid | default('')) | length > 0)
+                 and (((item.existing.address | default('')) != item.want_addr)
+                      or ((item.existing.port | default(0) | int) != (item.want_port | int))
+                      or ((item.existing.sni | default('')) != item.want_sni)
+                      or ((item.existing.fingerprint | default('chrome')) != 'chrome'))) }}
+      loop: &drift_cases
+        - name: "no existing Host"
+          existing: {}
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: false
+          creates: true
+        - name: "identical Host (true no-op)"
+          existing: { uuid: "h1", address: "edge.example.test", port: 8443, sni: "decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: false
+          creates: false
+        - name: "edge address changed"
+          existing: { uuid: "h1", address: "old-edge.example.test", port: 8443, sni: "decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: true
+          creates: true
+        - name: "edge port changed"
+          existing: { uuid: "h1", address: "edge.example.test", port: 443, sni: "decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: true
+          creates: true
+        - name: "decoy sni changed"
+          existing: { uuid: "h1", address: "edge.example.test", port: 8443, sni: "old-decoy.example", fingerprint: "chrome" }
+          want_addr: "edge.example.test"
+          want_port: 8443
+          want_sni: "decoy.example"
+          drift: true
+          creates: true
+      loop_control:
+        label: "{{ item.name }}"
+      register: _drifts
+
+    - name: Assert drift replaces the Host and an identical Host is a true no-op
+      assert:
+        that:
+          - (item.0.ansible_facts._drift | bool) == (item.1.drift | bool)
+          - (item.0.ansible_facts._creates | bool) == (item.1.creates | bool)
+        fail_msg: >-
+          {{ item.1.name }}: drift={{ item.0.ansible_facts._drift }} (want
+          {{ item.1.drift }}), creates={{ item.0.ansible_facts._creates }} (want
+          {{ item.1.creates }}). Skipping on drift leaves subscriptions on the old
+          edge; drifting on an identical Host churns it on every run.
+        success_msg: "{{ item.1.name }} -> drift={{ item.1.drift }} create={{ item.1.creates }}"
+      loop: "{{ _drifts.results | zip(_drift_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _drift_cases_ref: *drift_cases
+
+    # --- (k2) drift also covers the Host's INBOUND binding --------------------
+    # Deleting and reconciling the relay inbound mints a new uuid (a documented
+    # workflow), after which the node activates the new inbound while an unchanged
+    # Host still references the old one. The subtlety: an ABSENT inbound field in
+    # the response must NOT read as drift, or the Host is destroyed and re-created
+    # on every run.
+    - name: Evaluate the inbound half of the drift decision
+      set_fact:
+        _inb_drift: >-
+          {{ (((item.existing_inbound.configProfileInboundUuid | default('')) | length > 0)
+              and ((item.existing_inbound.configProfileInboundUuid | default('')) != item.want_inbound))
+             or (((item.existing_inbound.configProfileUuid | default('')) | length > 0)
+                 and ((item.existing_inbound.configProfileUuid | default('')) != item.want_profile)) }}
+      loop: &inb_cases
+        - name: "inbound matches"
+          existing_inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "in-1" }
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: false
+        - name: "inbound uuid replaced"
+          existing_inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "in-OLD" }
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: true
+        - name: "config profile replaced"
+          existing_inbound: { configProfileUuid: "cp-OLD", configProfileInboundUuid: "in-1" }
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: true
+        # The churn guard: a panel that omits the field must not look like drift.
+        - name: "inbound absent from response"
+          existing_inbound: {}
+          want_inbound: "in-1"
+          want_profile: "cp-1"
+          want: false
+      loop_control:
+        label: "{{ item.name }}"
+      register: _inbs
+
+    - name: Assert inbound drift is detected but an absent field never churns
+      assert:
+        that:
+          - (item.0.ansible_facts._inb_drift | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: drift={{ item.0.ansible_facts._inb_drift }}, expected
+          {{ item.1.want }}. Missing it leaves subscriptions on a stale binding;
+          claiming it on an absent field re-creates the Host on every run.
+        success_msg: "{{ item.1.name }} -> drift={{ item.1.want }}"
+      loop: "{{ _inbs.results | zip(_inb_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _inb_cases_ref: *inb_cases
+
+    # --- (m) change mode refuses contradictory transports too -----------------
+    # Deploy and migrate both reject relay alongside another :443 transport; change
+    # was missing direct Reality, and change runs BOTH Host includes — so the
+    # rotation published a Reality Host pointing at the node's own hostname.
+    - name: Evaluate the rotation exclusion gate
+      set_fact:
+        _rot_refused: >-
+          {{ (item.relay | bool)
+             and ((item.caddy | bool) or (item.reality | bool) or (item.cdn == 'fastly')) }}
+      loop: &rot_cases
+        - { name: "relay rotation, clean",        relay: true,  caddy: false, reality: false, cdn: none,   want: false }
+        - { name: "relay rotation + caddy",       relay: true,  caddy: true,  reality: false, cdn: none,   want: true  }
+        - { name: "relay rotation + reality",     relay: true,  caddy: false, reality: true,  cdn: none,   want: true  }
+        - { name: "relay rotation + fastly",      relay: true,  caddy: false, reality: false, cdn: fastly, want: true  }
+        - { name: "reality rotation (no relay)",  relay: false, caddy: false, reality: true,  cdn: none,   want: false }
+        - { name: "caddy rotation (no relay)",    relay: false, caddy: true,  reality: false, cdn: fastly, want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _rots
+
+    - name: Assert the rotation gate matches deploy and migrate exclusivity
+      assert:
+        that:
+          - (item.0.ansible_facts._rot_refused | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: refused={{ item.0.ansible_facts._rot_refused }},
+          expected {{ item.1.want }}. All three modes must agree on exclusivity, or
+          a rotation can build a node deploy would have refused.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _rots.results | zip(_rot_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _rot_cases_ref: *rot_cases
+
+    # --- (l) migrate refuses contradictory effective transports ---------------
+    # The effective facts are OR-combined (caller flag OR source detection), so
+    # inventory enabling Caddy/Reality on top of a detected relay source makes both
+    # effective and nothing downstream re-checks it.
+    - name: Evaluate the contradiction gate
+      set_fact:
+        _contradicts: >-
+          {{ (item.relay | bool)
+             and ((item.caddy | bool) or (item.reality | bool) or (item.cdn == 'fastly')) }}
+      loop: &contra_cases
+        # The valid relay configuration — must be ALLOWED, not refused.
+        - { name: "relay only",              relay: true,  caddy: false, reality: false, cdn: none,    want: false }
+        - { name: "relay + caddy",           relay: true,  caddy: true,  reality: false, cdn: none,    want: true  }
+        - { name: "relay + direct reality",  relay: true,  caddy: false, reality: true,  cdn: none,    want: true  }
+        - { name: "relay + fastly",          relay: true,  caddy: false, reality: false, cdn: fastly,  want: true  }
+        - { name: "caddy + fastly (no relay)", relay: false, caddy: true, reality: false, cdn: fastly, want: false }
+        - { name: "reality only (no relay)", relay: false, caddy: false, reality: true,  cdn: none,    want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _contras
+
+    - name: Assert the gate fires only on genuinely contradictory combinations
+      assert:
+        that:
+          - (item.0.ansible_facts._contradicts | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: contradicts={{ item.0.ansible_facts._contradicts }},
+          expected {{ item.1.want }}. Firing too broadly blocks ordinary Caddy or
+          Reality migrations; too narrowly builds a node with two :443 transports.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _contras.results | zip(_contra_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _contra_cases_ref: *contra_cases
+
+    # --- (n) structural: gates must precede mutations in migrate.yml ----------
+    # Read the real task file and compare positions. Ordering is the one property
+    # these expression tests cannot otherwise see, and it is exactly what went wrong
+    # twice: a pre-flight placed after the transfer does not prevent a bad
+    # migration, it strands one — source stopped, destination running, DNS moved,
+    # and a retry blocked by the clean-destination check.
+    - name: Read tasks/migrate/migrate.yml
+      set_fact:
+        _mig: "{{ lookup('file', playbook_dir ~ '/../tasks/migrate/migrate.yml') }}"
+
+    - name: Locate the destination gates and the first mutating tasks
+      set_fact:
+        _gates_at: >-
+          {{ [_mig.find('Fail on contradictory effective transports for the destination'),
+              _mig.find('Validate the panel token is available for the registered path'),
+              _mig.find('Validate the relay endpoint is known before migrating'),
+              _mig.find('Assert the relay edge is not one of the destination'),
+              _mig.find('Require acknowledgement that the relay proxy will be re-pointed')] }}
+        _mutations_at: >-
+          {{ [_mig.find('Include configuration transfer tasks (Remnawave)'),
+              _mig.find('Include container management tasks (Remnawave)'),
+              _mig.find('Include DNS record management tasks (Cloudflare)'),
+              _mig.find('include_tasks: ../providers/remnawave/update_node.yml')] }}
+
+    - name: Assert every gate is present and precedes every mutation
+      assert:
+        that:
+          # -1 would mean a task was renamed and this test silently stopped working.
+          - (_gates_at | min) > 0
+          - (_mutations_at | min) > 0
+          - (_gates_at | max) < (_mutations_at | min)
+        fail_msg: >-
+          Gate/mutation ordering violated in tasks/migrate/migrate.yml.
+          gates at {{ _gates_at }}, mutations at {{ _mutations_at }}. A -1 means a
+          task name changed and this guard went blind; otherwise a gate now runs
+          AFTER a mutation, which strands the node instead of refusing the run.
+        success_msg: "(n) all destination gates precede every mutating task in migrate.yml."
+
+    - name: Read tasks/change/remnawave_change.yml
+      set_fact:
+        _chg: "{{ lookup('file', playbook_dir ~ '/../tasks/change/remnawave_change.yml') }}"
+
+    # The ack gate must be able to NAME the new origin, so hostname derivation has to
+    # come BEFORE the gates — while DNS, the markers and the panel stay after. This
+    # pins both halves of that sandwich.
+    - name: Assert hostname derivation precedes the gates, and mutations follow them
+      vars:
+        _derive: "{{ _chg.find('- name: Set NEW hostname facts (custom)') }}"
+        _gate: "{{ _chg.find('- name: Require acknowledgement before deleting the old DNS name of a relay node') }}"
+        _mutate: "{{ _chg.find('- name: Update persisted hostname file') }}"
+        _dns: "{{ _chg.find('- name: Include DNS tasks (Cloudflare)') }}"
+      assert:
+        that:
+          - (_derive | int) > 0 and (_gate | int) > 0 and (_mutate | int) > 0 and (_dns | int) > 0
+          - (_derive | int) < (_gate | int)
+          - (_gate | int) < (_mutate | int)
+          - (_gate | int) < (_dns | int)
+        fail_msg: >-
+          Rotation ordering broken: derive={{ _derive }}, gate={{ _gate }},
+          persist={{ _mutate }}, dns={{ _dns }}. Derivation must precede the gate (or
+          the ack message cannot name the new origin, and the anti-leak check cannot
+          see a future-hostname self-reference), and DNS plus the on-disk markers must
+          follow it.
+        success_msg: "(n4) hostname derivation precedes the rotation gates; DNS and markers follow."
+
+    - name: Assert the rotation gates precede the first mutation
+      vars:
+        _cg: >-
+          {{ [_chg.find('Validate the panel token is available for the registered path (rotation)'),
+              _chg.find('Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)'),
+              _chg.find('Validate the relay endpoint is known before rotating'),
+              _chg.find("Assert the relay edge is not one of this node's own addresses (rotation)"),
+              _chg.find('Require acknowledgement before deleting the old DNS name of a relay node')] }}
+        _cm: >-
+          {{ [_chg.find('Update persisted hostname file'),
+              _chg.find('Re-persist the relay endpoint (relay marker)')] }}
+      assert:
+        that:
+          - (_cg | min) > 0
+          - (_cm | min) > 0
+          - (_cg | max) < (_cm | min)
+        fail_msg: >-
+          Rotation gates must precede the first mutation in
+          tasks/change/remnawave_change.yml. gates {{ _cg }}, mutations {{ _cm }}.
+        success_msg: "(n2) rotation gates precede the first mutation in change mode."
+
+    # --- (n3) all three modes enforce the anti-leak invariant -----------------
+    # change mode shipped without any node-address check at all: deploy and migrate
+    # had one, the rotation path did not, and the choke-point assert in
+    # create_relay_host.yml only fires after the DNS records are rewritten.
+    - name: Read tasks/main.yml
+      set_fact:
+        _mainy: "{{ lookup('file', playbook_dir ~ '/../tasks/main.yml') }}"
+
+    - name: Assert every mode includes the shared node-address definition
+      vars:
+        _incl: 'providers/remnawave/assert_relay_edge.yml'
+      assert:
+        that:
+          - _mainy.find(_incl) > 0
+          - _mig.find(_incl) > 0
+          - _chg.find(_incl) > 0
+        fail_msg: >-
+          A mode is missing the shared relay anti-leak definition
+          ({{ _incl }}): deploy={{ _mainy.find(_incl) }},
+          migrate={{ _mig.find(_incl) }}, change={{ _chg.find(_incl) }}. -1 means
+          that mode can publish the node's own address as the relay edge.
+        success_msg: "(n3) deploy, change and migrate all enforce the anti-leak invariant."
+
+    # --- (p) structural: migrate gates on effective facts, not raw flags -------
+    # migrate derives _migrate_*_effective as "caller flag OR detected on source",
+    # then must use ONLY those. Mixing the two is what let Host creation follow
+    # detection while the panel address update followed the raw flag: a migration
+    # whose source had a .node_uuid but whose invocation omitted the flag rewrote the
+    # Hosts and left the panel dialling the stopped source. Each raw flag may appear
+    # exactly once — in the line that builds its effective fact.
+    - name: Count raw transport-flag gate expressions in both lifecycle files
+      set_fact:
+        _raw_mig: >-
+          {{ {'caddy': _mig.count('remnawave_caddy_enabled | default(false) | bool'),
+              'reality': _mig.count('remnawave_reality_enabled | default(false) | bool'),
+              'relay': _mig.count('remnawave_relay_enabled | default(false) | bool'),
+              'register_node': _mig.count('remnawave_panel_register_node | default(false) | bool')} }}
+        # change mode derives only _change_register_node_effective (its other
+        # capabilities come from caller vars plus the relay marker), so only that
+        # flag is audited here — but it IS audited: checking migrate alone is exactly
+        # how six raw gates survived in change.yml for a round.
+        _raw_chg: >-
+          {{ {'register_node': _chg.count('remnawave_panel_register_node | default(false) | bool')} }}
+
+    - name: Assert each raw flag appears only where its effective fact is built
+      assert:
+        that:
+          - (_raw_mig.values() | list | max) == 1
+          - (_raw_mig.values() | list | min) == 1
+          - _raw_chg['register_node'] == 1
+        fail_msg: >-
+          Raw transport flags must not gate tasks — use the *_effective facts.
+          migrate: {{ _raw_mig }}, change: {{ _raw_chg }}. A count above 1 means a
+          task is gated on the caller's flag and will ignore what was detected on
+          disk; 0 means an effective fact lost its input.
+        success_msg: "(p) migrate.yml and change mode both gate only on *_effective facts."
+
+    # --- (o) squad membership is reconciled PER SQUAD -------------------------
+    # The first version of this predicate flattened every squad's inbounds into one
+    # panel-wide list, so a desired inbound belonging to ANY other squad suppressed
+    # the repair even when the FreeSocks squad was empty — and the extra hand-added
+    # memberships this task deliberately preserves are exactly how that happens.
+    - name: Build a squad name -> members map with the desired inbound parked elsewhere
+      set_fact:
+        _sq_members:
+          FreeSocks-Fastly: ["u-ws"]
+          FreeSocks-Reality: ["u-re"]
+          FreeSocks-Relay: []
+          Operator-Extra: ["u-rl"]
+
+    - name: Plan per squad (the shipped predicate)
+      set_fact:
+        _sq_plan: >-
+          {%- set plan = [] -%}
+          {%- for c in [{'name': 'FreeSocks-Fastly', 'want': 'u-ws'},
+                        {'name': 'FreeSocks-Reality', 'want': 'u-re'},
+                        {'name': 'FreeSocks-Relay', 'want': 'u-rl'}] -%}
+            {%- if (c.want | length > 0) and (c.name in _sq_members)
+                   and (c.want not in _sq_members[c.name]) -%}
+              {%- set _ = plan.append(c) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ plan }}
+
+    - name: Plan with the OLD panel-wide predicate (negative control)
+      set_fact:
+        _sq_plan_old: >-
+          {{ [{'name': 'FreeSocks-Relay', 'want': 'u-rl'}]
+             | rejectattr('want', 'in', (_sq_members.values() | list | sum(start=[]))) | list }}
+
+    - name: Assert the empty squad is repaired even though the inbound lives elsewhere
+      assert:
+        that:
+          - _sq_plan | length == 1
+          - _sq_plan[0].name == 'FreeSocks-Relay'
+          # Healthy squads are left alone — the repair must not churn them.
+          - "'FreeSocks-Fastly' not in (_sq_plan | map(attribute='name') | list)"
+          - "'FreeSocks-Reality' not in (_sq_plan | map(attribute='name') | list)"
+          # And the predicate this replaced would have done nothing at all.
+          - _sq_plan_old | length == 0
+        fail_msg: >-
+          Per-squad membership check failed: planned {{ _sq_plan }}. An empty
+          FreeSocks squad must be repaired regardless of which other squads happen
+          to reference the same inbound, or its FCP mode reaches no node.
+        success_msg: "(o) membership is checked per squad; the old panel-wide predicate is proven blind."
+
+    # --- (q) DNS-equivalent spellings are normalized before comparison --------
+    # Mirrors assert_relay_edge.yml. DNS is case-insensitive and a terminal dot names
+    # the same FQDN, so a byte comparison let `NODE.Example.com.` past a list holding
+    # `node.example.com`. Lowercasing also normalizes IPv6 hex case.
+    - name: Build a normalized node-address list the way assert_relay_edge.yml does
+      set_fact:
+        _norm_addrs: >-
+          {{ ['node.example.test', '203.0.113.10', '2001:DB8::10']
+             | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+    - name: Normalize each candidate and test membership
+      set_fact:
+        _q_ok: >-
+          {{ ((item.addr | lower | regex_replace('[.]$', '')) not in _norm_addrs) }}
+      loop: &q_cases
+        - { name: "proxy edge",                 addr: "relay-edge.example.test", want: true  }
+        - { name: "exact node name",            addr: "node.example.test",       want: false }
+        - { name: "node name, upper case",      addr: "NODE.EXAMPLE.TEST",        want: false }
+        - { name: "node name, terminal dot",    addr: "node.example.test.",       want: false }
+        - { name: "node name, mixed + dot",     addr: "Node.Example.Test.",       want: false }
+        - { name: "node IPv6, lower hex",       addr: "2001:db8::10",            want: false }
+        - { name: "node IPv6, upper hex",       addr: "2001:DB8::10",            want: false }
+        # A DIFFERENT host that merely shares a suffix must still be accepted.
+        - { name: "different host, same suffix", addr: "other.example.test",      want: true  }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _qs
+
+    - name: Assert every DNS-equivalent spelling of the node is rejected
+      assert:
+        that:
+          - (item.0.ansible_facts._q_ok | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }} ({{ item.1.addr }}): accepted={{ item.0.ansible_facts._q_ok }},
+          expected {{ item.1.want }}. Case and terminal-dot variants resolve to the
+          same host, so accepting one publishes the origin just as surely.
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _qs.results | zip(_q_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _q_cases_ref: *q_cases
+
+    # --- (r) bootstrap refuses relay without shared squads --------------------
+    # Relay has no per-node placement path, so the shared squad is its only route to
+    # a subscriber. The old behaviour created and printed the inbound while binding
+    # nothing — and because the pool entry AND _fcp_placement_expect_bound are both
+    # conditional on the squad uuid, the expect-bound guard was blind to it.
+    - name: Evaluate the bootstrap relay/shared-squad gate
+      set_fact:
+        _r_refused: "{{ (item.relay | bool) and (not (item.shared | bool)) }}"
+        # What the pool body would have looked like in that state: silently empty.
+        _r_pool: >-
+          {{ {'freedom-ws': {'squadUuids': ['sq-f']}}
+             | combine({'freedom-reality': {'squadUuids': [item.relay_squad]}}
+               if ((item.relay_squad | default('')) | length > 0) else {}) }}
+      loop: &r_cases
+        - { name: "relay + shared squads",        relay: true,  shared: true,  relay_squad: "sq-rl", want: false, pool: true  }
+        - { name: "relay, shared squads OFF",     relay: true,  shared: false, relay_squad: "",      want: true,  pool: false }
+        - { name: "no relay, shared squads OFF",  relay: false, shared: false, relay_squad: "",      want: false, pool: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _rs
+
+    - name: Assert the gate fires exactly on the unreachable combination
+      assert:
+        that:
+          - (item.0.ansible_facts._r_refused | bool) == (item.1.want | bool)
+          # Confirms the silent failure it prevents: no freedom-reality binding.
+          - (('freedom-reality' in item.0.ansible_facts._r_pool) | bool) == (item.1.pool | bool)
+        fail_msg: >-
+          {{ item.1.name }}: refused={{ item.0.ansible_facts._r_refused }} (want
+          {{ item.1.want }}), pool has freedom-reality={{ 'freedom-reality' in item.0.ansible_facts._r_pool }}
+          (want {{ item.1.pool }}).
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}, freedom-reality bound={{ item.1.pool }}"
+      loop: "{{ _rs.results | zip(_r_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _r_cases_ref: *r_cases
+
+    # --- (s) structural: the Hosts GET precedes the idempotency decision -------
+    - name: Read the three Host-creation task files
+      set_fact:
+        _f_relay: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_relay_host.yml') }}"
+        _f_real: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_reality_host.yml') }}"
+        _f_ws: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_hosts.yml') }}"
+
+    # Marker is each GET's REGISTERED VARIABLE, which is unique to that task. An
+    # earlier version searched for '/api/hosts' and matched a prose comment
+    # mentioning "PATCH /api/hosts" — so it passed on a file whose GET had been
+    # deleted. A structural guard keyed on text that also appears in comments is
+    # worse than none, because it reads as coverage.
+    - name: Assert each file fetches existing Hosts before deciding what to create
+      vars:
+        _relay_get: "{{ _f_relay.find('register: remnawave_relay_hosts_list') }}"
+        _relay_dec: "{{ _f_relay.find('_relay_existing') }}"
+        _real_get: "{{ _f_real.find('register: remnawave_reality_hosts_list') }}"
+        _real_dec: "{{ _f_real.find('not in (_remnawave_hosts') }}"
+        _ws_get: "{{ _f_ws.find('register: remnawave_hosts_list') }}"
+        _ws_dec: "{{ _f_ws.find('_existing_host_remarks') }}"
+      assert:
+        that:
+          - (_relay_get | int) > 0 and (_relay_dec | int) > 0 and (_relay_get | int) < (_relay_dec | int)
+          - (_real_get | int) > 0 and (_real_dec | int) > 0 and (_real_get | int) < (_real_dec | int)
+          - (_ws_get | int) > 0 and (_ws_dec | int) > 0 and (_ws_get | int) < (_ws_dec | int)
+        fail_msg: >-
+          A Host-creation file decides idempotency before (or without) fetching the
+          existing Hosts. relay get/dec={{ _relay_get }}/{{ _relay_dec }},
+          reality={{ _real_get }}/{{ _real_dec }}, ws={{ _ws_get }}/{{ _ws_dec }}.
+          A -1 means the GET or the decision marker is missing — without the GET every
+          run looks like "nothing exists" and re-runs duplicate Hosts.
+        success_msg: "(s) all three Host-creation files fetch existing Hosts before deciding."
+
+    # --- (t) resolves-back-to-the-node comparison + fail-open ------------------
+    # The positive path needs getent, which macOS controllers lack, so the integration
+    # suite drives it for real on the Ubuntu runner. Here we pin the decision logic and
+    # — just as importantly — that an UNRESOLVABLE name proceeds rather than failing:
+    # split-horizon and client-only-resolvable edges are legitimate.
+    - name: Evaluate the resolution comparison
+      set_fact:
+        _t_reject: >-
+          {{ ((item.resolved | default([])) | intersect(item.node_addrs) | length) > 0 }}
+      loop: &t_cases
+        - { name: "edge resolves to the CDN",      resolved: ["192.0.2.7", "192.0.2.8"], node_addrs: ["203.0.113.10"], want: false }
+        - { name: "edge CNAME'd to the node",      resolved: ["203.0.113.10"],           node_addrs: ["203.0.113.10"], want: true  }
+        - { name: "edge resolves to node + CDN",   resolved: ["192.0.2.7", "203.0.113.10"], node_addrs: ["203.0.113.10"], want: true }
+        # Unresolvable / getent missing: empty list -> no rejection (fail OPEN).
+        - { name: "name could not be resolved",    resolved: [],                          node_addrs: ["203.0.113.10"], want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _ts
+
+    - name: Assert the check rejects only a genuine overlap, and never fails closed
+      assert:
+        that:
+          - (item.0.ansible_facts._t_reject | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: reject={{ item.0.ansible_facts._t_reject }}, expected
+          {{ item.1.want }}. Failing closed on an unresolvable name would block
+          legitimate edges that only resolve from client networks.
+        success_msg: "{{ item.1.name }} -> {{ 'REJECTED' if item.1.want else 'allowed' }}"
+      loop: "{{ _ts.results | zip(_t_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _t_cases_ref: *t_cases
+
+    # --- (t2) the getent RESULT SHAPE, not just the comparison -----------------
+    # (t) tested the intersect and passed while the extraction was wrong: getent_hosts
+    # is keyed by the ADDRESS with names as values ({'127.0.0.1': ['localhost']}), and
+    # the first version collected values() only, so a node IP could never match. Testing
+    # the half that worked is the same mistake that made guard (s) vacuous — pin the
+    # shape assumption itself.
+    - name: Extract from the real getent_hosts shape
+      set_fact:
+        _t2_extract: >-
+          {{ (((item.shape | default({}, true)).keys() | list)
+              + ((item.shape | default({}, true)).values() | list | sum(start=[])))
+             | select('string') | map('lower') | map('regex_replace', '[.]$', '') | list }}
+      loop: &t2_cases
+        - name: "name resolving to the node"
+          shape: { "127.0.0.1": ["localhost"] }
+          node_addrs: ["127.0.0.1", "n1.example.test"]
+          reject: true
+        - name: "legitimate CDN edge"
+          shape: { "192.0.2.7": ["relay-edge.example.test"] }
+          node_addrs: ["203.0.113.10", "n1.example.test"]
+          reject: false
+        # An ALIAS of the node: the address differs but a name matches dns_hostname,
+        # which is equally a leak — hence collecting values as well as keys.
+        - name: "alias of the node's own hostname"
+          shape: { "203.0.113.10": ["n1.example.test", "alias.example.test"] }
+          node_addrs: ["n1.example.test"]
+          reject: true
+        # getent returns ONE line and the family depends on /etc/hosts ordering, so a
+        # name may come back as IPv6 only. The node address set must cover both, and
+        # the comparison must work on either.
+        - name: "name resolving to the node over IPv6"
+          shape: { "::1": ["localhost"] }
+          node_addrs: ["127.0.0.1", "::1"]
+          reject: true
+        - name: "IPv6 resolution, node set IPv4 only (mis-specified set)"
+          shape: { "::1": ["localhost"] }
+          node_addrs: ["127.0.0.1"]
+          reject: false
+        - name: "nothing resolved"
+          shape: {}
+          node_addrs: ["203.0.113.10"]
+          reject: false
+      loop_control:
+        label: "{{ item.name }}"
+      register: _t2s
+
+    - name: Assert the extraction collects addresses AND names, and detects overlap
+      assert:
+        that:
+          - ((item.0.ansible_facts._t2_extract | intersect(item.1.node_addrs) | length) > 0) == (item.1.reject | bool)
+        fail_msg: >-
+          {{ item.1.name }}: extracted {{ item.0.ansible_facts._t2_extract }} vs node
+          {{ item.1.node_addrs }} -> overlap
+          {{ item.0.ansible_facts._t2_extract | intersect(item.1.node_addrs) }}, expected
+          reject={{ item.1.reject }}. Collecting only getent's values misses the address
+          and the check can never fire.
+        success_msg: "{{ item.1.name }} -> {{ 'REJECTED' if item.1.reject else 'allowed' }} (extracted {{ item.0.ansible_facts._t2_extract }})"
+      loop: "{{ _t2s.results | zip(_t2_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _t2_cases_ref: *t2_cases
+
+    # --- (q2) a rotation must reject BOTH the outgoing and incoming FQDN ----------
+    # dns_hostname is the NEW name once derivation moved ahead of the gates, so the OLD
+    # one is passed via _relay_extra_node_names: it still resolves here until the old
+    # record is deleted, so naming it as the edge is equally a self-reference. And with
+    # custom_hostname an operator can name the FUTURE FQDN, which the old dns_hostname
+    # alone could not have caught.
+    - name: Build the rotation-time node set (old + new)
+      set_fact:
+        _q2_set: >-
+          {{ (["old-name.example.test"] + ["new-name.example.test"])
+             | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+    - name: Test each candidate against the rotation-time set
+      set_fact:
+        _q2_ok: "{{ (item.addr | lower | regex_replace('[.]$', '')) not in _q2_set }}"
+      loop: &q2_cases
+        - { name: "outgoing FQDN",              addr: "old-name.example.test",  want: false }
+        - { name: "incoming FQDN",              addr: "new-name.example.test",  want: false }
+        - { name: "incoming FQDN, mixed + dot", addr: "NEW-NAME.Example.Test.", want: false }
+        - { name: "genuine proxy edge",         addr: "relay-edge.example.test", want: true }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _q2s
+
+    - name: Assert both rotation FQDNs are rejected and a real edge is not
+      assert:
+        that:
+          - (item.0.ansible_facts._q2_ok | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }} ({{ item.1.addr }}): accepted={{ item.0.ansible_facts._q2_ok }},
+          expected {{ item.1.want }}. A rotation that accepts either of its own FQDNs as
+          the edge publishes the origin.
+        success_msg: "{{ item.1.name }} -> {{ 'accepted' if item.1.want else 'REJECTED' }}"
+      loop: "{{ _q2s.results | zip(_q2_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _q2_cases_ref: *q2_cases
+
+    # --- (t3) KNOWN GAP: equivalent IPv6 spellings are not canonicalized -------
+    # Documented rather than silently absent. ansible-core has no IP filter, and
+    # hand-rolled `::` collapsing risks FALSE rejections (a refused legitimate edge
+    # blocks a deploy). This test states the gap so nobody reads (q)/(t2) as covering
+    # it; flip the expectations here if ansible.utils + netaddr are ever adopted.
+    - name: Evaluate the textual comparison on equivalent IPv6 spellings
+      set_fact:
+        _t3_caught: "{{ (item.addr | lower) in (item.node_addrs | map('lower') | list) }}"
+      loop: &t3_cases
+        - { name: "same spelling (caught)",          addr: "2001:db8::1",              node_addrs: ["2001:db8::1"], want: true  }
+        - { name: "case differs (caught by lower)",  addr: "2001:DB8::1",              node_addrs: ["2001:db8::1"], want: true  }
+        # THE GAP: same address, expanded spelling -> textually different.
+        - { name: "expanded form (NOT caught)",      addr: "2001:0db8:0:0:0:0:0:1",    node_addrs: ["2001:db8::1"], want: false }
+        - { name: "leading zeros (NOT caught)",      addr: "2001:0db8::1",             node_addrs: ["2001:db8::1"], want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _t3s
+
+    - name: Assert the documented gap is exactly as described (no more, no less)
+      assert:
+        that:
+          - (item.0.ansible_facts._t3_caught | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: caught={{ item.0.ansible_facts._t3_caught }}, expected
+          {{ item.1.want }}. If an expanded IPv6 form is now caught, canonicalization
+          was added — update this test and the KNOWN LIMIT note in
+          assert_relay_edge.yml. If a same-spelling case stopped being caught, the
+          textual comparison has regressed.
+        success_msg: "{{ item.1.name }} -> {{ 'caught' if item.1.want else 'NOT caught (known gap)' }}"
+      loop: "{{ _t3s.results | zip(_t3_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _t3_cases_ref: *t3_cases
+
+    # --- (u) panel-token pre-flights follow the EFFECTIVE registered path ------
+    # The token asserts live inside the Host and update_node task files, i.e. at the end
+    # of a lifecycle run. Detection can enable that path without the caller passing a
+    # token, so the pre-flight has to key on the effective fact, not the raw flag.
+    - name: Evaluate the token pre-flight gate
+      set_fact:
+        _u_fires: >-
+          {{ ((item.flag | bool) or ((item.uuid | default('')) | length > 0))
+             and ((item.token | default('')) | length == 0) }}
+      loop: &u_cases
+        - { name: "flag set, token present",        flag: true,  uuid: "",     token: "t", want: false }
+        - { name: "flag set, token MISSING",        flag: true,  uuid: "",     token: "",  want: true  }
+        # The reported case: registration detected on disk, caller passed no token.
+        - { name: "uuid on disk, token MISSING",    flag: false, uuid: "u-1",  token: "",  want: true  }
+        - { name: "uuid on disk, token present",    flag: false, uuid: "u-1",  token: "t", want: false }
+        # Unregistered node: the panel is never called, so no token is needed.
+        - { name: "no flag, no uuid, no token",     flag: false, uuid: "",     token: "",  want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _us
+
+    - name: Assert the token pre-flight fires exactly when the panel will be called
+      assert:
+        that:
+          - (item.0.ansible_facts._u_fires | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: fires={{ item.0.ansible_facts._u_fires }}, expected
+          {{ item.1.want }}. Missing it strands a lifecycle run after the mutations;
+          firing on an unregistered node blocks a legitimate one.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _us.results | zip(_u_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _u_cases_ref: *u_cases
+
+    - name: Summary
+      debug:
+        msg: >-
+          relay: cleanup_hosts remark regex, migrate detection truth table,
+          .relay_address parsing, the repoint gates, relay port precedence, and
+          relay-only inbound activation, the same-name cleanup guard, the
+          choke-point anti-leak invariant, and reconcile-on-empty-profile all
+          verified — plus the IP-aware anti-leak check, endpoint-drift replacement,
+          and migrate's contradictory-transport refusal.

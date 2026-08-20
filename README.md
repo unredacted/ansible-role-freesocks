@@ -708,7 +708,46 @@ remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
 
 **Keys live on the panel, not the role.** The Reality `publicKey` / `shortIds` / `privateKey` / `flow` are configured on the **panel inbound** (raw Xray config). The role only creates the Remnawave Host (`tasks/providers/remnawave/create_reality_host.yml`): remark `<hostname>-reality`, `address`/`sni` from `remnawave_reality_address` (default `dns_hostname`) / `remnawave_reality_sni`, `securityLayer: DEFAULT` — the panel derives `pbk`/`sid`/`flow` from the inbound. The Reality inbound's UUID is also added to the derived `remnawave_panel_active_inbounds` when enabled. Reality is wired into deploy / change / migrate (gated on `remnawave_reality_enabled` + `remnawave_panel_register_node`).
 
+**Decoy sites are operator-supplied.** The role ships **no default** for `remnawave_bootstrap_reality_dest` / `_server_names` (nor their relay counterparts): which site a REALITY inbound borrows is deployment-specific and does not belong in a public repo. Set them in your own inventory — `operation_mode=bootstrap` asserts they are non-empty rather than creating a dead inbound. The mechanical requirements: `dest` must be a real, reachable TLS 1.3 host and must serve **every** name in `serverNames` (a probe sending an unserved name gets a cert mismatch, which burns the node), its certificate chain must fit Xray's hardcoded 8192-byte REALITY buffer ([xray-core #6356](https://github.com/XTLS/Xray-core/issues/6356)), and `remnawave_reality_sni` must be one of those `serverNames`.
+
 **Phase 0 (Reality) — one-time manual panel prerequisite.** Add a Reality inbound to the Config Profile — raw Xray: `vless`, `listen 0.0.0.0:443`, `security reality`, `realitySettings { dest, serverNames, privateKey, shortIds }`, `flow xtls-rprx-vision` — generate the x25519 keypair (panel UI / `GenerateX25519` endpoint / `xray x25519`), then record the inbound UUID (from `GET /api/config-profiles/inbounds`) into `remnawave_reality_inbound_uuid` and one serverName into `remnawave_reality_sni`.
+
+#### Relay transport (VLESS+REALITY behind an external L4 proxy)
+
+The heaviest-censorship transport. The client dials an **external L4/TCP proxy edge** you create yourself; the proxy forwards **raw TCP** to the node, where REALITY terminates. An L4 forwarder is transparent to REALITY, so there is **no TLS at the edge** — no cert, no ACME, no Caddy, no decoy web root — and **the node's own address never appears in a client config**.
+
+Versus the two transports above, relay adds two things direct Reality cannot have: the node IP is hidden behind the edge (so IP-blocking the node is not available to a censor), and the decoy can resolve into the *same network as the edge the client is talking to*, which removes the `(IP, SNI)` mismatch a censor can otherwise score.
+
+```yaml
+remnawave_enabled: true
+outline_enabled: false
+
+# A relay node is DEDICATED — the role asserts all of these.
+remnawave_caddy_enabled: false            # MUST stay off (contends for :443)
+remnawave_reality_enabled: false          # MUST stay off (contends for :443)
+remnawave_per_node_placement: false       # legacy path does not know relay
+# remnawave_cdn_transports: []            # not needed: the role drops inherited
+                                          # CDN transports on a relay node itself
+
+remnawave_relay_enabled: true
+remnawave_relay_inbound_uuid: "<configProfileInboundUuid of the relay inbound>"
+remnawave_relay_address: "<the EXTERNAL proxy edge — FQDN or IP>"
+remnawave_relay_sni: "<a serverName from the relay inbound>"
+# remnawave_relay_port: 443               # client-facing port ON THE EDGE
+# remnawave_relay_fingerprint: chrome
+
+remnawave_panel_register_node: true
+```
+
+**Two ports, and conflating them is the most common mistake.** `remnawave_relay_port` is the port **on the edge** that clients dial (it lands in the `vless://` link). `remnawave_bootstrap_relay_listen_port` is the port the inbound binds **on the node** — that is what you point the proxy's *backend* at. One edge can front several nodes by mapping a different edge port to each, so the former is per-node. Both bootstrap and the deploy summary print the exact backend target.
+
+**`remnawave_relay_address` has no default, on purpose.** It is asserted, not defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — a worse outcome than a failed run. The role additionally fails if the address *equals* `dns_hostname`.
+
+**PROXY protocol.** Many L4 forwarders prepend a PROXY v1/v2 header. If yours does, set `remnawave_bootstrap_relay_accept_proxy_protocol: true` — otherwise REALITY reads the header bytes as a malformed ClientHello and **every connection fails with no useful error**. If yours does not, leave it off; the same failure happens in reverse.
+
+**What the role does not do.** It never talks to a proxy provider: you create the proxy and point its backend at the node by hand. On rotation (`change`) and migration the role tells you exactly what to re-point, and requires `remnawave_relay_repoint_ack=true` before doing anything that would break an FQDN-based proxy origin irrecoverably.
+
+**FCP mode.** The relay squad binds to FCP's `freedom-reality` pool (direct Reality keeps `privacy-reality`). `freedom-reality` **ships disabled** in FCP's catalog and the role cannot enable it (that needs `admin:settings:write`, which the role's token deliberately does not hold) — enable it in **FCP Admin → Connection modes** once at least one relay node exists.
 
 #### Choosing a transport
 
@@ -716,8 +755,9 @@ remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
 |-----------|-------|----------|----------|
 | **VLESS+WS+TLS** (via Caddy, real LE cert) | `remnawave_caddy_enabled` + `ws` transport | Rides ordinary HTTPS — traverses forced proxies; TLS inspection sees normal HTTPS (blocking it means blocking all HTTPS) | **Business / school networks** (forced proxies, TLS inspection) |
 | **VLESS+Vision+REALITY** (direct) | `remnawave_reality_enabled` | Fastest; best against active probing (raw TCP, mimics a real site's TLS) | **Open networks** |
+| **VLESS+REALITY via an L4 relay** | `remnawave_relay_enabled` | REALITY's probe-resistance **plus** a hidden node IP; the edge is a shared address whose blocking carries collateral damage | **Heavily censored networks**, where the other two are blocked |
 
-The tradeoff in one line: **WS+TLS via Caddy** is the choice for restrictive **business/school** networks because it looks like — and rides — normal HTTPS, so it gets through forced HTTP proxies and TLS inspection. **Reality** is the **fastest** option and the strongest against active probing, but it does **not** traverse forced HTTP proxies / TLS inspection, so it is for **open** networks, not the business/school case.
+The tradeoff in one line: **WS+TLS via Caddy** is the choice for restrictive **business/school** networks because it looks like — and rides — normal HTTPS, so it gets through forced HTTP proxies and TLS inspection. **Reality** is the **fastest** option and the strongest against active probing, but it does **not** traverse forced HTTP proxies / TLS inspection, so it is for **open** networks. **Relay** trades a little latency (one extra hop) for hiding the node IP entirely, which is what matters once a censor is blocking endpoints by address.
 
 #### Notes
 

@@ -5,6 +5,15 @@
 # (the Reality inbound embeds it; the panel derives the client public key / pbk).
 # Panel-only (delegate_to: localhost); part of operation_mode=bootstrap.
 #
+# Which transport's key this becomes is chosen by the caller via _x25519_target:
+#   'reality' (DEFAULT) -> remnawave_reality_private_key   (direct Reality)
+#   'relay'             -> remnawave_relay_private_key     (relay transport)
+# Every transport gets its OWN keypair: sharing one means (a) relay silently
+# renders an EMPTY privateKey — a dead inbound — whenever
+# remnawave_bootstrap_reality is false, and (b) a seized direct-Reality node
+# would burn the relay transport too. Pass _x25519_target as a LITERAL on the
+# include's `vars:`, never a chained template (CLAUDE.md 2.19 HARD RULE).
+#
 # VERIFY on your panel /docs: v2.8 exposes GET /api/system/tools/x25519/generate.
 # The response nesting differs across versions, so the parse below tolerates both
 # a flat {response:{privateKey,publicKey}} and {response:{keypairs:[{privateKey}]}}.
@@ -29,7 +38,7 @@
 
 - name: Capture the x25519 private key (tolerate flat or keypairs[] shapes)
   set_fact:
-    remnawave_reality_private_key: >-
+    _rw_x25519_priv: >-
       {{ (_rw_x25519_resp.privateKey | default(''))
          if ((_rw_x25519_resp.privateKey | default('')) | length > 0)
          else ((_rw_x25519_resp.keypairs | default([]) | first | default({})).privateKey | default('')) }}
@@ -38,14 +47,39 @@
 - name: Assert an x25519 private key was returned
   assert:
     that:
-      - remnawave_reality_private_key is defined
-      - remnawave_reality_private_key | length > 0
+      - _rw_x25519_priv is defined
+      - _rw_x25519_priv | length > 0
     fail_msg: >-
       The panel x25519 endpoint ({{ remnawave_x25519_endpoint }}) returned no
       privateKey. Verify the path + response shape against your panel's /docs
       OpenAPI (some versions use POST, or nest under response.keypairs[0]).
   no_log: true
 
+# Publish under the caller's target name. Separate gated tasks rather than one
+# templated key so the fact name is never itself a computed expression.
+- name: Publish the keypair as the direct-Reality private key
+  set_fact:
+    remnawave_reality_private_key: "{{ _rw_x25519_priv }}"
+  no_log: true
+  when: (_x25519_target | default('reality')) == 'reality'
+
+- name: Publish the keypair as the relay private key
+  set_fact:
+    remnawave_relay_private_key: "{{ _rw_x25519_priv }}"
+  no_log: true
+  when: (_x25519_target | default('reality')) == 'relay'
+
+- name: Assert the keypair reached a known target
+  assert:
+    that:
+      - (_x25519_target | default('reality')) in ['reality', 'relay']
+    fail_msg: >-
+      Unknown _x25519_target '{{ _x25519_target | default('reality') }}' — the
+      generated keypair was discarded. Valid targets: reality, relay.
+
 - name: Note x25519 keypair generated
   debug:
-    msg: "Generated a Reality x25519 keypair (private key captured, not logged)."
+    msg: >-
+      Generated an x25519 keypair for the
+      '{{ _x25519_target | default('reality') }}' transport (private key
+      captured, not logged).

@@ -73,28 +73,68 @@
     - remnawave_panel_register_node | default(false) | bool
 
 # Derive the panel's active inbounds from the enabled CDN transports (+ the
-# Reality inbound when enabled) so node registration and Host creation can't
-# drift. Falls back to an explicitly-set remnawave_panel_active_inbounds when no
-# transport carries an inbound_uuid yet. Materialized in two set_facts — chained
-# task-level vars mis-evaluate under ansible-core 2.19+ lazy templating.
+# Reality inbound and/or the relay inbound when enabled) so node registration and
+# Host creation can't drift. Falls back to an explicitly-set
+# remnawave_panel_active_inbounds when no transport carries an inbound_uuid yet.
+# Materialized in two set_facts — chained task-level vars mis-evaluate under
+# ansible-core 2.19+ lazy templating.
+#
+# The `when:` below MUST list every transport: a relay-only node whose disjunct is
+# missing skips this task entirely, falls through to the empty
+# remnawave_panel_active_inbounds default, and dies in register_node.yml's assert.
+# A relay node is DEDICATED, and that has to be enforced in CODE rather than by
+# documentation: the bootstrap output file carries an ENABLED ws transport, and it
+# is loaded with `-e @file`, i.e. extra-vars — which outrank an inventory-level
+# `remnawave_cdn_transports: []`. So an operator cannot reliably turn it off from
+# inventory, and a relay node would otherwise also activate the WS inbound. That
+# inbound cannot work here anyway (it needs Caddy to terminate TLS and proxy to
+# it, and Caddy is asserted off on relay nodes), so activating it is never right —
+# it just occupies a loopback port and muddies the node's inbound set.
+#
+# Two independent keys in ONE set_fact (no cross-reference, so 2.19-safe): the
+# declared set is kept only to tell the operator what was ignored.
 - name: Collect enabled CDN-transport inbound UUIDs
   set_fact:
-    _cdn_transport_inbounds: >-
+    _cdn_transport_inbounds_declared: >-
       {{ remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
          | select('string') | reject('equalto', '') | list }}
+    _cdn_transport_inbounds: >-
+      {{ []
+         if (remnawave_relay_enabled | default(false) | bool)
+         else (remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
+               | select('string') | reject('equalto', '') | list) }}
 
-- name: Derive active inbounds from enabled CDN transports (+ Reality)
+- name: Note that CDN transports are ignored on a relay node
+  debug:
+    msg: >-
+      Relay node — ignoring {{ _cdn_transport_inbounds_declared | length }} enabled
+      CDN transport(s) from remnawave_cdn_transports. A relay node is dedicated:
+      the WS inbound needs Caddy to terminate TLS in front of it, and Caddy is
+      asserted off here, so it would never carry traffic. This node activates only
+      its relay inbound. (The entry usually arrives from the bootstrap output vars
+      file, which is loaded as extra-vars and cannot be overridden from inventory.)
+  when:
+    - remnawave_relay_enabled | default(false) | bool
+    - _cdn_transport_inbounds_declared | length > 0
+
+- name: Derive active inbounds from enabled CDN transports (+ Reality, + relay)
   set_fact:
     remnawave_panel_active_inbounds: >-
       {{ _cdn_transport_inbounds
          + ([remnawave_reality_inbound_uuid]
             if (remnawave_reality_enabled | default(false) | bool
                  and (remnawave_reality_inbound_uuid | default('') | length > 0))
+            else [])
+         + ([remnawave_relay_inbound_uuid]
+            if (remnawave_relay_enabled | default(false) | bool
+                 and (remnawave_relay_inbound_uuid | default('') | length > 0))
             else []) }}
   when: >-
     (_cdn_transport_inbounds | length > 0) or
     (remnawave_reality_enabled | default(false) | bool
-     and (remnawave_reality_inbound_uuid | default('') | length > 0))
+     and (remnawave_reality_inbound_uuid | default('') | length > 0)) or
+    (remnawave_relay_enabled | default(false) | bool
+     and (remnawave_relay_inbound_uuid | default('') | length > 0))
 
 # === Panel API: register node ===
 # Hostname/DNS must already be set (main.yml generates them earlier in deploy
@@ -139,6 +179,35 @@
     dest: "{{ remnawave_node_install_dir }}/.node_name"
     mode: '0640'
   become: yes
+
+# .relay_address is the AUTHORITATIVE "this is a relay node" marker: relay nodes
+# run no Caddy, so migrate's capability detection cannot tell them apart from a
+# direct Reality node by absence alone (see tasks/migrate/migrate.yml). Its
+# EXISTENCE is the signal; the contents let change/migrate/wipe re-create the
+# Host and warn about the manual proxy.
+#
+# key=value lines rather than a bare "host:port" — the latter is ambiguous for
+# IPv6 literals. `become` follows the remnawave_persist_become hook used by
+# register_node.yml so the integration harness can write to an unprivileged dir.
+- name: Persist the relay endpoint (relay marker)
+  copy:
+    content: |
+      address={{ remnawave_relay_address }}
+      port={{ remnawave_relay_port | default(443, true) | int }}
+      fingerprint={{ remnawave_relay_fingerprint | default('chrome', true) }}
+    dest: "{{ remnawave_node_install_dir }}/.relay_address"
+    mode: '0640'
+  become: "{{ remnawave_persist_become | default(true) }}"
+  when: remnawave_relay_enabled | default(false) | bool
+
+# Keep the marker trustworthy: if a node is re-deployed WITHOUT relay, a stale
+# marker would make migrate detect it as a relay node forever.
+- name: Remove a stale relay marker when relay is disabled
+  file:
+    path: "{{ remnawave_node_install_dir }}/.relay_address"
+    state: absent
+  become: "{{ remnawave_persist_become | default(true) }}"
+  when: not (remnawave_relay_enabled | default(false) | bool)
 
 # === Container lifecycle ===
 - name: Pull image (force when force_reinstall_remnawave is set)

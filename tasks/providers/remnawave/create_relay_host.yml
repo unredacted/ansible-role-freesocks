@@ -1,0 +1,192 @@
+---
+# tasks/providers/remnawave/create_relay_host.yml
+#
+# Create the Remnawave Host for a RELAY node: VLESS+REALITY reached through a
+# MANUALLY-CONFIGURED external L4/TCP proxy. The client dials the proxy's edge;
+# the proxy forwards raw TCP to this node's relay inbound, where REALITY
+# terminates. Nothing TLS happens at the edge, so there is no cert, no ACME, no
+# Caddy and no decoy web root — and the Host advertises the EDGE, never the node.
+#
+# Reality params (publicKey/shortIds/flow) live on the PANEL inbound; the Host
+# only references that inbound and sets address/port/sni. securityLayer is
+# DEFAULT — the Host schema has no REALITY enum, the security comes from the
+# inbound, and the panel derives pbk/sid/flow. Idempotent: GET-first by remark,
+# tolerate 409.
+#
+# The proxy side is entirely the operator's: this file never talks to a proxy
+# provider. It assumes the operator pointed the edge's backend at
+# <node>:<remnawave_relay_node_listen_port> (printed by bootstrap and by the
+# deploy summary).
+#
+# VERIFY on a live panel that the generated vless:// line carries
+# security=reality + pbk/sid/flow AND the EDGE address (not this node's).
+
+# remnawave_relay_address is ASSERTED, never defaulted to dns_hostname. A
+# default would mean any run that forgot the var silently publishes this node's
+# real hostname to every subscriber — an unblocking-vector disclosure, strictly
+# worse than a dead Host.
+- name: Validate relay Host prerequisites
+  assert:
+    that:
+      - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
+      - remnawave_panel_config_profile_uuid is defined and remnawave_panel_config_profile_uuid | length > 0
+      - remnawave_relay_inbound_uuid | default('') | length > 0
+      - remnawave_relay_address | default('') | length > 0
+      - remnawave_relay_sni | default('') | length > 0
+      - random_hostname is defined and random_hostname | length > 0
+    fail_msg: >-
+      Relay Host creation requires remnawave_panel_api_token,
+      remnawave_panel_config_profile_uuid, remnawave_relay_inbound_uuid,
+      remnawave_relay_address (the EXTERNAL proxy edge — never this node) and
+      remnawave_relay_sni (a serverName the relay inbound borrows).
+  no_log: true
+
+# The anti-leak invariant is enforced HERE, at the single choke point every path
+# goes through. tasks/main.yml has an equivalent guard, but it lives in the deploy
+# block — change and migrate include this file without passing through it, and both
+# let a caller override the persisted endpoint.
+#
+# It is a SEPARATE assert from the one above so its fail_msg is actually visible:
+# that one is no_log for the credential checks, which would censor this diagnosis.
+# Nothing below references a secret.
+#
+# remnawave_relay_address accepts an IP as well as an FQDN, so comparing against
+# dns_hostname alone is not enough — the node's own address in either form is a
+# direct-Reality deploy wearing a relay label, and it hands every subscriber
+# exactly the address an IP block needs. Every source is `default`ed so this
+# degrades to the hostname check when facts were not gathered.
+# Defence in depth at the shared choke point. Path is tasks/-relative, not a bare
+# sibling name: under include_role/tasks_from a bare name resolves against the
+# PLAYBOOK dir (that broke CI once).
+- name: Assert the relay edge is not this node (choke point)
+  include_tasks: providers/remnawave/assert_relay_edge.yml
+  vars:
+    _relay_edge_candidate: "{{ remnawave_relay_address }}"
+
+# Distinct fact name on purpose: create_hosts.yml and create_reality_host.yml both
+# write _remnawave_hosts, and set_facts outlive the task file — sharing the name
+# would cross-contaminate the idempotency check when two of these run in one play.
+- name: List existing Remnawave Hosts (relay)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    return_content: yes
+    status_code: [200]
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_relay_hosts_list
+
+- name: Normalize the Hosts list payload (relay; bare array or hosts-wrapped)
+  set_fact:
+    _remnawave_relay_hosts: "{{ remnawave_relay_hosts_list.json.response['hosts'] if (remnawave_relay_hosts_list.json.response is mapping and 'hosts' in remnawave_relay_hosts_list.json.response) else (remnawave_relay_hosts_list.json.response | default([])) }}"
+
+# Idempotency is by remark, but the remark does not encode the endpoint — and the
+# relay endpoint is the MANUAL proxy edge, the one field an operator changes
+# independently of the hostname. On a same-name rotation or migration the remark
+# already exists, so a plain skip would keep advertising the OLD edge while
+# .relay_address is rewritten with the new one: subscriptions and the marker would
+# disagree, and every later lifecycle run would trust the marker.
+#
+# So: detect drift and replace. Delete-then-POST rather than PATCH /api/hosts —
+# both endpoints used here are already exercised by this role, whereas the Host
+# PATCH contract is not, and this is not the place to take that risk.
+- name: Identify an existing relay Host with this remark
+  set_fact:
+    _relay_existing: >-
+      {{ (_remnawave_relay_hosts | selectattr('remark', 'equalto', random_hostname ~ '-relay')
+          | list | first) | default({}, true) }}
+
+# The Host's inbound binding drifts independently of its endpoint: deleting and
+# reconciling the relay inbound mints a NEW configProfileInboundUuid (a workflow
+# this role documents, since editing dest/serverNames on an existing tag is not
+# reconciled). The node would then activate the new inbound while the Host still
+# referenced the old one, so subscriptions point at a stale binding.
+#
+# GET /api/hosts exposes it as inbound.{configProfileUuid,configProfileInboundUuid}
+# (verified against the panel OpenAPI). The comparison only claims drift when the
+# response ACTUALLY carries a value — an absent field must not read as a mismatch,
+# or the Host would be deleted and re-created on every single run.
+- name: Materialize the existing relay Host's inbound binding
+  set_fact:
+    _relay_existing_inbound: "{{ (_relay_existing.inbound | default({}, true)) if (_relay_existing.inbound is defined) else {} }}"
+
+- name: Detect drift on the existing relay Host (endpoint or inbound binding)
+  set_fact:
+    _relay_drift: >-
+      {{ ((_relay_existing.uuid | default('')) | length > 0)
+         and (((_relay_existing.address | default('')) != (remnawave_relay_address | default('')))
+              or ((_relay_existing.port | default(0) | int) != (remnawave_relay_port | default(443, true) | int))
+              or ((_relay_existing.sni | default('')) != (remnawave_relay_sni | default('')))
+              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome', true)))
+              or (((_relay_existing_inbound.configProfileInboundUuid | default('')) | length > 0)
+                  and ((_relay_existing_inbound.configProfileInboundUuid | default('')) != (remnawave_relay_inbound_uuid | default(''))))
+              or (((_relay_existing_inbound.configProfileUuid | default('')) | length > 0)
+                  and ((_relay_existing_inbound.configProfileUuid | default('')) != (remnawave_panel_config_profile_uuid | default(''))))) }}
+
+- name: Delete the stale relay Host before re-creating it (endpoint drift)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts/{{ _relay_existing.uuid }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 204, 404]
+  delegate_to: localhost
+  no_log: true
+  when: _relay_drift | bool
+
+- name: Note that the relay Host is being re-pointed
+  debug:
+    msg: >-
+      Relay Host {{ random_hostname }}-relay is being re-created: its endpoint
+      changed from {{ _relay_existing.address | default('?') }}:{{ _relay_existing.port | default('?') }}
+      (sni {{ _relay_existing.sni | default('?') }}, inbound
+      {{ _relay_existing_inbound.configProfileInboundUuid | default('?') }}) to
+      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
+      (sni {{ remnawave_relay_sni }}).
+  when: _relay_drift | bool
+
+- name: Create the relay Host
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      inbound:
+        configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
+        configProfileInboundUuid: "{{ remnawave_relay_inbound_uuid }}"
+      remark: "{{ random_hostname }}-relay"
+      # The PROXY EDGE plus the edge port mapped to THIS node — one edge can
+      # front several nodes on different ports.
+      address: "{{ remnawave_relay_address }}"
+      port: "{{ remnawave_relay_port | default(443, true) | int }}"
+      sni: "{{ remnawave_relay_sni }}"
+      fingerprint: "{{ remnawave_relay_fingerprint | default('chrome', true) }}"
+      securityLayer: "DEFAULT"
+      # address is the edge, sni is the borrowed site — they intentionally differ,
+      # so the panel must not overwrite one from the other. No path/host/alpn:
+      # this is raw TCP, not WebSocket.
+      overrideSniFromAddress: false
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_relay_host_result
+  when: >-
+    ((_relay_existing.uuid | default('')) | length == 0)
+    or (_relay_drift | bool)
+
+- name: Summarize relay Host creation
+  debug:
+    msg: >-
+      Relay Host ensured: {{ random_hostname }}-relay ->
+      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
+      (sni {{ remnawave_relay_sni }}). The proxy edge must forward raw TCP to
+      {{ dns_hostname | default('<node>') }}:{{ remnawave_relay_node_listen_port | default(443) }}.

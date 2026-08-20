@@ -72,27 +72,123 @@
     - inventory_hostname == source_hostname
     - migrate_component == 'remnawave'
 
-- name: Derive detected Remnawave capabilities on source
-  set_fact:
-    migrate_detected_caddy: "{{ source_caddyfile_path.stat.exists }}"
-    migrate_detected_register_node: "{{ source_node_uuid_path.stat.exists }}"
-    # Reality = a reality squad on disk, or (fallback) no Caddy on a Remnawave
-    # node — Caddy and Reality are mutually exclusive, so a Caddy-less node is
-    # a direct/Reality node for Host purposes.
-    migrate_detected_reality: >-
-      {{ ((((source_squad_uuids_raw.content | default('') | b64decode)
-            if source_squad_uuids_raw.content is defined else '')
-           is search('^reality=\S', multiline=true))
-          or (not (source_caddyfile_path.stat.exists | bool))) }}
+# The relay marker. Its EXISTENCE is the authoritative "this is a relay node"
+# signal — relay nodes run no Caddy, so without it the Reality fallback below
+# claims every relay node (see the comment there). Not no_log: the proxy edge
+# address is not a secret and the repoint warning has to print it.
+- name: Detect the relay marker on source (Remnawave)
+  stat:
+    path: "{{ remnawave_node_install_dir }}/.relay_address"
+  register: source_relay_marker
+  become: yes
   when:
     - inventory_hostname == source_hostname
     - migrate_component == 'remnawave'
+
+- name: Read the relay endpoint on source (Remnawave)
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.relay_address"
+  register: source_relay_raw
+  become: yes
+  failed_when: false
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+# Detection is split across SEPARATE set_fact tasks on purpose:
+# migrate_detected_reality has to read migrate_detected_relay, and
+# cross-referencing keys inside ONE set_fact mis-evaluates under ansible-core
+# 2.19+ lazy templating (CLAUDE.md HARD RULE). Keep them apart.
+- name: Materialize the source per-node squad file contents
+  set_fact:
+    migrate_source_squads_text: >-
+      {{ (source_squad_uuids_raw.content | b64decode)
+         if source_squad_uuids_raw.content is defined else '' }}
+  no_log: true  # carries the per-node squad UUIDs
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Derive the detected relay capability on source
+  set_fact:
+    migrate_detected_relay: "{{ source_relay_marker.stat.exists | default(false) | bool }}"
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+# Patterns here are deliberately BACKSLASH-FREE. YAML block scalars pass
+# backslashes through raw while double-quoted scalars consume them as escapes, so
+# a \S-style pattern silently stops matching if the scalar style ever changes.
+# The non-group regex_search form also returns None rather than raising when
+# nothing matches, so a missing/empty/garbage marker yields '' instead of a
+# traceback (the group form raises 'NoneType has no attribute group').
+- name: Materialize the source relay endpoint
+  set_fact:
+    migrate_source_relay_address: >-
+      {{ (((source_relay_raw.content | b64decode) if source_relay_raw.content is defined else '')
+          | regex_search('^address=.+', multiline=true) | default('', true))
+         | regex_replace('^address=', '') }}
+    migrate_source_relay_port: >-
+      {{ (((source_relay_raw.content | b64decode) if source_relay_raw.content is defined else '')
+          | regex_search('^port=[0-9]+', multiline=true) | default('', true))
+         | regex_replace('^port=', '') }}
+    migrate_source_relay_fingerprint: >-
+      {{ (((source_relay_raw.content | b64decode) if source_relay_raw.content is defined else '')
+          | regex_search('^fingerprint=.+', multiline=true) | default('', true))
+         | regex_replace('^fingerprint=', '') }}
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Derive the remaining detected Remnawave capabilities on source
+  set_fact:
+    migrate_detected_caddy: "{{ source_caddyfile_path.stat.exists }}"
+    migrate_detected_register_node: "{{ source_node_uuid_path.stat.exists }}"
+    # Reality = a reality squad on disk (legacy per-node placement), or
+    # (fallback) a Remnawave node with neither Caddy NOR the relay marker.
+    # Caddy, Reality and relay are mutually exclusive, so a node with none of
+    # the positive markers is a direct/Reality node for Host purposes. The
+    # `not relay` term is load-bearing: .squad_uuids only exists under the
+    # legacy per-node model, so in the default shared-squad topology this
+    # expression reduces to the fallback and would otherwise claim every relay
+    # node. Legacy Reality nodes have no marker, so their detection is
+    # unchanged.
+    migrate_detected_reality: >-
+      {{ ((migrate_source_squads_text is search('^reality=\S', multiline=true))
+          or ((not (source_caddyfile_path.stat.exists | bool))
+              and (not (migrate_detected_relay | bool)))) }}
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
+- name: Fail on contradictory source capability evidence (relay + Caddy)
+  fail:
+    msg: |
+      The source node has BOTH a relay marker
+      ({{ remnawave_node_install_dir }}/.relay_address) and a Caddyfile
+      (/etc/caddy/Caddyfile). Those transports are mutually exclusive — a relay
+      node terminates REALITY on the node itself and runs no Caddy — so the
+      source's real topology cannot be determined and migrating would create the
+      wrong Hosts on the destination.
+
+      Resolve it on the SOURCE first: remove whichever artifact is stale (delete
+      .relay_address if the node was converted to Caddy-fronted WS, or remove
+      the leftover Caddy install if it is a relay node), then re-run.
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+    - migrate_detected_relay | bool
+    - source_caddyfile_path.stat.exists | bool
 
 - name: Propagate detected Remnawave capabilities to destination
   set_fact:
     migrate_detected_caddy: "{{ hostvars[source_hostname].migrate_detected_caddy | default(false) }}"
     migrate_detected_register_node: "{{ hostvars[source_hostname].migrate_detected_register_node | default(false) }}"
     migrate_detected_reality: "{{ hostvars[source_hostname].migrate_detected_reality | default(false) }}"
+    migrate_detected_relay: "{{ hostvars[source_hostname].migrate_detected_relay | default(false) }}"
+    migrate_source_relay_address: "{{ hostvars[source_hostname].migrate_source_relay_address | default('') }}"
+    migrate_source_relay_port: "{{ hostvars[source_hostname].migrate_source_relay_port | default('') }}"
+    migrate_source_relay_fingerprint: "{{ hostvars[source_hostname].migrate_source_relay_fingerprint | default('') }}"
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
@@ -163,6 +259,202 @@
       - "DNS Hostname: {{ dns_hostname }}"
       - "Bare Hostname (kv_hostname): {{ kv_hostname }}"
   when: inventory_hostname == destination_hostname
+
+# ============================================================================
+# Destination pre-flight (MUST stay ahead of every mutation)
+# ============================================================================
+# These checks resolve the destination's effective capabilities and refuse the
+# migration BEFORE anything is touched. Position is load-bearing: everything
+# below this point is destructive or externally visible — the config transfer
+# renames the source install dir, container management starts the destination,
+# DNS is repointed, and the panel node address is PATCHed. A gate placed after
+# those (where these checks originally sat) does not prevent a bad migration,
+# it strands one: the source is already stopped and the relay is offline, and
+# re-running with the acknowledgement is then blocked by the clean-destination
+# check in tasks/main.yml because the destination now holds the transferred
+# install. dns_hostname is set just above, so the messages can name the new
+# origin.
+
+# Caller-passed flags force-enable a capability; the source-side detection fills
+# it in when the flags sit at their default-false (Ansible cannot distinguish an
+# explicit false from an unset default — to deliberately slim a node down,
+# migrate first, then use update-mode force flags).
+- name: Resolve effective Remnawave capabilities for the destination
+  set_fact:
+    _migrate_caddy_effective: "{{ (remnawave_caddy_enabled | default(false) | bool) or (migrate_detected_caddy | default(false) | bool) }}"
+    _migrate_register_node_effective: "{{ (remnawave_panel_register_node | default(false) | bool) or (migrate_detected_register_node | default(false) | bool) }}"
+    _migrate_reality_effective: "{{ (remnawave_reality_enabled | default(false) | bool) or (migrate_detected_reality | default(false) | bool) }}"
+    _migrate_relay_effective: "{{ (remnawave_relay_enabled | default(false) | bool) or (migrate_detected_relay | default(false) | bool) }}"
+    # Deliberately NOT named remnawave_relay_* — a self-referential set_fact key
+    # recurses under 2.19. The caller's value wins over the source's.
+    _migrate_relay_address_effective: >-
+      {{ remnawave_relay_address
+         if ((remnawave_relay_address | default('')) | length > 0)
+         else (migrate_source_relay_address | default('')) }}
+    # Same precedence rule as change mode: explicit port -> the source node's
+    # persisted port -> 443. remnawave_relay_port's default is EMPTY so the first
+    # branch actually discriminates (a concrete default made it always true, which
+    # would silently move a non-443 relay onto 443 during a migration).
+    _migrate_relay_port_effective: >-
+      {{ remnawave_relay_port
+         if ((remnawave_relay_port | default('')) | string | length > 0)
+         else ((migrate_source_relay_port | default('')) | default('443', true)) }}
+    _migrate_relay_fingerprint_effective: >-
+      {{ remnawave_relay_fingerprint
+         if ((remnawave_relay_fingerprint | default('')) | length > 0)
+         else ((migrate_source_relay_fingerprint | default('')) | default('chrome', true)) }}
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
+# Both of these fail EARLY so the create/cleanup asymmetry later can never bite:
+# cleanup_hosts.yml is gated only on the *_effective flags, while the create
+# includes carry extra uuid gates. A missing uuid used to SKIP the create while
+# cleanup still ran, silently removing the node from every subscription.
+# The effective facts above are OR-combined (caller flag OR source detection), so
+# inventory that enables Caddy or direct Reality on top of a detected relay source
+# makes BOTH effective — and nothing downstream re-checks exclusivity. The
+# migration would then install Caddy AND create a Reality Host alongside the relay,
+# all three contending for :443, which deploy mode forbids outright. Refuse here,
+# ahead of the transfer, rather than building a contradictory node.
+- name: Fail on contradictory effective transports for the destination
+  fail:
+    msg: |
+      The destination would end up with relay AND another :443 transport enabled.
+
+        relay   : {{ _migrate_relay_effective }}{{ ' (detected from the source marker)' if (migrate_detected_relay | default(false) | bool) else '' }}
+        caddy   : {{ _migrate_caddy_effective }}{{ ' (detected on the source)' if (migrate_detected_caddy | default(false) | bool) else '' }}
+        reality : {{ _migrate_reality_effective }}{{ ' (detected on the source)' if (migrate_detected_reality | default(false) | bool) else '' }}
+        cdn     : {{ effective_cdn_provider | default('none') }}
+
+      Relay is a DEDICATED node mode — it terminates REALITY on the node itself and
+      contends for :443 with both Caddy and direct Reality, and Fastly cannot
+      forward raw TCP. Deploy mode asserts this; migration has to as well, because
+      the capability flags you pass are OR'd with what was detected on the source
+      (Ansible cannot tell an explicit false from an unset default).
+
+      Either drop remnawave_caddy_enabled / remnawave_reality_enabled from this
+      migration and set the domain's cdn_provider to none, or migrate the node as
+      the non-relay type it actually is.
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_effective | bool
+    - >-
+      (_migrate_caddy_effective | bool)
+      or (_migrate_reality_effective | bool)
+      or (effective_cdn_provider | default('none') == 'fastly')
+
+# The panel token is required by every task the registered path runs (Host create,
+# cleanup, update_node). Detection can turn that path on without the caller passing a
+# token — a source with .node_uuid and an invocation that omits it — and the token
+# asserts live inside those task files, i.e. at the END of the migration. Failing there
+# leaves the source stopped, the destination running, DNS repointed, and a retry blocked
+# by the clean-destination check. Check it here instead.
+- name: Validate the panel token is available for the registered path
+  assert:
+    that:
+      - (remnawave_panel_api_token | default('')) | length > 0
+    fail_msg: >-
+      This migration will use the panel API — either remnawave_panel_register_node was
+      passed, or a .node_uuid was found on the source — but remnawave_panel_api_token is
+      empty. Host creation, Host cleanup and the node address PATCH all need it, and
+      they run after the transfer, so discovering this later would strand the node.
+      Pass the token (vault it) and re-run.
+  no_log: true
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_register_node_effective | bool
+
+- name: Validate the Reality inbound UUID is available before touching Hosts
+  fail:
+    msg: |
+      The destination is a Reality node but remnawave_reality_inbound_uuid is
+      unset, so the new Reality Host cannot be created — and the OLD Host would
+      still be cleaned up, dropping this node out of every subscription. Load your
+      generated bootstrap vars file for the migration:
+        -e @<env>-remnawave.generated.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_register_node_effective | bool
+    - _migrate_reality_effective | bool
+    - (remnawave_reality_inbound_uuid | default('')) | length == 0
+
+- name: Validate the relay inbound UUID and SNI are available before touching Hosts
+  fail:
+    msg: |
+      The destination is a relay node but remnawave_relay_inbound_uuid and/or
+      remnawave_relay_sni is unset, so the new relay Host cannot be created —
+      and the OLD Host would still be cleaned up. Load your generated bootstrap
+      vars file for the migration:
+        -e @<env>-remnawave.generated.yml
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_register_node_effective | bool
+    - _migrate_relay_effective | bool
+    - >-
+      ((remnawave_relay_inbound_uuid | default('')) | length == 0)
+      or ((remnawave_relay_sni | default('')) | length == 0)
+
+- name: Validate the relay endpoint is known before migrating
+  fail:
+    msg: |
+      The destination is a relay node but no proxy edge address is available:
+      none on the source's marker and no remnawave_relay_address passed. Without
+      it the new Host would advertise THIS NODE's hostname instead of the proxy
+      edge, publishing the origin to every subscriber.
+
+      Re-supply it:
+        -e remnawave_relay_address=<proxy edge> -e remnawave_relay_port=<port>
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_effective | bool
+    - (_migrate_relay_address_effective | default('')) | length == 0
+
+# The anti-leak invariant, enforced HERE as well as at the shared choke point in
+# create_relay_host.yml. That include runs at the very END of the migration, so on
+# its own it aborts with the source already stopped, the destination already
+# running, DNS already repointed — the relay offline — and a normal retry blocked
+# by the clean-destination check in tasks/main.yml. The choke-point assert stays as
+# defence in depth; this one is what actually saves the node.
+- name: Assert the relay edge is not one of the destination's own addresses
+  include_tasks: ../providers/remnawave/assert_relay_edge.yml
+  vars:
+    _relay_edge_candidate: "{{ _migrate_relay_address_effective }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_effective | bool
+
+# Migrate ALWAYS moves machines, so both the IP and the FQDN change — the proxy
+# console always needs a human. No conditional escape hatch here (unlike change
+# mode, where a same-machine rotation can be a no-op for an IP-origin console).
+- name: Require acknowledgement that the relay proxy will be re-pointed
+  fail:
+    msg: |
+      Relay repoint acknowledgement required.
+
+      Migrating a relay node moves it to a DIFFERENT machine, so BOTH its IP and
+      its hostname change. The external L4 proxy will keep dialling the OLD
+      origin until you update its console — the role cannot do that for you.
+
+        source origin  : {{ source_kv_hostname | default('(unknown)') }}
+        dest origin    : {{ dns_hostname | default('(unknown)') }}
+        dest IP        : {{ ansible_facts['default_ipv4']['address'] | default('(unknown)') }}
+        node-side port : {{ remnawave_relay_node_listen_port | default(443) }}
+        proxy edge     : {{ _migrate_relay_address_effective }}:{{ _migrate_relay_port_effective }}
+
+      Re-point the proxy's origin to the destination FIRST, then re-run with:
+        -e remnawave_relay_repoint_ack=true
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_effective | bool
+    - not (remnawave_relay_repoint_ack | default(false) | bool)
 
 # ============================================================================
 # Install on destination
@@ -472,12 +764,20 @@
     - dest_node_uuid_raw.content is defined
     - (dest_node_uuid_raw.content | b64decode | trim) | length > 0
 
+# Gated on the EFFECTIVE fact, not the raw flag. Host creation and cleanup below
+# already use _migrate_register_node_effective, so a migration whose source carries
+# a .node_uuid but whose invocation left remnawave_panel_register_node at its
+# default recreated the destination's Hosts while leaving the panel dialling the
+# SOURCE address — and the source container is stopped by then, so the node is
+# unreachable through the panel until a human intervenes. If detection is trusted
+# enough to rewrite Hosts, it is trusted enough to PATCH the address, and the uuid
+# needed to do it was transferred with the install dir.
 - name: Update Panel-side node address (Remnawave)
   include_tasks: ../providers/remnawave/update_node.yml
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
-    - remnawave_panel_register_node | default(false) | bool
+    - _migrate_register_node_effective | bool
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0
 
@@ -488,11 +788,14 @@
       The Remnawave node was migrated to {{ dns_hostname }} but the Panel API
       was not used to update the address. Open the Panel UI → Nodes → find the
       entry for {{ source_kv_hostname }}.* and update its 'Address' to '{{ dns_hostname }}'.
+
+      The panel is still dialling the SOURCE address, which is no longer serving —
+      this node is unreachable through the panel until that field is updated.
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
     - >-
-      not (remnawave_panel_register_node | default(false) | bool)
+      not (_migrate_register_node_effective | bool)
       or remnawave_node_uuid is not defined
       or remnawave_node_uuid | length == 0
 
@@ -512,18 +815,6 @@
     - migrate_component == 'remnawave'
     - base_domain in domain_providers
 
-# Caller-passed flags force-enable a capability; the source-side detection fills
-# it in when the flags sit at their default-false (Ansible cannot distinguish an
-# explicit false from an unset default — to deliberately slim a node down,
-# migrate first, then use update-mode force flags).
-- name: Resolve effective Remnawave capabilities for the destination
-  set_fact:
-    _migrate_caddy_effective: "{{ (remnawave_caddy_enabled | default(false) | bool) or (migrate_detected_caddy | default(false) | bool) }}"
-    _migrate_register_node_effective: "{{ (remnawave_panel_register_node | default(false) | bool) or (migrate_detected_register_node | default(false) | bool) }}"
-    _migrate_reality_effective: "{{ (remnawave_reality_enabled | default(false) | bool) or (migrate_detected_reality | default(false) | bool) }}"
-  when:
-    - inventory_hostname == destination_hostname
-    - migrate_component == 'remnawave'
 
 - name: Re-install/render Caddy on the destination (restores dropped Caddyfile)
   include_tasks: ../setup/caddy.yml
@@ -666,13 +957,70 @@
     - remnawave_reality_inbound_uuid | default('') | length > 0
 
 # Old objects come down only after their replacements exist.
+# transfer_remnawave.yml archives the whole install dir, so the source's marker
+# usually arrives intact. Rewrite it anyway: the operator may have re-pointed the
+# proxy to a new edge as part of this migration, and the marker must reflect what
+# the new Host actually advertises. Cannot live next to the .node_name write —
+# _migrate_relay_effective is not resolved until the capability block above.
+- name: Persist the destination's relay endpoint (relay marker)
+  copy:
+    content: |
+      address={{ _migrate_relay_address_effective }}
+      port={{ _migrate_relay_port_effective | int }}
+      fingerprint={{ _migrate_relay_fingerprint_effective }}
+    dest: "{{ remnawave_node_install_dir }}/.relay_address"
+    mode: '0640'
+  become: "{{ remnawave_persist_become | default(true) }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_effective | bool
+    - (_migrate_relay_address_effective | default('')) | length > 0
+
+- name: Create NEW relay Host on the destination
+  include_tasks: ../providers/remnawave/create_relay_host.yml
+  vars:
+    remnawave_relay_address: "{{ _migrate_relay_address_effective }}"
+    remnawave_relay_port: "{{ _migrate_relay_port_effective }}"
+    remnawave_relay_fingerprint: "{{ _migrate_relay_fingerprint_effective }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_register_node_effective | bool
+    - _migrate_relay_effective | bool
+
+# Same-name guard: when the new hostname equals the old one (a same-name rotation
+# or migration — both are supported, see the _fastly_same_name_rotation paths), the
+# create tasks above find the remark ALREADY present and skip, so cleaning up
+# "the old hostname" would delete the very Host that is meant to survive and put
+# nothing back. There is nothing old to remove in that case.
+#
+# The guard lives HERE and not inside cleanup_hosts.yml on purpose: the
+# force_wipe_remnawave path deliberately calls it with old == new to remove a
+# decommissioned node's own Hosts (tasks/update/remnawave_update.yml).
 - name: Clean up OLD Remnawave Hosts (source hostname)
   include_tasks: ../providers/remnawave/cleanup_hosts.yml
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
     - _migrate_register_node_effective | bool
-    - (_migrate_caddy_effective | bool) or (_migrate_reality_effective | bool)
+    - (old_random_hostname | default('')) != (random_hostname | default(''))
+    - >-
+      (_migrate_caddy_effective | bool)
+      or (_migrate_reality_effective | bool)
+      or (_migrate_relay_effective | bool)
+
+- name: Note that Host cleanup is skipped for a same-name migration
+  debug:
+    msg: >-
+      Same-name migration ({{ random_hostname }}) — skipping Host cleanup. The
+      existing Hosts already carry this remark and now point at the destination,
+      so deleting them would remove the node from every subscription.
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_register_node_effective | bool
+    - (old_random_hostname | default('')) == (random_hostname | default(''))
 
 - name: Delete OLD Fastly service (after the NEW one is live)
   include_tasks: ../providers/fastly/cleanup.yml

@@ -371,6 +371,15 @@ remnawave_cdn_transports:
 # Decoy/camouflage site served by Caddy on every non-transport path.
 remnawave_decoy_root: "/var/www/decoy"
 
+# Remark labels for the DIRECT transports — the ones that are not entries in
+# remnawave_cdn_transports but still create a Host named "<hostname>-<label>".
+# cleanup_hosts.yml builds its remark-matching regex from
+# (remnawave_cdn_transports names + this list), so a transport missing here is
+# never torn down on rotation/migration/wipe and its Host keeps advertising a
+# decommissioned node. Kept as a variable so the task and tests/test_relay.yml
+# share one source of truth.
+remnawave_direct_transport_remarks: ["reality", "relay"]
+
 # ============================================================================
 # Remnawave Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN)
 # ============================================================================
@@ -394,6 +403,71 @@ remnawave_reality_sni: ""            # a serverName from the inbound (the borrow
 remnawave_reality_address: ""        # client-facing address; defaults to dns_hostname
 remnawave_reality_port: 443
 remnawave_reality_fingerprint: "chrome"
+
+# ============================================================================
+# Remnawave relay transport (VLESS+REALITY behind a MANUAL external L4 proxy)
+# ============================================================================
+# The heaviest-censorship transport. The client dials an EXTERNAL L4/TCP proxy
+# edge, which forwards RAW TCP to this node, where REALITY terminates. An L4
+# forwarder is transparent to REALITY, so there is NO TLS at the edge — no cert,
+# no ACME, no Caddy, no decoy web root — and the node's own address never appears
+# in a client config. The proxy is created BY HAND by the operator; this role
+# talks to no proxy provider.
+#
+# Relay is a DEDICATED node mode. The role asserts it is mutually exclusive with
+# remnawave_caddy_enabled AND remnawave_reality_enabled (all three would contend
+# for the node's :443), incompatible with Fastly (which cannot forward raw TCP),
+# and incompatible with the legacy remnawave_per_node_placement path. It also
+# forces dns_proxied=false: both the proxy's origin dial and the panel's :2222
+# management dial need the node reached directly.
+#
+# TWO PORTS — do not conflate them:
+#   remnawave_relay_port                   the CLIENT-facing port ON THE EDGE
+#                                          (what lands in the vless:// link)
+#   remnawave_bootstrap_relay_listen_port  the port the inbound binds ON THE NODE
+#                                          (what the proxy's backend targets)
+# One edge can front several nodes by mapping a different edge port to each, so
+# remnawave_relay_port is per-node, not fleet-wide.
+#
+# Keys (privateKey/publicKey/shortIds) and flow/Vision live on the PANEL inbound
+# — the panel derives pbk/sid/flow when it injects users — so they are not role
+# variables. The role only creates the Host.
+remnawave_relay_enabled: false
+# The VLESS_RELAY_REALITY inbound's configProfileInboundUuid.
+# operation_mode=bootstrap writes this into remnawave_bootstrap_output_file.
+remnawave_relay_inbound_uuid: ""
+# The EXTERNAL proxy edge clients dial (FQDN or IP). REQUIRED when enabled, and
+# deliberately NOT defaulted to dns_hostname: defaulting it to the node would
+# silently publish the node's own address to every subscriber and bypass the
+# proxy entirely — a direct-Reality deploy wearing a relay label. The role
+# asserts it is set and that it differs from dns_hostname.
+remnawave_relay_address: ""
+# Empty means "443". It is deliberately NOT defaulted to 443 outright: change and
+# migrate have to tell an operator-supplied port from an untouched default so they
+# can fall back to the port persisted in .relay_address. With a concrete default
+# that distinction is impossible and a non-443 relay would silently be rewritten
+# to 443 on every rotation. Consumers resolve it with `| default(443, true)`.
+remnawave_relay_port: ""
+# A serverName the relay inbound borrows — must be one of
+# remnawave_bootstrap_relay_server_names. Bootstrap writes it into the output
+# file; keep it out of your creds file so the two cannot disagree (both load as
+# extra-vars, where the later -e wins).
+remnawave_relay_sni: ""
+# Empty means "chrome". Same reasoning as remnawave_relay_port above: with a concrete
+# default, change and migrate cannot tell an operator-supplied value from an untouched
+# one, so a relay deployed with a deliberate non-default fingerprint would silently be
+# rewritten to chrome on every lifecycle run — and, because the Host body then differs
+# from the live Host, re-created on every run as well. Persisted in .relay_address and
+# resolved with `| default('chrome', true)` at the point of use.
+remnawave_relay_fingerprint: ""
+# Informational echo of the node-side listen port, written by bootstrap into the
+# output file so the deploy summary can print the exact "point your proxy backend
+# here" line. Configures nothing.
+remnawave_relay_node_listen_port: 443
+# change/migrate acknowledgement: rotating or moving a relay node changes the
+# ORIGIN the manual proxy dials, and only a human can update the proxy console.
+# See tasks/change/remnawave_change.yml + tasks/migrate/migrate.yml.
+remnawave_relay_repoint_ack: false
 
 # ============================================================================
 # slipstream DNS Tunnel Configuration
@@ -602,6 +676,7 @@ remnawave_bootstrap_shared_squads: true
 # for an XHTTP-capable provider) slot in alongside FreeSocks-Fastly.
 remnawave_bootstrap_fronted_squad_name: "FreeSocks-Fastly"
 remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
+remnawave_bootstrap_relay_squad_name: "FreeSocks-Relay"
 # Opt-in: path (localhost) to write the created config-profile + inbound UUIDs +
 # a ready remnawave_cdn_transports list to, so node deploys need no manual paste.
 # Empty = just print them. e.g. "vars/remnawave.generated.yml".
@@ -612,19 +687,59 @@ remnawave_bootstrap_output_file: ""
 # a flat {privateKey,publicKey} and a {keypairs:[{privateKey,...}]} shape.
 remnawave_x25519_endpoint: "/api/system/tools/x25519/generate"
 
-# Reality inbound params (the borrowed-site TLS handshake it mimics). dest +
-# serverNames must be a real, reachable TLS site; shortIds [""] = accept-all.
-# Decoy = dl.google.com: no in-country PoPs in CN/RU/IR (so no routing /
-# reverse-DNS anomaly, which Iran actively exploits) and it emits no
-# NewSessionTicket (the current Reality-detection fingerprint, net4people #481).
-# NOT www.microsoft.com — its ~8273-byte cert record trips Xray's hardcoded
-# 8192-byte REALITY buffer (#6356) AND it has in-country servers.
-remnawave_bootstrap_reality_dest: "dl.google.com:443"
-remnawave_bootstrap_reality_server_names: ["dl.google.com"]
+# Reality inbound params (the borrowed-site TLS handshake it mimics).
+#
+# dest + serverNames are REQUIRED and deliberately have NO default: which site a
+# deployment borrows is operator-specific and belongs in PRIVATE inventory, not
+# in this repo. Set them alongside your panel credentials; bootstrap asserts they
+# are non-empty. shortIds [""] = accept-all.
+#
+# Mechanical contract (all the guidance that belongs here):
+#   * dest must be a real, reachable TLS 1.3 host, and must serve EVERY name in
+#     serverNames — a probe sending a name dest does not serve gets a cert
+#     mismatch, which burns the node.
+#   * its certificate chain must fit Xray's hardcoded 8192-byte REALITY buffer
+#     (xray-core #6356); a chain over that breaks the handshake outright.
+#   * remnawave_reality_sni (node-deploy side) must be one of these serverNames.
+remnawave_bootstrap_reality_dest: ""
+remnawave_bootstrap_reality_server_names: []
 remnawave_bootstrap_reality_short_ids: [""]
 # Reality stream network: v2.8 renamed the raw-TCP carrier "tcp" -> "raw". VERIFY
 # against your panel; flip to "tcp" on older panels.
 remnawave_bootstrap_reality_network: "raw"
+
+# --- relay inbound (bootstrap side) -----------------------------------------
+# The relay transport's own REALITY inbound. It gets its OWN keypair and its OWN
+# decoy: the direct-Reality decoy is picked for probe-resistance, while relay
+# targets the most heavily censored networks and needs a name reachable there.
+# Sharing a keypair would also mean a seized direct node burns relay.
+remnawave_bootstrap_relay: true
+# REQUIRED when remnawave_bootstrap_relay is true, no default — same rule and
+# same mechanical contract as the direct-Reality dest/serverNames above. Set them
+# in PRIVATE inventory.
+remnawave_bootstrap_relay_dest: ""
+remnawave_bootstrap_relay_server_names: []
+remnawave_bootstrap_relay_short_ids: [""]
+# v2.8 renamed the raw-TCP carrier "tcp" -> "raw"; flip on older panels.
+remnawave_bootstrap_relay_network: "raw"
+# The port the relay inbound listens on ON THE NODE — i.e. what you point the
+# external L4 proxy's BACKEND at. NOT the client-facing port (that is
+# remnawave_relay_port, which lives on the proxy edge). 443 is safe because relay
+# nodes are dedicated: Caddy and direct Reality are both asserted off. Move it
+# (e.g. 8444) if relay is ever unlocked to coexist with them on one node.
+remnawave_bootstrap_relay_listen_port: 443
+# Some L4 forwarders prepend a PROXY-protocol v1/v2 header. Xray must be told, or
+# REALITY reads those bytes as a malformed ClientHello and EVERY connection fails
+# with no useful error. Set true ONLY if your proxy sends it.
+remnawave_bootstrap_relay_accept_proxy_protocol: false
+
+# Reconcile missing BASE inbounds into an ALREADY-EXISTING Config Profile
+# (append-by-tag PATCH). Without this, a panel bootstrapped under an older role
+# version never gains newly-added base inbounds, because the create POST only
+# runs when the profile is absent. Existing inbounds are never rewritten, so a
+# re-run cannot rotate a live inbound's keys. Set false to hand-manage the
+# profile in the panel UI.
+remnawave_bootstrap_reconcile_inbounds: true
 
 # The WS inbound (raw Xray) the bootstrap POSTs into the Config Profile.
 # The tag MUST match what create_config_profile reads back + what create_squad

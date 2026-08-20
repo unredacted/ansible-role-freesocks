@@ -48,17 +48,69 @@
           inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "rin-1" }
           remark: "{{ 'apple-banana-cherry' ~ '-reality' }}"
           address: "{{ dns_hostname }}"
-          sni: "www.microsoft.com"
+          sni: "decoy-direct.example"
           securityLayer: "DEFAULT"
     - name: Assert Reality host body
       assert:
         that:
           - _reality_body.securityLayer == 'DEFAULT'
-          - _reality_body.sni == 'www.microsoft.com'
+          - _reality_body.sni == 'decoy-direct.example'
           - _reality_body.inbound.configProfileInboundUuid == 'rin-1'
           - _reality_body.remark.endswith('-reality')
         success_msg: "Reality host body OK (DEFAULT securityLayer, borrowed sni, inbound ref)."
 
+    # (e) relay Host body shaping (create_relay_host.yml). The critical property is
+    # that `address` is the EXTERNAL PROXY EDGE and never this node: a Host that
+    # leaks the origin hands every subscriber the address an IP block needs.
+    - name: Build relay host body
+      vars:
+        remnawave_relay_address: "relay-edge.example.test"
+        remnawave_relay_port: 8443
+        remnawave_relay_sni: "decoy-relay.example"
+      set_fact:
+        _relay_body:
+          inbound: { configProfileUuid: "cp-1", configProfileInboundUuid: "rlin-1" }
+          remark: "{{ 'apple-banana-cherry' ~ '-relay' }}"
+          address: "{{ remnawave_relay_address }}"
+          port: "{{ remnawave_relay_port | default(443, true) | int }}"
+          sni: "{{ remnawave_relay_sni }}"
+          securityLayer: "DEFAULT"
+          overrideSniFromAddress: false
+
+    - name: Assert relay host body advertises the EDGE, not the node
+      assert:
+        that:
+          - _relay_body.address == 'relay-edge.example.test'
+          # The anti-leak invariant.
+          - _relay_body.address != dns_hostname
+          - _relay_body.port == 8443
+          - _relay_body.sni == 'decoy-relay.example'
+          # address (edge) and sni (decoy) intentionally differ, so the panel must
+          # not derive one from the other.
+          - _relay_body.sni != _relay_body.address
+          - not _relay_body.overrideSniFromAddress
+          - _relay_body.securityLayer == 'DEFAULT'
+          - _relay_body.inbound.configProfileInboundUuid == 'rlin-1'
+          - _relay_body.remark.endswith('-relay')
+          # Raw TCP, not WebSocket: no path/host/alpn belong in this body.
+          - "'path' not in _relay_body"
+          - "'host' not in _relay_body"
+          - "'alpn' not in _relay_body"
+        success_msg: "(e) relay Host body OK (edge address, decoy sni, no ws fields)."
+
+    # (e2) The anti-leak guard is an ASSERT in create_relay_host.yml, not a
+    # default(dns_hostname) fallback. Cloning create_reality_host.yml's
+    # `default(dns_hostname, true)` verbatim would publish the origin on any run
+    # that forgot the var — so pin that the expression yields '' instead.
+    - name: Assert an unset relay address yields empty, never the node hostname
+      vars:
+        remnawave_relay_address: ""
+      assert:
+        that:
+          - (remnawave_relay_address | default('')) | length == 0
+          - (remnawave_relay_address | default('')) != dns_hostname
+        success_msg: "(e2) unset relay address stays empty (asserted upstream), never falls back to the node."
+
     - name: All FCP + Host shaping tests passed
       debug:
-        msg: "All FCP + Host shaping tests passed."
+        msg: "All FCP + Host shaping tests passed (incl. relay Host + anti-leak)."

@@ -1,0 +1,161 @@
+---
+# tasks/providers/remnawave/assert_relay_edge.yml
+#
+# THE relay anti-leak invariant, in one place: the client-facing relay edge must
+# never be an address that resolves to this node. Publishing the node's own address
+# hands every subscriber exactly what an IP block needs and bypasses the proxy
+# entirely, which is the single thing the relay transport exists to prevent.
+#
+# Caller sets _relay_edge_candidate, then includes this file. It may also pass
+# _relay_extra_node_names for names that identify this node but are not dns_hostname —
+# a rotation must reject BOTH the outgoing and incoming FQDN, since the old record still
+# resolves here until it is deleted and the new one will as soon as it is created. Both the list AND the
+# comparison live here on purpose: this invariant has now drifted between modes
+# three times — first existing only in deploy, then only comparing the hostname,
+# then missing from change entirely — and every one of those was a case of the same
+# rule being re-implemented per mode. There is nothing left to re-implement.
+#
+# Every fact source is defaulted, so with facts ungathered this degrades to the
+# hostname comparison rather than failing.
+#
+# KNOWN LIMIT — equivalent IPv6 spellings are not canonicalized. `2001:db8::1` and
+# `2001:0db8:0:0:0:0:0:1` are the same address, and lowercasing does not make those two
+# strings equal, so supplying the node's own IPv6 in expanded form would pass the
+# textual comparison. Two reasons this is not fixed here rather than papered over:
+#
+#   * ansible-core ships no IP-address filter. ipaddr/ipv6 live in ansible.utils and
+#     additionally need the netaddr Python package, and requirements.yml deliberately
+#     carries community.docker alone. A collection plus a pip dependency is
+#     disproportionate for one narrow spelling of an already-guarded footgun.
+#   * hand-rolling IPv6 canonicalization in Jinja means getting `::` run-collapsing
+#     right, and a mistake there produces FALSE rejections — a legitimate edge refused
+#     and a deploy blocked, which is worse than the case it would catch.
+#
+# The resolver pass below is the partial mitigation: literals are handed to getent,
+# which echoes its own canonical form when it can resolve them. If exact IPv6 semantics
+# are wanted, add ansible.utils + netaddr and compare with `ipaddr('address')` on both
+# sides; that is a deliberate dependency decision for the maintainer, not something to
+# smuggle in here.
+#
+# Names are normalized before comparison: DNS is case-insensitive and a terminal dot
+# denotes the same FQDN, so `NODE.Example.com.` and `node.example.com` are the same
+# host and a byte comparison would let the first through. Lowercasing also
+# normalizes hex-case differences in IPv6 literals. The pattern is backslash-free
+# ('[.]$' not '\.$') because YAML block and quoted scalars disagree about
+# backslashes — see the note in tasks/migrate/migrate.yml.
+
+- name: Collect this node's own addresses (relay anti-leak)
+  set_fact:
+    _relay_node_addresses: >-
+      {{ ((_relay_extra_node_names | default([]))
+          + [dns_hostname | default('')]
+          + [ansible_facts['default_ipv4']['address'] | default('')]
+          + [ansible_facts['default_ipv6']['address'] | default('')]
+          + (ansible_facts['all_ipv4_addresses'] | default([]))
+          + (ansible_facts['all_ipv6_addresses'] | default([]))
+          + ((envoy_mappings[inventory_hostname]['ipv4'] | default([]))
+             if ((envoy_mappings | default({})) is mapping and (inventory_hostname in (envoy_mappings | default({})))) else [])
+          + ((envoy_mappings[inventory_hostname]['ipv6'] | default([]))
+             if ((envoy_mappings | default({})) is mapping and (inventory_hostname in (envoy_mappings | default({})))) else []))
+         | select('string') | reject('equalto', '')
+         | map('lower') | map('regex_replace', '[.]$', '') | list }}
+
+- name: Normalize the proposed relay edge for comparison
+  set_fact:
+    _relay_edge_normalized: "{{ (_relay_edge_candidate | default('')) | lower | regex_replace('[.]$', '') }}"
+
+- name: Assert the relay edge is not one of this node's own addresses
+  assert:
+    that:
+      - _relay_edge_normalized not in _relay_node_addresses
+    fail_msg: |
+      The relay edge address ({{ _relay_edge_candidate | default('(unset)') }}) is one
+      of THIS NODE's own addresses.
+
+        proposed edge (normalized) : {{ _relay_edge_normalized }}
+        this node's addresses      : {{ _relay_node_addresses | join(', ') }}
+
+      That is a direct Reality deploy wearing a relay label: the Host would publish
+      the node's own address to every subscriber, so an IP block kills it and the
+      external L4 proxy is bypassed entirely.
+
+      Point the edge at the proxy instead:
+        -e remnawave_relay_address=<proxy edge FQDN or IP>
+
+      For a genuinely direct node, use remnawave_reality_enabled=true rather than
+      pointing a relay at itself.
+
+# --- Best-effort: does the proposed edge NAME resolve back to this node? ------
+# The comparison above is textual, so an alternate name or a CNAME pointing at the
+# node passes it while clients still resolve and dial the origin directly — the exact
+# exposure this file exists to prevent, reached by a plausible DNS misconfiguration
+# (pointing the "edge" record at the node instead of the proxy).
+#
+# Deliberately BEST-EFFORT, and the limits are real:
+#   * resolution here is not necessarily what a client sees — split-horizon, GeoDNS
+#     and anycast all mean a pass does NOT prove clients cannot reach the origin;
+#   * getent returns what nsswitch gives, which may be a single address rather than
+#     the full RRset.
+# So it fails ONLY on a positive match and never on an inability to resolve: a name
+# that cannot be looked up here proceeds, with a note. Uses ansible.builtin.getent
+# rather than a dig lookup so no new collection dependency is introduced
+# (requirements.yml carries community.docker only).
+- name: Resolve the proposed relay edge name (best effort)
+  getent:
+    database: hosts
+    key: "{{ _relay_edge_normalized }}"
+  register: _relay_edge_resolved
+  failed_when: false
+  changed_when: false
+  # Literals are NOT skipped: `getent hosts <literal>` echoes the address in the
+  # resolver's own canonical form, which is free partial canonicalization for the
+  # equivalent-IPv6-spelling case below. Costs one extra lookup per run.
+  when: (_relay_edge_normalized | length) > 0
+
+# getent_hosts is keyed by the FIRST COLUMN of `getent hosts`, which is the ADDRESS,
+# with the names as the values: {'127.0.0.1': ['localhost']}. Taking values() alone
+# collected the names and never the address, so the comparison below could not match a
+# node IP — CI caught exactly that.
+#
+# Both halves are collected deliberately, and both are legitimate signals:
+#   * a KEY matching one of this node's IPs  -> the edge name resolves to the node;
+#   * a VALUE matching this node's hostname  -> the edge name is an alias of the node.
+# No IP-shaped filtering: a hostname made only of hex characters and dots would pass
+# such a filter anyway, and the names are wanted regardless.
+- name: Extract everything the edge name resolves to (addresses and names)
+  set_fact:
+    _relay_edge_resolved_addrs: >-
+      {{ (((_relay_edge_resolved.ansible_facts.getent_hosts | default({}, true)).keys() | list)
+          + ((_relay_edge_resolved.ansible_facts.getent_hosts | default({}, true)).values() | list | sum(start=[])))
+         | select('string') | map('lower') | map('regex_replace', '[.]$', '') | list }}
+  when: _relay_edge_resolved.ansible_facts is defined
+
+- name: Assert the relay edge name does not resolve back to this node
+  assert:
+    that:
+      - (_relay_edge_resolved_addrs | default([])) | intersect(_relay_node_addresses) | length == 0
+    fail_msg: |
+      The relay edge name {{ _relay_edge_candidate }} RESOLVES to this node.
+
+        resolves to      : {{ _relay_edge_resolved_addrs | default([]) | join(', ') }}
+        this node's addrs: {{ _relay_node_addresses | join(', ') }}
+        overlap          : {{ (_relay_edge_resolved_addrs | default([])) | intersect(_relay_node_addresses) | join(', ') }}
+
+      Clients would resolve that name and dial the node directly, bypassing the
+      external L4 proxy and publishing the origin — the same exposure as naming the
+      node outright, just one DNS hop away.
+
+      The edge record should point at the proxy (an A/AAAA or CNAME to the provider's
+      edge), not at this node.
+  when: (_relay_edge_resolved_addrs | default([])) | length > 0
+
+- name: Note that the relay edge name could not be resolved here
+  debug:
+    msg: >-
+      Could not resolve {{ _relay_edge_candidate }} from this host, so the
+      resolves-back-to-the-node check was skipped (the textual checks above still
+      applied). This is not a failure — an edge name may be resolvable only from the
+      networks clients use. Confirm by hand that it points at the proxy, not the node.
+  when:
+    - (_relay_edge_normalized | length) > 0
+    - (_relay_edge_resolved_addrs | default([])) | length == 0
