@@ -5,8 +5,12 @@
 # Note: PATCH is on the collection root, not /api/nodes/{uuid}. The body
 # carries the uuid plus any fields to change.
 #
-# Used by change mode (rotate hostname → PATCH address) and migrate mode
-# (move node to new IP → PATCH address).
+# Used by change mode (rotate hostname → PATCH address), migrate mode (move node
+# to new IP → PATCH address) and register_node.yml's opt-in address reconcile.
+#
+# The address itself comes from resolve_node_address.yml: the IP of
+# remnawave_node_address_interface (e.g. tailscale0) when set, else the
+# configured remnawave_node_address / dns_hostname.
 
 - name: Validate update prerequisites
   assert:
@@ -20,6 +24,9 @@
       remnawave_node_uuid (read from /opt/remnanode/.node_uuid in update/
       change/migrate flows).
 
+- name: Resolve the panel-side node address
+  include_tasks: providers/remnawave/resolve_node_address.yml
+
 - name: PATCH node on Panel
   uri:
     url: "{{ remnawave_panel_url }}/api/nodes"
@@ -30,7 +37,7 @@
     body_format: json
     body:
       uuid: "{{ remnawave_node_uuid }}"
-      address: "{{ remnawave_node_address | default(dns_hostname, true) }}"
+      address: "{{ remnawave_node_address_effective }}"
       port: "{{ remnawave_node_port | int }}"
     status_code: 200
     return_content: yes
@@ -40,4 +47,4 @@
 
 - name: Log node update
   debug:
-    msg: "Updated the panel node address={{ remnawave_node_address | default(dns_hostname, true) }} port={{ remnawave_node_port }}"
+    msg: "Updated the panel node address={{ remnawave_node_address_effective }} port={{ remnawave_node_port }}"

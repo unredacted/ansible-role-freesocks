@@ -1,0 +1,141 @@
+---
+# tasks/providers/remnawave/resolve_node_address.yml
+# Resolve remnawave_node_address_effective — the MANAGEMENT address the panel
+# dials for this node on remnawave_node_port (default 2222). The data plane
+# (Fastly origin / Reality address / client Hosts) is untouched by this file.
+#
+# Precedence:
+#   1. remnawave_node_address_interface (non-empty) — the IP this node carries
+#      on that interface, e.g. tailscale0 -> 100.x.y.z. Preferred when the panel
+#      reaches nodes over an overlay: the panel makes its node API calls from
+#      inside a Docker container, where Tailscale MagicDNS resolution is
+#      unreliable, so a MagicDNS name in the address field is a latent outage.
+#   2. remnawave_node_address — a name (defaults to the node's origin FQDN),
+#      falling back to dns_hostname when explicitly blanked.
+#
+# Included by register_node.yml and update_node.yml so deploy / change / migrate
+# all resolve identically. Idempotent: every include re-derives the fact, so a
+# later include can't inherit a stale value from an earlier one.
+
+- name: Validate the node-address interface selector
+  assert:
+    that:
+      - remnawave_node_address_family | default('ipv4') in ['ipv4', 'ipv6']
+    fail_msg: >-
+      remnawave_node_address_family must be 'ipv4' or 'ipv6' (got
+      '{{ remnawave_node_address_family | default('') }}').
+  when: remnawave_node_address_interface | default('') | length > 0
+
+# Ansible spells some device names differently in the fact keys than the kernel
+# does ('-', '.' and ':' become '_', e.g. br-lan -> br_lan), so carry both
+# candidates and pick whichever exists.
+- name: Compute the interface fact-key candidates
+  set_fact:
+    _rn_addr_iface: "{{ remnawave_node_address_interface }}"
+    _rn_addr_iface_alt: "{{ remnawave_node_address_interface | replace('-', '_') | replace('.', '_') | replace(':', '_') }}"
+  when: remnawave_node_address_interface | default('') | length > 0
+
+# Covers both a play run with gather_facts:false and an interface that came up
+# during this run (Tailscale brought up after facts were gathered) — without it
+# the resolve would fail on a node where the interface is perfectly fine.
+- name: Gather network facts (requested interface absent from the fact set)
+  setup:
+    gather_subset:
+      - '!all'
+      - '!min'
+      - network
+  when:
+    - remnawave_node_address_interface | default('') | length > 0
+    - _rn_addr_iface not in ansible_facts
+    - _rn_addr_iface_alt not in ansible_facts
+
+- name: Select the interface fact key
+  set_fact:
+    _rn_addr_iface_key: >-
+      {{ _rn_addr_iface if (_rn_addr_iface in ansible_facts)
+         else (_rn_addr_iface_alt if (_rn_addr_iface_alt in ansible_facts) else '') }}
+  when: remnawave_node_address_interface | default('') | length > 0
+
+- name: Fail when the requested interface does not exist on this node
+  assert:
+    that:
+      - _rn_addr_iface_key | length > 0
+    fail_msg: |
+      remnawave_node_address_interface='{{ remnawave_node_address_interface }}' is not
+      present on this node.
+      Interfaces seen: {{ ansible_facts['interfaces'] | default([]) | sort | join(', ') | default('(none — facts not gathered)', true) }}
+      Bring the interface up before deploying (for Tailscale: `tailscale up`, and
+      confirm `ip -br addr show tailscale0`), or clear
+      remnawave_node_address_interface to register the node by name instead.
+  when: remnawave_node_address_interface | default('') | length > 0
+
+# Fact shape differs by platform: Linux gives ipv4 as a MAPPING (the primary
+# address, with extras under ipv4_secondaries), BSD/macOS gives a LIST. Accept
+# both — and a missing key resolves to '' for the assert below to catch.
+- name: Extract the interface address (IPv4)
+  set_fact:
+    _rn_addr_iface_ip: >-
+      {{ (ansible_facts[_rn_addr_iface_key]['ipv4']['address']
+          if (ansible_facts[_rn_addr_iface_key]['ipv4'] | default({}, true) is mapping)
+          else (ansible_facts[_rn_addr_iface_key]['ipv4'] | default([], true)
+                | map(attribute='address') | list | first)) | default('', true) }}
+  when:
+    - remnawave_node_address_interface | default('') | length > 0
+    - remnawave_node_address_family | default('ipv4') == 'ipv4'
+
+# ansible_facts[iface].ipv6 is a LIST of {address, prefix, scope}. Only a
+# global-scope address is dialable from the panel — link-local needs a zone
+# index the panel's address field has no room for. BSD/macOS omits `scope`
+# entirely, so fall back to any entry that is not in fe80::/10 there.
+- name: Collect the interface's global-scope IPv6 addresses
+  set_fact:
+    _rn_addr_v6_global: >-
+      {{ ansible_facts[_rn_addr_iface_key]['ipv6'] | default([], true)
+         | selectattr('scope', 'defined') | selectattr('scope', 'equalto', 'global')
+         | map(attribute='address') | list }}
+    _rn_addr_v6_unscoped: >-
+      {{ ansible_facts[_rn_addr_iface_key]['ipv6'] | default([], true)
+         | rejectattr('scope', 'defined') | map(attribute='address')
+         | reject('match', '(?i)fe[89ab][0-9a-f]:') | list }}
+  when:
+    - remnawave_node_address_interface | default('') | length > 0
+    - remnawave_node_address_family | default('ipv4') == 'ipv6'
+
+- name: Extract the interface address (IPv6)
+  set_fact:
+    _rn_addr_iface_ip: >-
+      {{ ((_rn_addr_v6_global | first) if (_rn_addr_v6_global | length > 0)
+          else (_rn_addr_v6_unscoped | first if (_rn_addr_v6_unscoped | length > 0) else '')) }}
+  when:
+    - remnawave_node_address_interface | default('') | length > 0
+    - remnawave_node_address_family | default('ipv4') == 'ipv6'
+
+- name: Fail when the interface carries no usable address
+  assert:
+    that:
+      - _rn_addr_iface_ip | length > 0
+    fail_msg: >-
+      Interface '{{ remnawave_node_address_interface }}' (facts key
+      '{{ _rn_addr_iface_key }}') has no
+      {{ 'global-scope IPv6' if (remnawave_node_address_family | default('ipv4') == 'ipv6') else 'IPv4' }}
+      address, so the panel has nothing to dial. Check the interface is up and
+      addressed, or switch remnawave_node_address_family.
+  when: remnawave_node_address_interface | default('') | length > 0
+
+- name: Use the interface address as the panel-side node address
+  set_fact:
+    remnawave_node_address_effective: "{{ _rn_addr_iface_ip }}"
+  when: remnawave_node_address_interface | default('') | length > 0
+
+- name: Use the configured name as the panel-side node address
+  set_fact:
+    remnawave_node_address_effective: "{{ remnawave_node_address | default(dns_hostname, true) }}"
+  when: remnawave_node_address_interface | default('') | length == 0
+
+- name: Log the resolved panel-side node address
+  debug:
+    msg: >-
+      Panel-side node address: {{ remnawave_node_address_effective }}:{{ remnawave_node_port }}
+      {{ '(from interface ' + remnawave_node_address_interface + ', ' + (remnawave_node_address_family | default('ipv4')) + ')'
+         if (remnawave_node_address_interface | default('') | length > 0)
+         else '(from remnawave_node_address)' }}

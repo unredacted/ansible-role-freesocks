@@ -598,6 +598,13 @@ remnawave_panel_active_inbounds:
   - "<inbound-uuid-1>"
 remnawave_panel_country_code: "US"
 
+# Where the PANEL dials this node to manage it (control plane, node_port).
+# Interface first — see "Panel-side node address" below.
+remnawave_node_address_interface: "tailscale0"  # empty = use the name below
+remnawave_node_address_family: "ipv4"           # ipv4 | ipv6
+remnawave_node_address: ""                      # a NAME; defaults to the node's origin FQDN
+remnawave_node_reconcile_address: false         # PATCH an already-registered node whose address drifted
+
 # Standalone Caddy on the host (TLS terminator + WS reverse-proxy)
 # Required for Fastly fronting and for VLESS-TLS / Trojan-TLS transports.
 # The Reality and relay transports don't need this (REALITY terminates in Xray).
@@ -653,6 +660,62 @@ remnawave_relay_repoint_ack: false   # required before change/migrate breaks the
 1. Create a long-lived API token via Panel UI → Tokens. Store as `remnawave_panel_api_token` in vault.
 2. Set `remnawave_secret_key_source: panel_api` (so the role fetches the key automatically) and/or `remnawave_panel_register_node: true` (so the role creates the panel-side node entry).
 3. When `register_node` is true, also supply `remnawave_panel_config_profile_uuid` (from the `bootstrap` mode output). The active inbounds are derived from `remnawave_cdn_transports[].inbound_uuid` (+ the Reality inbound when enabled). The role calls `POST /api/nodes`, captures the returned UUID, and persists it locally to `/opt/remnanode/.node_uuid` for use by future change/migrate flows (which then `PATCH /api/nodes` to keep the panel in sync with the new hostname).
+
+#### Panel-side node address
+
+The panel needs an address to reach each node's management API on
+`remnawave_node_port` (default 2222). Two ways to spell it, and the interface
+form is the reliable one on an overlay network:
+
+```yaml
+# Preferred: register the IP this node carries on an interface.
+remnawave_node_address_interface: "tailscale0"
+remnawave_node_address_family: "ipv4"    # ipv4 | ipv6 (global scope, unbracketed)
+
+# Fallback: a name. Defaults to the node's origin FQDN (the unguessable
+# fastly_origin_fqdn when Fastly-fronted, else dns_hostname).
+remnawave_node_address: "node-a1b2c3d4.example.com"
+```
+
+Prefer the interface when the panel reaches nodes over Tailscale or WireGuard.
+The panel makes its node API calls from inside a Docker container, which
+resolves Tailscale MagicDNS names unreliably at best — so a MagicDNS name in
+this field is a node that goes unmanageable for reasons that look like nothing.
+The interface's address always dials. Deploy, change and migrate all resolve it
+the same way (`tasks/providers/remnawave/resolve_node_address.yml`), from facts
+gathered on the node itself, so nothing has to be restated per host.
+
+The resolution fails loudly rather than registering a blank or a guess: an
+interface that does not exist lists the ones that do, and an interface with no
+address in the requested family (or only a link-local IPv6) is an error.
+Facts are re-gathered on the fly when the interface is not in the current fact
+set, so `gather_facts: false` and "Tailscale came up earlier in this run" both
+work.
+
+This is the **management** endpoint only. The data plane — the Fastly origin,
+the Reality address, the client-facing Hosts — is unaffected.
+
+**Moving an already-registered fleet.** Registration is GET-first: a node
+already on the panel under this name is reused and its address left alone. So
+switching a live fleet from hostnames to overlay IPs needs one of:
+
+```yaml
+remnawave_node_reconcile_address: true   # PATCH the reused node's address/port when it drifts
+```
+
+Without it the drift is still logged on every run (`Panel node "x" is registered
+as … but this run resolves …`), so nothing rots silently; a `change`/`migrate`
+run also PATCHes the address as part of its normal flow.
+
+For a node that is already deployed (where `deploy` refuses to run again), the
+transition is `update` mode with the same flag — the only lifecycle mode that
+touches a live node without rotating it. It needs the panel token (from vault)
+and the node's `.node_uuid` on disk; both are reported if missing, and neither
+is the deploy-time `remnawave_panel_register_node` flag:
+
+```bash
+ansible-playbook -i inventory playbook.yml --ask-vault-pass --extra-vars "target=node-a operation_mode=update environment_mode=prod outline_enabled=false remnawave_enabled=true remnawave_panel_url=https://panel.example.com remnawave_node_address_interface=tailscale0 remnawave_node_reconcile_address=true"
+```
 
 #### Caddy + Fastly coordination
 

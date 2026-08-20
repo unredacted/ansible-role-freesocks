@@ -314,13 +314,36 @@ remnawave_node_fronted_squad_prefix: "FSF"
 remnawave_node_reality_squad_prefix: "FSR"
 remnawave_panel_country_code: "XX" # 2-letter ISO; panel default is "XX"
 # The address the PANEL dials to manage the node (control plane, node_port 2222).
-# Defaults to the node's ORIGIN name: the unguessable fastly_origin_fqdn when
-# Fastly-fronted (the edge CNAME can't carry panel management traffic), else the
-# public data-plane dns_hostname. Override to a Tailscale MagicDNS name / IP
-# (e.g. "{{ inventory_hostname }}") when the panel reaches nodes over
-# Tailscale rather than the public internet. MANAGEMENT endpoint only — does NOT
-# affect the data plane (Fastly origin / Reality address / client Hosts).
+# MANAGEMENT endpoint only — does NOT affect the data plane (Fastly origin /
+# Reality address / client Hosts).
+#
+# Two ways to spell it, interface first:
+#
+#   remnawave_node_address_interface — the node registers as the IP it carries
+#     on that interface (e.g. "tailscale0" -> 100.x.y.z). PREFER THIS when the
+#     panel reaches nodes over an overlay: the panel's Xray/node API calls come
+#     out of a Docker container, which resolves Tailscale MagicDNS names
+#     unreliably at best, so a name there is a latent outage — an address always
+#     dials. Resolved per-host from gathered facts by
+#     providers/remnawave/resolve_node_address.yml; wins over the name below.
+#
+#   remnawave_node_address — a NAME (or a literal address). Defaults to the
+#     node's ORIGIN name: the unguessable fastly_origin_fqdn when Fastly-fronted
+#     (the edge CNAME can't carry panel management traffic), else the public
+#     data-plane dns_hostname.
 remnawave_node_address: "{{ fastly_origin_fqdn | default(dns_hostname, true) }}"
+remnawave_node_address_interface: "" # e.g. "tailscale0" — empty = use the name above
+# ipv4 | ipv6. ipv6 takes the interface's first GLOBAL-scope address (link-local
+# is not dialable from the panel) and stores it UNBRACKETED, as the panel's
+# address field expects.
+remnawave_node_address_family: "ipv4"
+# Registration is GET-first: a node already on the panel under this name is
+# reused as-is and its address is left alone (address drift is change/migrate's
+# job). Set true to also PATCH the panel when the reused node's address/port no
+# longer matches what this run resolves — the way to move a fleet that was
+# registered by hostname onto overlay addresses without a rotation. Off by
+# default, but the drift is always logged.
+remnawave_node_reconcile_address: false
 
 # TLS via standalone Caddy (opt-in)
 # Required when fronting through Fastly (Fastly origin needs a valid public cert

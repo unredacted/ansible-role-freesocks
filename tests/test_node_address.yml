@@ -1,0 +1,321 @@
+---
+# tests/test_node_address.yml
+#
+# Offline test for tasks/providers/remnawave/resolve_node_address.yml — the
+# panel-side node MANAGEMENT address resolution (interface IP vs configured
+# name). No hosts, no API calls: ansible_facts is shadowed with synthetic
+# interface facts via the include's vars — passed as a YAML ALIAS to the literal
+# mapping, never as a "{{ _fake_facts }}" template, because the conditional
+# `setup` re-gather merges gathered facts into that var and cannot merge into an
+# unresolved template string.
+#
+# Sections:
+#   (a1) interface unset  -> remnawave_node_address wins
+#   (a2) interface unset + blank address -> dns_hostname fallback
+#   (b1) interface set    -> its IPv4 beats remnawave_node_address
+#   (b2) family=ipv6      -> the GLOBAL-scope address, not link-local
+#   (b3) dashed/dotted device name -> resolves via the sanitized fact key
+#   (b4) re-resolve with no interface -> the fact does not stick from (b1)
+#   (b5) BSD/macOS fact shape (ipv4 as a LIST, ipv6 with no scope keys)
+#   (c1) unknown interface -> fail (lists what the node does have)
+#   (c2) interface without an IPv4 -> fail
+#   (c3) family=ipv6 but only link-local -> fail
+#   (c4) invalid family -> fail
+#   (d1) STRUCTURAL: register_node/update_node send the RESOLVED fact, their
+#        nested includes use role-tasks-relative paths (a bare sibling filename
+#        does NOT resolve inside tasks/providers/<x>/), and update mode keeps its
+#        opt-in, wipe-safe address re-sync gated on credentials + .node_uuid
+#
+# Run: ansible-playbook tests/test_node_address.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _resolve: "{{ playbook_dir | dirname }}/tasks/providers/remnawave/resolve_node_address.yml"
+    remnawave_node_port: 2222
+    dns_hostname: "quiet-falcon.freesocks.example"
+    remnawave_node_address: "quiet-falcon-a1b2c3d4.freesocks.example"
+    remnawave_node_address_interface: ""
+    remnawave_node_address_family: "ipv4"
+    # Synthetic facts for a node on a tailnet: tailscale0 carries the CGNAT v4
+    # plus a link-local and a global v6; br-lan exercises fact-key sanitizing;
+    # dummy0 has no address family at all.
+    _fake_facts: &fake_facts
+      interfaces: ["lo", "eth0", "tailscale0", "br-lan", "dummy0"]
+      lo:
+        ipv4: { address: "127.0.0.1" }
+      eth0:
+        ipv4: { address: "203.0.113.10" }
+      tailscale0:
+        ipv4: { address: "100.100.64.7" }
+        ipv6:
+          - { address: "fe80::abcd", prefix: "64", scope: "link" }
+          - { address: "fd7a:115c:a1e0::1234", prefix: "128", scope: "global" }
+      br_lan:
+        ipv4: { address: "10.20.0.1" }
+      dummy0:
+        ipv6:
+          - { address: "fe80::dead", prefix: "64", scope: "link" }
+      # BSD/macOS fact shape: ipv4 is a LIST and ipv6 entries carry no scope.
+      utun3:
+        ipv4:
+          - { address: "100.100.64.9", netmask: "255.255.255.255" }
+        ipv6:
+          - { address: "fe80::9", prefix: "64" }
+          - { address: "fd7a:115c:a1e0::9", prefix: "128" }
+  tasks:
+    # ---------------------------------------------------------------- (a) name
+    - name: (a1) Resolve with no interface selected
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+
+    - name: (a1) Assert the configured name is used verbatim
+      assert:
+        that:
+          - remnawave_node_address_effective == 'quiet-falcon-a1b2c3d4.freesocks.example'
+        success_msg: "No interface selected → remnawave_node_address wins."
+
+    - name: (a2) Resolve with the address blanked
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+        remnawave_node_address: ""
+
+    - name: (a2) Assert the dns_hostname fallback survives
+      assert:
+        that:
+          - remnawave_node_address_effective == 'quiet-falcon.freesocks.example'
+        success_msg: "Blank remnawave_node_address → dns_hostname (pre-existing behaviour kept)."
+
+    # ----------------------------------------------------------- (b) interface
+    - name: (b1) Resolve from the tailscale0 interface
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+        remnawave_node_address_interface: "tailscale0"
+
+    - name: (b1) Assert the interface IPv4 beats the configured name
+      assert:
+        that:
+          - remnawave_node_address_effective == '100.100.64.7'
+        success_msg: "tailscale0 → its 100.x address, not the hostname the panel can't resolve."
+
+    - name: (b2) Resolve the interface's IPv6
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+        remnawave_node_address_interface: "tailscale0"
+        remnawave_node_address_family: "ipv6"
+
+    - name: (b2) Assert the GLOBAL-scope v6 is chosen, unbracketed
+      assert:
+        that:
+          - remnawave_node_address_effective == 'fd7a:115c:a1e0::1234'
+        success_msg: "family=ipv6 → the global-scope address; link-local skipped."
+
+    - name: (b3) Resolve a device whose fact key is sanitized (br-lan → br_lan)
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+        remnawave_node_address_interface: "br-lan"
+
+    - name: (b3) Assert the sanitized fact key is found
+      assert:
+        that:
+          - remnawave_node_address_effective == '10.20.0.1'
+        success_msg: "Kernel device name with '-' resolves through the '_' fact key."
+
+    - name: (b4) Re-resolve with the interface cleared again
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+
+    - name: (b4) Assert the interface address did not stick as a fact
+      assert:
+        that:
+          - remnawave_node_address_effective == 'quiet-falcon-a1b2c3d4.freesocks.example'
+        success_msg: "Every include re-derives the fact — no stale value from an earlier include."
+
+    - name: (b5) Resolve a BSD/macOS-shaped interface (ipv4 as a list)
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+        remnawave_node_address_interface: "utun3"
+
+    - name: (b5) Assert the list-shaped IPv4 fact resolves
+      assert:
+        that:
+          - remnawave_node_address_effective == '100.100.64.9'
+        success_msg: "ipv4 as a LIST (BSD/macOS facts) resolves like the Linux mapping."
+
+    - name: (b5) Resolve the same interface's IPv6 with no scope keys
+      include_tasks: "{{ _resolve }}"
+      vars:
+        ansible_facts: *fake_facts
+        remnawave_node_address_interface: "utun3"
+        remnawave_node_address_family: "ipv6"
+
+    - name: (b5) Assert the unscoped fallback skips link-local
+      assert:
+        that:
+          - remnawave_node_address_effective == 'fd7a:115c:a1e0::9'
+        success_msg: "No scope keys → first non-fe80:: address, never the link-local one."
+
+    # ------------------------------------------------------------ (c) failures
+    - name: (c1) An unknown interface must fail
+      block:
+        - name: (c1) Resolve a device the node does not have
+          include_tasks: "{{ _resolve }}"
+          vars:
+            ansible_facts: *fake_facts
+            remnawave_node_address_interface: "wg0"
+        - name: (c1) Unreached
+          assert:
+            that: [false]
+            fail_msg: "An unknown interface resolved instead of failing."
+      rescue:
+        - name: (c1) Assert the failure names the interfaces that do exist
+          assert:
+            that:
+              - "'wg0' in (ansible_failed_result.msg | default(''))"
+              - "'tailscale0' in (ansible_failed_result.msg | default(''))"
+            success_msg: "Unknown interface fails, and the message lists what the node has."
+
+    - name: (c2) An interface with no IPv4 must fail
+      block:
+        - name: (c2) Resolve a v6-only device as ipv4
+          include_tasks: "{{ _resolve }}"
+          vars:
+            ansible_facts: *fake_facts
+            remnawave_node_address_interface: "dummy0"
+        - name: (c2) Unreached
+          assert:
+            that: [false]
+            fail_msg: "An interface with no IPv4 resolved instead of failing."
+      rescue:
+        - name: (c2) Assert the failure explains the empty address
+          assert:
+            that:
+              - "'dummy0' in (ansible_failed_result.msg | default(''))"
+              - "'IPv4' in (ansible_failed_result.msg | default(''))"
+            success_msg: "No IPv4 on the interface fails loudly (never registers an empty address)."
+
+    - name: (c3) Link-local-only IPv6 must fail
+      block:
+        - name: (c3) Resolve a link-local-only device as ipv6
+          include_tasks: "{{ _resolve }}"
+          vars:
+            ansible_facts: *fake_facts
+            remnawave_node_address_interface: "dummy0"
+            remnawave_node_address_family: "ipv6"
+        - name: (c3) Unreached
+          assert:
+            that: [false]
+            fail_msg: "A link-local-only interface resolved instead of failing."
+      rescue:
+        - name: (c3) Assert the failure calls out global scope
+          assert:
+            that:
+              - "'global-scope IPv6' in (ansible_failed_result.msg | default(''))"
+            success_msg: "Link-local is refused — the panel cannot dial it."
+
+    - name: (c4) An invalid address family must fail
+      block:
+        - name: (c4) Resolve with a bogus family
+          include_tasks: "{{ _resolve }}"
+          vars:
+            ansible_facts: *fake_facts
+            remnawave_node_address_interface: "tailscale0"
+            remnawave_node_address_family: "ipv5"
+        - name: (c4) Unreached
+          assert:
+            that: [false]
+            fail_msg: "An invalid remnawave_node_address_family was accepted."
+      rescue:
+        - name: (c4) Assert the family validation fired
+          assert:
+            that:
+              - "'remnawave_node_address_family' in (ansible_failed_result.msg | default(''))"
+            success_msg: "Only ipv4/ipv6 are accepted."
+
+    # ---------------------------------------------------------- (d) structural
+    - name: (d1) Read the panel node-API task files
+      set_fact:
+        _reg_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/providers/remnawave/register_node.yml') }}"
+        _upd_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/providers/remnawave/update_node.yml') }}"
+        _updmode_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/update/remnawave_update.yml') }}"
+
+    # assert.that items ARE expressions, and an expression cannot contain
+    # template delimiters — so the needles are concatenated from single braces.
+    - name: (d1) Compose the wire-body needles
+      set_fact:
+        _ob: "{{ '{' ~ '{' }}"
+        _cb: "{{ '}' ~ '}' }}"
+
+    - name: (d1) Compose the resolved / raw address needles
+      set_fact:
+        _needle_resolved: "{{ 'address: \"' ~ _ob ~ ' remnawave_node_address_effective ' ~ _cb ~ '\"' }}"
+        # Prefix only: catches both the bare var and any filter chain after it.
+        _needle_raw: "{{ 'address: \"' ~ _ob ~ ' remnawave_node_address ' }}"
+
+    - name: (d1) Assert both API bodies send the RESOLVED address
+      assert:
+        that:
+          # The wire body, not a comment: the key with the fact as its value.
+          - _needle_resolved in _reg_src
+          - _needle_resolved in _upd_src
+          # ...and neither still sends the raw var (bare or filtered).
+          - _needle_raw not in _reg_src
+          - _needle_raw not in _upd_src
+          # Both must resolve the address before shaping a request body.
+          - _reg_src.find('resolve_node_address') < _reg_src.find(_needle_resolved)
+          - _upd_src.find('resolve_node_address') < _upd_src.find(_needle_resolved)
+        success_msg: "POST /api/nodes and PATCH /api/nodes both carry the resolved address."
+
+    - name: (d1) Assert nested includes use role-tasks-relative paths
+      assert:
+        that:
+          # A bare sibling filename does NOT resolve from tasks/providers/<x>/ —
+          # ansible searches the role's tasks/ dir, not the including file's dir.
+          - "'include_tasks: providers/remnawave/resolve_node_address.yml' in _reg_src"
+          - "'include_tasks: providers/remnawave/resolve_node_address.yml' in _upd_src"
+          - "'include_tasks: resolve_node_address.yml' not in _reg_src"
+          - "'include_tasks: resolve_node_address.yml' not in _upd_src"
+          - "'include_tasks: update_node.yml' not in _reg_src"
+        success_msg: "Nested includes are role-tasks-relative, so they resolve in every flow."
+
+    # update mode is the only lifecycle mode that runs against a deployed node
+    # without rotating it, so it is where an existing fleet is moved onto
+    # interface addresses. Wiring that goes missing would be silent.
+    # Slice from the task name so the explanatory comment above it (which names
+    # the flag it deliberately does NOT gate on) cannot satisfy these.
+    - name: (d1) Materialize the update-mode re-sync task
+      set_fact:
+        _updmode_resync: "{{ _updmode_src[_updmode_src.find('- name: Re-sync the panel-side node address'):] }}"
+
+    - name: (d1) Assert the re-sync gate keys on credentials + persisted state
+      assert:
+        that:
+          # An update run carries the panel token and reads .node_uuid off disk;
+          # it does NOT re-pass deploy-time flags, so gating on
+          # remnawave_panel_register_node makes the documented one-liner a no-op.
+          - "'remnawave_panel_api_token' in _updmode_resync"
+          - "'remnawave_node_uuid' in _updmode_resync"
+          - "'remnawave_panel_register_node' not in _updmode_resync"
+        success_msg: "update mode's re-sync gates on the token + persisted uuid, not a deploy flag."
+
+    - name: (d1) Assert update mode can re-sync the address, opt-in and wipe-safe
+      assert:
+        that:
+          - "'include_tasks: ../providers/remnawave/update_node.yml' in _updmode_src"
+          - "'remnawave_node_reconcile_address' in _updmode_src"
+          - >-
+            _updmode_src.find('Re-sync the panel-side node address')
+            < _updmode_src.find('remnawave_node_reconcile_address')
+          - "'not (force_wipe_remnawave | default(false) | bool)' in _updmode_src"
+        success_msg: "update mode PATCHes the address only under the opt-in flag, never after a wipe."
+
+    - name: All node-address tests passed
+      debug:
+        msg: "OK"

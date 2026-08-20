@@ -787,7 +787,12 @@
       ⚠️  Manual step required:
       The Remnawave node was migrated to {{ dns_hostname }} but the Panel API
       was not used to update the address. Open the Panel UI → Nodes → find the
-      entry for {{ source_kv_hostname }}.* and update its 'Address' to '{{ dns_hostname }}'.
+      entry for {{ source_kv_hostname }}.* and update its 'Address' to
+      '{{ remnawave_node_address_effective if (remnawave_node_address_effective is defined)
+         else ((remnawave_node_address | default(dns_hostname, true))
+               if ((remnawave_node_address_interface | default('') | length) == 0)
+               else ("the " ~ remnawave_node_address_interface ~ " "
+                     ~ (remnawave_node_address_family | default('ipv4')) ~ " address of this node")) }}'.
 
       The panel is still dialling the SOURCE address, which is no longer serving —
       this node is unreachable through the panel until that field is updated.
