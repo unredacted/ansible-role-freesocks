@@ -725,6 +725,32 @@ remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
 
 **Decoy sites are operator-supplied.** The role ships **no default** for `remnawave_bootstrap_reality_dest` / `_server_names` (nor their relay counterparts): which site a REALITY inbound borrows is deployment-specific and does not belong in a public repo. Set them in your own inventory — `operation_mode=bootstrap` asserts they are non-empty rather than creating a dead inbound. The mechanical requirements: `dest` must be a real, reachable TLS 1.3 host and must serve **every** name in `serverNames` (a probe sending an unserved name gets a cert mismatch, which burns the node), its certificate chain must fit Xray's hardcoded 8192-byte REALITY buffer ([xray-core #6356](https://github.com/XTLS/Xray-core/issues/6356)), and `remnawave_reality_sni` must be one of those `serverNames`.
 
+**Bootstrap-side inbound variables.** These shape the inbounds `operation_mode=bootstrap` creates on the panel; they are read during bootstrap only, never on a node deploy. Each REALITY transport carries its own set — and its own x25519 keypair, so a seized direct-Reality node does not burn relay:
+
+```yaml
+# Direct Reality
+remnawave_bootstrap_reality: true                  # set false to skip the inbound entirely
+remnawave_bootstrap_reality_dest: ""               # REQUIRED — "<decoy host>:443"
+remnawave_bootstrap_reality_server_names: []       # REQUIRED — names that dest serves
+remnawave_bootstrap_reality_short_ids: [""]
+remnawave_bootstrap_reality_network: "raw"
+remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
+
+# Relay (defaults to ON — set false if you are not deploying relay nodes yet,
+# otherwise bootstrap asserts on the empty dest/serverNames below)
+remnawave_bootstrap_relay: true
+remnawave_bootstrap_relay_dest: ""                 # REQUIRED when relay is on
+remnawave_bootstrap_relay_server_names: []         # REQUIRED when relay is on
+remnawave_bootstrap_relay_short_ids: [""]
+remnawave_bootstrap_relay_network: "raw"
+remnawave_bootstrap_relay_listen_port: 443         # port the inbound binds ON THE NODE
+remnawave_bootstrap_relay_accept_proxy_protocol: false
+remnawave_bootstrap_relay_squad_name: "FreeSocks-Relay"
+
+# Re-running bootstrap adds base inbounds missing from an existing profile, by tag
+remnawave_bootstrap_reconcile_inbounds: true
+```
+
 **Phase 0 (Reality) — one-time manual panel prerequisite.** Add a Reality inbound to the Config Profile — raw Xray: `vless`, `listen 0.0.0.0:443`, `security reality`, `realitySettings { dest, serverNames, privateKey, shortIds }`, `flow xtls-rprx-vision` — generate the x25519 keypair (panel UI / `GenerateX25519` endpoint / `xray x25519`), then record the inbound UUID (from `GET /api/config-profiles/inbounds`) into `remnawave_reality_inbound_uuid` and one serverName into `remnawave_reality_sni`.
 
 #### Relay transport (VLESS+REALITY behind an external L4 proxy)
@@ -760,7 +786,9 @@ Bootstrap echoes the node-side port into its output file as `remnawave_relay_nod
 
 **Adding relay to a panel that is already bootstrapped.** Bootstrap reconciles the Config Profile's base inbounds **by tag** (`remnawave_bootstrap_reconcile_inbounds`, default on): re-running it against an existing `FreeSocks-Config` adds any missing base inbound — the relay one included — via a full-replace `PATCH /api/config-profiles`. Existing inbounds are copied through **byte-for-byte and never rewritten**, so a re-run cannot rotate a live inbound's keys out from under connected clients. The corollary: editing `dest` / `serverNames` on an inbound that already exists is *not* reconciled — change it in the panel, or delete the inbound and re-run.
 
-**`remnawave_relay_address` has no default, on purpose.** It is asserted, not defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — a worse outcome than a failed run. The role additionally fails if the address *equals* `dns_hostname`.
+**`remnawave_relay_address` has no default, on purpose.** It is asserted, not defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — a worse outcome than a failed run.
+
+**The edge is checked against the node, not just its hostname.** A single task file, `tasks/providers/remnawave/assert_relay_edge.yml`, owns the invariant. Deploy, `change` and `migrate` each include it as an early pre-flight, so a bad edge fails before anything is mutated — and `create_relay_host.yml` includes it again, which makes it unavoidable: every path that publishes a relay Host passes through there. That is why the check exists in exactly one file rather than once per mode. It refuses an edge that is, or resolves to, this node: `dns_hostname`, **both** FQDNs of a rotation (old and new), `default_ipv4` / `default_ipv6`, every entry of `all_ipv4_addresses` / `all_ipv6_addresses`, this host's `envoy_mappings` addresses, and finally a best-effort `getent` resolution of the edge name compared against all of the above. The resolution pass fails **only on a positive match** — an edge that cannot be resolved from the control host is not an error, since your resolver is not the client's. Documented limit: equivalent IPv6 *spellings* are not canonicalized (`2001:db8::1` vs `2001:0db8:0:0:0:0:0:1` compare as different strings), so give the edge in the same form the node's facts report; `tests/test_relay.yml` `(t3)` pins that gap deliberately so it cannot regress unnoticed.
 
 **PROXY protocol.** Many L4 forwarders prepend a PROXY v1/v2 header. If yours does, set `remnawave_bootstrap_relay_accept_proxy_protocol: true` — otherwise REALITY reads the header bytes as a malformed ClientHello and **every connection fails with no useful error**. If yours does not, leave it off; the same failure happens in reverse.
 
