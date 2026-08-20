@@ -57,11 +57,12 @@ a Config Profile + inbounds + an internal squad). Two ways to create them:
 
 - **Automated (recommended) — `operation_mode=bootstrap`:** run the role once against
   the panel (host-agnostic, `delegate_to: localhost`) and it creates the Config Profile
-  (`FreeSocks-Config`) with the BASE WS/Reality inbounds (born compliant with the
-  FreeSocks no-log Xray posture), generates the Reality x25519 keypair, creates the
-  two **panel-wide squads** (`FreeSocks-Fastly` for the WS/CDN side, `FreeSocks-Reality`
-  for direct), and binds them to FCP's per-mode placement pools (`freedom-ws` =
-  Freedom Mode / `privacy-reality` = Privacy Mode). Every node deploy then activates the SHARED base inbounds and
+  (`FreeSocks-Config`) with the BASE WS / Reality / relay inbounds (born compliant
+  with the FreeSocks no-log Xray posture), generates an x25519 keypair per REALITY
+  transport, creates the three **panel-wide squads** (`FreeSocks-Fastly` for the
+  WS/CDN side, `FreeSocks-Reality` for direct Reality, `FreeSocks-Relay` for
+  REALITY behind an external L4 proxy), and binds them to FCP's per-mode placement
+  pools (`freedom-ws` / `privacy-reality` / `freedom-reality`). Every node deploy then activates the SHARED base inbounds and
   creates its own Hosts — subscriptions carry every node's endpoint, and rotation or
   teardown never touches squads. Bootstrap PRINTS the created Config Profile + base
   inbound UUIDs; copy them into your node-deploy vars.
@@ -131,7 +132,7 @@ Write a `playbook.yml` that applies the role to your host. A **fronted Remnawave
     fcp_enabled: true
     fcp_api_url: "https://control-plane.example.org"
     fcp_register_remnawave_panel: true # register the panel row (once)
-    # the panel-wide squads (FreeSocks-Fastly / FreeSocks-Reality) were created
+    # the panel-wide squads (FreeSocks-Fastly / -Reality / -Relay) were created
     # and bound to FCP's mode pools at bootstrap — this deploy only registers
     # the node against the SHARED base inbounds and creates its Hosts
   roles:
@@ -195,7 +196,8 @@ environment_mode: "prod"  # or "dev"
 operation_mode: "deploy"  # deploy | migrate | change | update | bootstrap
 # bootstrap = one-time, panel-only: create the Remnawave Config Profile
 # (FreeSocks-Config) + inbounds + the panel-wide squads (FreeSocks-Fastly /
-# FreeSocks-Reality) and bind them to FCP's mode pools (no host touched).
+# FreeSocks-Reality / FreeSocks-Relay) and bind them to FCP's mode pools
+# (no host touched). Re-running it reconciles missing base inbounds by tag.
 # Legacy per-node placement (clones + per-node squads) is opt-in via
 # remnawave_per_node_placement=true.
 
@@ -320,7 +322,7 @@ fcp_status_gate: false
 
 - **Remnawave** — FCP stores only the **panel** (`baseUrl` + `apiToken`), **not** individual nodes. Per-node config reaches users through the panel's subscription output. The role still registers the node and creates Hosts on the panel (separate, unchanged behavior). Registering the panel with FCP is opt-in via `fcp_register_remnawave_panel: true` (with `fcp_remnawave_panel_slug`).
 
-**Node placement (per-mode squad pools).** FCP no longer binds squads to tiers — it homes each new key into the chosen connection mode's squad POOL, bound via `PATCH /api/v1/admin/backends/remnawave/mode-placements` (scope `admin:servers:write`, the same one registration uses; requires the FCP 2026-07-28 DB-driven mode-catalog release — older role versions used the still-alive `/api/v1/admin/remnawave/mode-placements` alias with the pre-rename ids `evade`/`privacy`). The default topology is **one panel-wide squad per transport**: bootstrap creates `FreeSocks-Fastly` (WS/CDN → `freedom-ws`) and `FreeSocks-Reality` (direct → `privacy-reality`) and binds them as the pools; every node activates the shared base inbounds and adds its own Hosts, so a subscription carries every node's endpoint. Retiring a node (`force_wipe_remnawave`) deletes its Hosts and its node entry — the squads and pools stay. Squad UUIDs are treated as sensitive (requests are `no_log`; FCP validates them server-side, audits only a `poolBound` boolean + pool size, and never echoes them back). A **legacy per-node model** (`remnawave_per_node_placement: true`) remains available for per-node least-loaded homing: each node clones the base inbounds under its own tag and gets its own squad (`FSF-<hostname>` / `FSR-<hostname>` — the panel caps squad names at 30 chars), appended to the pools (`addSquadUuids`) and detached at teardown (`tasks/providers/remnawave/teardown_node_placement.yml`).
+**Node placement (per-mode squad pools).** FCP no longer binds squads to tiers — it homes each new key into the chosen connection mode's squad POOL, bound via `PATCH /api/v1/admin/backends/remnawave/mode-placements` (scope `admin:servers:write`, the same one registration uses; requires the FCP 2026-07-28 DB-driven mode-catalog release — older role versions used the still-alive `/api/v1/admin/remnawave/mode-placements` alias with the pre-rename ids `evade`/`privacy`). The default topology is **one panel-wide squad per transport**: bootstrap creates `FreeSocks-Fastly` (WS/CDN → `freedom-ws`), `FreeSocks-Reality` (direct → `privacy-reality`) and `FreeSocks-Relay` (REALITY behind an external L4 proxy → `freedom-reality`) and binds them as the pools; every node activates the shared base inbounds and adds its own Hosts, so a subscription carries every node's endpoint. Retiring a node (`force_wipe_remnawave`) deletes its Hosts and its node entry — the squads and pools stay. Squad UUIDs are treated as sensitive (requests are `no_log`; FCP validates them server-side, audits only a `poolBound` boolean + pool size, and never echoes them back). A **legacy per-node model** (`remnawave_per_node_placement: true`) remains available for per-node least-loaded homing: each node clones the base inbounds under its own tag and gets its own squad (`FSF-<hostname>` / `FSR-<hostname>` — the panel caps squad names at 30 chars), appended to the pools (`addSquadUuids`) and detached at teardown (`tasks/providers/remnawave/teardown_node_placement.yml`).
 
 **Migrate cleans up the source row.** When an Outline server is migrated to a new host, the destination is registered under its own slug and the role then **deletes the source server's FCP `backendServers` row** (by the source slug, `source_kv_hostname`) via `tasks/providers/fcp/delete_server.yml` — a single idempotent `DELETE …/backend-servers/by-slug/{slug}` (no GET-list / id resolution; no-ops if absent). This leaves no orphaned row behind, and is skipped when source and destination slugs are identical.
 
@@ -598,7 +600,7 @@ remnawave_panel_country_code: "US"
 
 # Standalone Caddy on the host (TLS terminator + WS reverse-proxy)
 # Required for Fastly fronting and for VLESS-TLS / Trojan-TLS transports.
-# Reality transport doesn't need this.
+# The Reality and relay transports don't need this (REALITY terminates in Xray).
 remnawave_caddy_enabled: false
 remnawave_caddy_email: "admin@example.com"
 remnawave_caddy_listen_port: 443
@@ -623,6 +625,19 @@ remnawave_reality_sni: ""            # a serverName from the inbound (the borrow
 remnawave_reality_address: ""        # client-facing address; defaults to dns_hostname
 remnawave_reality_port: 443
 remnawave_reality_fingerprint: "chrome"
+
+# Relay transport (VLESS+REALITY behind an external L4/TCP proxy). See the
+# "Relay transport" section below. A DEDICATED node mode: the role asserts Caddy,
+# direct Reality, Fastly and per-node placement are all off. Empty port/fingerprint
+# mean "unset" (443 / chrome) so a lifecycle run cannot silently reset a deliberate
+# value — they are persisted in .relay_address and resolved at the point of use.
+remnawave_relay_enabled: false
+remnawave_relay_inbound_uuid: ""     # configProfileInboundUuid of the relay inbound
+remnawave_relay_address: ""          # the EXTERNAL proxy edge — REQUIRED, never defaulted
+remnawave_relay_sni: ""              # a serverName from the relay inbound
+remnawave_relay_port: ""             # client-facing port ON THE EDGE (empty = 443)
+remnawave_relay_fingerprint: ""      # empty = chrome
+remnawave_relay_repoint_ack: false   # required before change/migrate breaks the proxy origin
 ```
 
 #### Two workflows
@@ -741,11 +756,17 @@ remnawave_panel_register_node: true
 
 **Two ports, and conflating them is the most common mistake.** `remnawave_relay_port` is the port **on the edge** that clients dial (it lands in the `vless://` link). `remnawave_bootstrap_relay_listen_port` is the port the inbound binds **on the node** — that is what you point the proxy's *backend* at. One edge can front several nodes by mapping a different edge port to each, so the former is per-node. Both bootstrap and the deploy summary print the exact backend target.
 
+Bootstrap echoes the node-side port into its output file as `remnawave_relay_node_listen_port` (alongside `remnawave_relay_inbound_uuid` and `remnawave_relay_sni`, taken from the first `serverNames` entry) purely so node deploys can print that line — it configures nothing. Because the output file loads as extra-vars, **do not also set `remnawave_relay_sni` in your own vars file**: the later `-e` would win and the effective value would depend on argument order.
+
+**Adding relay to a panel that is already bootstrapped.** Bootstrap reconciles the Config Profile's base inbounds **by tag** (`remnawave_bootstrap_reconcile_inbounds`, default on): re-running it against an existing `FreeSocks-Config` adds any missing base inbound — the relay one included — via a full-replace `PATCH /api/config-profiles`. Existing inbounds are copied through **byte-for-byte and never rewritten**, so a re-run cannot rotate a live inbound's keys out from under connected clients. The corollary: editing `dest` / `serverNames` on an inbound that already exists is *not* reconciled — change it in the panel, or delete the inbound and re-run.
+
 **`remnawave_relay_address` has no default, on purpose.** It is asserted, not defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — a worse outcome than a failed run. The role additionally fails if the address *equals* `dns_hostname`.
 
 **PROXY protocol.** Many L4 forwarders prepend a PROXY v1/v2 header. If yours does, set `remnawave_bootstrap_relay_accept_proxy_protocol: true` — otherwise REALITY reads the header bytes as a malformed ClientHello and **every connection fails with no useful error**. If yours does not, leave it off; the same failure happens in reverse.
 
-**What the role does not do.** It never talks to a proxy provider: you create the proxy and point its backend at the node by hand. On rotation (`change`) and migration the role tells you exactly what to re-point, and requires `remnawave_relay_repoint_ack=true` before doing anything that would break an FQDN-based proxy origin irrecoverably.
+**What the role does not do.** It never talks to a proxy provider: you create the proxy and point its backend at the node by hand. On rotation (`change`) and migration the role tells you exactly what to re-point, and requires `remnawave_relay_repoint_ack=true` before doing anything that would break an FQDN-based proxy origin irrecoverably. An acknowledged rotation additionally requires `custom_hostname`, so the name the proxy must be pointed at is decided by you rather than regenerated.
+
+**The node remembers it is a relay node.** Deploy writes `address=` / `port=` / `fingerprint=` lines to `.relay_address` in the install dir (`remnawave_node_install_dir`, default `/opt/remnanode`), and **the existence of that file is the authoritative marker**. `change`, `migrate` and `update` read it, so they keep working on a relay node without re-passing the relay flags — and `migrate` uses it to tell a relay node from a direct-Reality one (neither has a Caddyfile, so nothing else can). It also means the endpoint survives a lifecycle run that forgets `remnawave_relay_port` / `_fingerprint`, instead of silently resetting to the defaults and re-creating the Host on every run.
 
 **FCP mode.** The relay squad binds to FCP's `freedom-reality` pool (direct Reality keeps `privacy-reality`). `freedom-reality` **ships disabled** in FCP's catalog and the role cannot enable it (that needs `admin:settings:write`, which the role's token deliberately does not hold) — enable it in **FCP Admin → Connection modes** once at least one relay node exists.
 
@@ -922,6 +943,8 @@ ansible-playbook playbook.yml --ask-vault-pass \
 | `remnawave_panel_register_node` | `false` | Auto-register node on the Panel via `POST /api/nodes` |
 | `remnawave_caddy_enabled` | `false` | Install standalone Caddy (TLS terminator + WS proxy) — required for Fastly fronting |
 | `remnawave_reality_enabled` | `false` | VLESS+Vision+Reality direct node (no Caddy/CDN; requires `remnawave_reality_inbound_uuid` + `_sni`) |
+| `remnawave_relay_enabled` | `false` | VLESS+REALITY behind an external L4 proxy — DEDICATED node (asserts Caddy / direct Reality / Fastly / per-node placement all off; requires `remnawave_relay_inbound_uuid` + `_address` + `_sni`) |
+| `remnawave_relay_repoint_ack` | `false` | Acknowledge that you will re-point the external proxy's backend before a relay `change`/`migrate` breaks it |
 | `remnawave_per_node_placement` | `false` | Legacy opt-in: per-node inbound clones + squads (`FSF-`/`FSR-<hostname>`), appended to FCP's mode pools. Default = shared panel-wide squads bound at bootstrap |
 | `force_reinstall_remnawave` | `false` | Re-template compose + recreate the node container |
 | `force_wipe_remnawave` | `false` | **Destructive**: tear down placement, delete panel node + install dir |
@@ -989,7 +1012,7 @@ ansible-playbook playbook.yml \
 ### Migrate Mode
 
 Migrates an existing Outline or Remnawave server to a new location:
-1. Verifies the source server state and **detects the installed backend** (`/opt/outline` vs `/opt/remnanode`) — the flow routes accordingly
+1. Verifies the source server state and **detects the installed backend** (`/opt/outline` vs `/opt/remnanode`) and, for Remnawave, which transport it runs (the `.relay_address` marker distinguishes a relay node from a direct-Reality one — neither has a Caddyfile) — the flow routes accordingly
 2. Verifies the destination has no conflicting installation
 3. Installs the matching backend on the destination (Outline, or Docker for Remnawave)
 4. Copies configuration from source to destination
@@ -1140,10 +1163,12 @@ tasks/
     │   ├── delete_node.yml        # DELETE /api/nodes/{uuid}
     │   ├── create_hosts.yml       # POST /api/hosts per transport × edge domain
     │   ├── create_reality_host.yml # POST /api/hosts for the Reality node
+    │   ├── create_relay_host.yml   # POST /api/hosts for the relay node (advertises the EDGE)
+    │   ├── assert_relay_edge.yml   # refuse a relay edge that resolves to this node
     │   ├── cleanup_hosts.yml      # DELETE old Hosts (exact remark match)
     │   ├── gen_x25519.yml         # Reality x25519 keypair (bootstrap)
     │   ├── create_config_profile.yml # Config Profile + inbounds (bootstrap)
-    │   ├── create_squad.yml       # Shared panel-wide squads (bootstrap — default topology)
+    │   ├── create_squad.yml       # Shared panel-wide squads ×3 (bootstrap — default topology)
     │   ├── create_node_placement.yml  # LEGACY per-node inbound clones + squads
     │   └── teardown_node_placement.yml # Undo per-node placement (legacy path)
     └── fcp/                 # FreeSocks Control Plane registration (REST API)
@@ -1166,9 +1191,18 @@ Every push and PR runs three CI jobs (`.github/workflows/ci.yml`): **lint**
 **Unit tests** (offline, `connection: local`, no hosts or APIs):
 
 - **`tests/test_bootstrap.yml`** — the bootstrap/placement filter expressions:
-  FCP mode-placement bodies (full-replace + per-node `addSquadUuids`), the
-  per-node inbound plan + clone logic (incl. re-run idempotency), x25519/response
-  shape tolerance.
+  the three base inbounds and their tag→UUID mapping, FCP mode-placement bodies
+  (full-replace + per-node `addSquadUuids`), the per-node inbound plan + clone
+  logic (incl. re-run idempotency), x25519/response shape tolerance.
+- **`tests/test_relay.yml`** — the relay transport and the lifecycle gates it
+  shares with the other direct transports: the `cleanup_hosts.yml` remark regex,
+  the migrate source-capability truth table (via the `tests/relay_detect_case.yml`
+  helper), `.relay_address` parsing and precedence, the change/migrate repoint
+  gates, relay-only inbound activation, Host drift, the anti-leak invariant (a
+  relay edge that resolves back to the node is refused), and **structural** guards
+  that pin task ORDERING — destination gates before the first mutation, Host GET
+  before the idempotency decision, gates keyed on the resolved `*_effective` facts
+  rather than raw flags.
 - **`tests/test_caddyfile_render.yml`** — renders the Remnawave Caddyfile
   template and asserts its structure (transport routes + decoy fallback).
 - **`tests/test_fcp_and_hosts.yml`** — the FCP Outline `apiUrl` construction and
@@ -1195,12 +1229,17 @@ undeclared-field rejection and squad-UUID checks), and a **mock Cloudflare API**
 (`tests/mock_cloudflare.py`), then runs two playbooks:
 
 1. **`tests/test_integration.yml`** — task-level: `operation_mode=bootstrap`
-   (asserts the profile is born with the no-log Xray posture + the shared
-   squads are created and bound to the FCP pools), two shared-model node
-   registrations (no clones, no per-node squads, no pool appends), a shared-model
-   retire (Host cleanup + node DELETE; fleet state untouched), and the LEGACY
-   per-node placement path for two simulated nodes (idempotent re-runs, the
-   duplicate inbound-port case, append-only FCP pools, teardown).
+   (asserts the profile is born with the no-log Xray posture, that all three
+   base inbounds exist, and that the three shared squads are created and bound
+   to the FCP pools), two shared-model node registrations (no clones, no
+   per-node squads, no pool appends), a **relay node** (it inherits the WS
+   transport from the bootstrap output and must still activate only its relay
+   inbound; its Host must advertise the edge, never the node; endpoint drift
+   re-points the Host; the `.relay_address` marker round-trips), a shared-model
+   retire (Host cleanup by remark — one node's Hosts only — then node DELETE;
+   fleet state untouched) and a relay retire, plus the LEGACY per-node placement
+   path for two simulated nodes (idempotent re-runs, the duplicate inbound-port
+   case, append-only FCP pools, teardown).
 2. **`tests/test_deploy.yml`** (with `RUN_DEPLOY_PHASE=1`) — the **real
    `operation_mode=deploy` path**, exactly as production runs it: validation,
    hostname, (mock) DNS, apt installs, a **real `remnawave/node` container**
