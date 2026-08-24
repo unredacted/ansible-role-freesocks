@@ -35,19 +35,28 @@
     _rn_addr_iface_alt: "{{ remnawave_node_address_interface | replace('-', '_') | replace('.', '_') | replace(':', '_') }}"
   when: remnawave_node_address_interface | default('') | length > 0
 
-# Covers both a play run with gather_facts:false and an interface that came up
-# during this run (Tailscale brought up after facts were gathered) — without it
-# the resolve would fail on a node where the interface is perfectly fine.
-- name: Gather network facts (requested interface absent from the fact set)
+# Re-gather whenever an interface is requested, NOT only when the device is
+# missing from the fact set. Presence is the wrong question: what matters is
+# whether the facts hold a CURRENT address in the requested family, and a device
+# can sit in stale facts while unaddressed —
+#   * the play ran with gather_facts: false            (no facts at all)
+#   * the device was created mid-run                   (tailscaled started late)
+#   * the device existed but was unaddressed at gather time and has since been
+#     configured                                       (`tailscale up` ran after)
+#   * the address arrived in the OTHER family           (v4 known, v6 added later)
+# A presence check catches only the first two; in the last two it skips the
+# refresh, and the extractor below then fails on a node whose interface is
+# perfectly usable. Gating on "requested family missing" instead would mean
+# restating the extraction logic (two fact-key spellings x two platform fact
+# shapes x two families) inside a when: — a predicate that can drift from the
+# extractor it guards, which is a worse failure than one network-subset gather.
+- name: Gather network facts (fresh addresses for the requested interface)
   setup:
     gather_subset:
       - '!all'
       - '!min'
       - network
-  when:
-    - remnawave_node_address_interface | default('') | length > 0
-    - _rn_addr_iface not in ansible_facts
-    - _rn_addr_iface_alt not in ansible_facts
+  when: remnawave_node_address_interface | default('') | length > 0
 
 - name: Select the interface fact key
   set_fact:

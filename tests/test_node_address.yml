@@ -25,6 +25,9 @@
 #        nested includes use role-tasks-relative paths (a bare sibling filename
 #        does NOT resolve inside tasks/providers/<x>/), and update mode keeps its
 #        opt-in, wipe-safe address re-sync gated on credentials + .node_uuid
+#   (d2) STRUCTURAL: the network-fact refresh is gated ONLY on the interface
+#        selector — never on the device already being in the fact set, which
+#        would skip the refresh for a device that is present but unaddressed
 #
 # Run: ansible-playbook tests/test_node_address.yml
 - hosts: localhost
@@ -315,6 +318,38 @@
             < _updmode_src.find('remnawave_node_reconcile_address')
           - "'not (force_wipe_remnawave | default(false) | bool)' in _updmode_src"
         success_msg: "update mode PATCHes the address only under the opt-in flag, never after a wipe."
+
+    # ------------------------------------------------------ (d2) STRUCTURAL
+    # A device can be in the fact set and still have no usable address — e.g.
+    # tailscaled is up (so tailscale0 exists) but `tailscale up` has not run
+    # yet, and something earlier in the play runs it. Gating the refresh on
+    # "device absent from ansible_facts" skips it in exactly that case, and the
+    # extractor then fails on an interface that is by then perfectly fine.
+    # Behaviour here depends on a REAL re-gather, which an offline test cannot
+    # stage — so pin the gate itself, which is the part that can regress.
+    - name: (d2) Read the resolver source
+      set_fact:
+        _resolve_src: "{{ lookup('file', _resolve) }}"
+
+    # Slice from the task name to the next task, so the explanatory comment
+    # above it (which names the rejected presence check) cannot satisfy these.
+    - name: (d2) Materialize the fact-refresh task
+      set_fact:
+        _refresh_task: >-
+          {{ _resolve_src[_resolve_src.find('- name: Gather network facts'):
+                          _resolve_src.find('- name: Select the interface fact key')] }}
+
+    - name: (d2) Assert the refresh runs whenever an interface is requested
+      assert:
+        that:
+          - _refresh_task | length > 0
+          - "'setup:' in _refresh_task"
+          - "'network' in _refresh_task"
+          - "'remnawave_node_address_interface' in _refresh_task"
+          # The regression this guards: any presence test on the fact set.
+          - "'not in ansible_facts' not in _refresh_task"
+          - "'in ansible_facts' not in _refresh_task"
+        success_msg: "The fact refresh is gated only on the interface selector, so stale addresses cannot survive it."
 
     - name: All node-address tests passed
       debug:
