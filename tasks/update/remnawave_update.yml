@@ -322,6 +322,55 @@
     remnawave_install_success: true
     component_install_success: true
 
+# === Optional: re-sync the panel-side management address ===
+# Update mode normally leaves the panel entry alone — a re-templated container
+# still answers on the same address. The exception is a deliberate change of
+# HOW the address is spelled (typically hostname -> remnawave_node_address_
+# interface, e.g. tailscale0, because the panel's container cannot resolve
+# MagicDNS): update mode is the only lifecycle mode that runs against an
+# already-deployed node without rotating it, so this is where such a fleet gets
+# moved over. Opt-in, and skipped on a wipe (that node is gone from the panel).
+#
+# Gated on the uuid ON DISK plus the panel token, NOT on
+# remnawave_panel_register_node — like the panel work above it. An update run is
+# not a deploy: the operator re-passes the credentials, not the deploy-time
+# flags, and .node_uuid is itself the evidence that the panel manages this node.
+# Gating on the flag meant the documented one-liner for moving a fleet onto
+# overlay addresses silently did nothing.
+- name: Re-sync the panel-side node address
+  include_tasks: ../providers/remnawave/update_node.yml
+  when:
+    - remnawave_node_reconcile_address | default(false) | bool
+    - not (force_wipe_remnawave | default(false) | bool)
+    - remnawave_panel_api_token | default('') | length > 0
+    - remnawave_node_uuid is defined
+    - remnawave_node_uuid | length > 0
+
+- name: Warn that the panel-side address was NOT re-synced (no .node_uuid)
+  debug:
+    msg: >-
+      remnawave_node_reconcile_address=true but no .node_uuid is known for this
+      node, so the panel entry was NOT PATCHed and the panel may still dial a
+      name it cannot resolve. Write the node's UUID to
+      {{ remnawave_node_install_dir }}/.node_uuid (Panel UI → Nodes → the node's
+      URL) and re-run, or set the Address in the Panel UI by hand.
+  when:
+    - remnawave_node_reconcile_address | default(false) | bool
+    - not (force_wipe_remnawave | default(false) | bool)
+    - remnawave_node_uuid is not defined or remnawave_node_uuid | length == 0
+
+- name: Warn that the panel-side address was NOT re-synced (no panel token)
+  debug:
+    msg: >-
+      remnawave_node_reconcile_address=true but remnawave_panel_api_token is
+      empty, so the panel entry was NOT PATCHed — the panel keeps dialling
+      whatever address it holds. Re-run with the panel token (vault), or set the
+      Address in the Panel UI by hand.
+  when:
+    - remnawave_node_reconcile_address | default(false) | bool
+    - not (force_wipe_remnawave | default(false) | bool)
+    - remnawave_panel_api_token | default('') | length == 0
+
 # Remnawave update does NOT touch FCP. FCP stores only the panel (baseUrl +
 # apiToken), which is unchanged when a node is re-templated/recreated. Per-node
 # config (transports/Hosts) lives panel-side and is fed to FCP by the panel.

@@ -734,7 +734,12 @@
       neither remnawave_panel_register_node nor a persisted .node_uuid was found,
       so the panel is still dialling the OLD address.
       Open the Panel UI → Nodes → find the entry for {{ old_dns_hostname }}
-      and update its 'Address' field to '{{ dns_hostname }}'.
+      and update its 'Address' field to
+      '{{ remnawave_node_address_effective if (remnawave_node_address_effective is defined)
+         else ((remnawave_node_address | default(dns_hostname, true))
+               if ((remnawave_node_address_interface | default('') | length) == 0)
+               else ("the " ~ remnawave_node_address_interface ~ " "
+                     ~ (remnawave_node_address_family | default('ipv4')) ~ " address of this node")) }}'.
       The role cannot do this automatically without Panel API access.
   when: >-
     not (_change_register_node_effective | bool)

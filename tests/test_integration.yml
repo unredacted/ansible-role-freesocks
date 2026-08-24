@@ -10,7 +10,9 @@
 #      FreeSocks-Reality), binds them to FCP's mode pools, sets the default mode.
 #   2. Shared-model node (node 1): registers against the BASE inbounds — no
 #      clones, no per-node squads, no pool appends. A PATCH /api/nodes
-#      round-trip (the change/migrate contract), panel registration with
+#      round-trip (the change/migrate contract), an interface-derived address
+#      (remnawave_node_address_interface, loopback standing in for tailscale0)
+#      with the reconcile off then on, panel registration with
 #      maxKeys/priority + the strict test-connection probe, and mock-FCP scope
 #      enforcement (a read-only token 403s on the by-slug PUT).
 #   3. Node 2 registers the same way — shared state undisturbed.
@@ -363,6 +365,107 @@
         fail_msg: >-
           Host creation did not produce the expected remarks (got {{ _t2_remarks }}).
           Phase 4's cleanup assertions depend on these existing.
+
+    # In production the panel dials nodes over an overlay, where a MagicDNS name
+    # is not resolvable from inside its container — so the address can be sourced
+    # from an INTERFACE instead of a name. Loopback stands in for tailscale0.
+    - name: Gather network facts (for the interface-derived address)
+      setup:
+        gather_subset: ['!all', '!min', 'network']
+    - name: Pick this runner's loopback device
+      set_fact:
+        _ci_lo: "{{ 'lo' if ('lo' in ansible_facts) else 'lo0' }}"
+
+    # Default: the GET-first reuse reports the drift but leaves the panel alone.
+    - name: Re-register node 1 from an interface address (reconcile OFF)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/register_node
+      vars:
+        remnawave_node_address_interface: "{{ _ci_lo }}"
+        remnawave_node_reconcile_address: false
+    - name: Read back node 1 after the non-reconciling re-run
+      uri:
+        url: "{{ remnawave_panel_url }}/api/nodes"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t2_nodes_no_reconcile
+    - name: Materialize node 1 after the non-reconciling re-run
+      set_fact:
+        _t2_no_reconcile: >-
+          {{ ((_t2_nodes_no_reconcile.json.response['nodes']
+               if (_t2_nodes_no_reconcile.json.response is mapping and 'nodes' in _t2_nodes_no_reconcile.json.response)
+               else _t2_nodes_no_reconcile.json.response)
+             | selectattr('name', 'equalto', 'ci-node-one') | list | first) }}
+    - name: Assert the reused node's address was left untouched
+      assert:
+        that:
+          - _t2_no_reconcile.address == 'ci-node-one-moved.example.test'
+          - _t2_no_reconcile.uuid == _t2_first_uuid
+        fail_msg: "register_node rewrote an existing node's address without remnawave_node_reconcile_address"
+
+    # Opt-in: the same re-run PATCHes the drifted address to the interface IP —
+    # how a fleet registered by hostname moves onto overlay addresses.
+    - name: Re-register node 1 from an interface address (reconcile ON)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/register_node
+      vars:
+        remnawave_node_address_interface: "{{ _ci_lo }}"
+        remnawave_node_reconcile_address: true
+    - name: Read back node 1 after the reconciling re-run
+      uri:
+        url: "{{ remnawave_panel_url }}/api/nodes"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t2_nodes_reconciled
+    - name: Materialize node 1 after the reconciling re-run
+      set_fact:
+        _t2_reconciled: >-
+          {{ ((_t2_nodes_reconciled.json.response['nodes']
+               if (_t2_nodes_reconciled.json.response is mapping and 'nodes' in _t2_nodes_reconciled.json.response)
+               else _t2_nodes_reconciled.json.response)
+             | selectattr('name', 'equalto', 'ci-node-one') | list | first) }}
+    - name: Assert the reconcile PATCHed the interface address in
+      assert:
+        that:
+          - _t2_reconciled.address == '127.0.0.1'
+          - _t2_reconciled.uuid == _t2_first_uuid
+        fail_msg: "remnawave_node_reconcile_address=true did not PATCH the interface-derived address"
+
+    # Hand 127.0.0.1:2222 back. The panel rejects a CREATE whose address:port
+    # duplicates an existing node with a 400, and phase 3b's relay node claims
+    # exactly that pair — so leaving node 1 parked on the loopback address fails
+    # a later phase from here, with an error that says nothing about this one.
+    # Restoring also re-proves the name path after an interface run: the
+    # resolved fact must not stick.
+    - name: Restore node 1's name-based address (leave the phase state-neutral)
+      include_role:
+        name: "{{ playbook_dir | dirname | basename }}"
+        tasks_from: providers/remnawave/update_node
+      vars:
+        remnawave_node_address_interface: ""
+        remnawave_node_address: "ci-node-one-moved.example.test"
+    - name: Read back node 1 after the restore
+      uri:
+        url: "{{ remnawave_panel_url }}/api/nodes"
+        headers: { Authorization: "Bearer {{ remnawave_panel_api_token }}", Accept: application/json }
+        return_content: yes
+      register: _t2_nodes_restored
+    - name: Materialize node 1 after the restore
+      set_fact:
+        _t2_restored: >-
+          {{ ((_t2_nodes_restored.json.response['nodes']
+               if (_t2_nodes_restored.json.response is mapping and 'nodes' in _t2_nodes_restored.json.response)
+               else _t2_nodes_restored.json.response)
+             | selectattr('name', 'equalto', 'ci-node-one') | list | first) }}
+    - name: Assert the loopback address was released
+      assert:
+        that:
+          - _t2_restored.address == 'ci-node-one-moved.example.test'
+        fail_msg: >-
+          node 1 is still parked on 127.0.0.1:2222 — the relay phase's node create
+          will 400 on the duplicate address:port.
 
     - name: Register the panel with FCP (maxKeys/priority + strict probe)
       include_role:

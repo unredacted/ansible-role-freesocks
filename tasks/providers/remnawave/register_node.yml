@@ -31,11 +31,18 @@
       the panel caps node names at 30 chars — shorten custom_hostname /
       hostname_word_count.
 
+# Resolve the management address the panel will dial (interface IP when
+# remnawave_node_address_interface is set, else the configured name) into
+# remnawave_node_address_effective.
+- name: Resolve the panel-side node address
+  include_tasks: providers/remnawave/resolve_node_address.yml
+
 # Idempotent: GET first and reuse the existing node with this name (re-runs,
 # e.g. resuming a failed deploy). The panel answers a duplicate POST with 400
 # (unique constraint), NOT 409 — and a GET-first also captures the UUID, which
-# the 409 path could not. Address/config drift on an existing node is
-# change/migrate's job (update_node.yml).
+# the 409 path could not. Config drift on an existing node is change/migrate's
+# job; address/port drift is reported below and PATCHed only when
+# remnawave_node_reconcile_address is set.
 - name: List existing nodes (idempotency check)
   uri:
     url: "{{ remnawave_panel_url }}/api/nodes"
@@ -63,6 +70,37 @@
     remnawave_node_uuid: "{{ _rn_existing_node.uuid }}"
   when: (_rn_existing_node.uuid | default('')) | length > 0
 
+# The reuse above deliberately leaves the existing entry's address alone. That
+# is right for a resumed deploy and wrong for a fleet being moved onto overlay
+# addresses (hostname -> tailscale0 IP), which is what the opt-in reconcile is
+# for. Either way the drift is surfaced rather than passed over in silence.
+- name: Detect panel-side address drift on the reused node
+  set_fact:
+    _rn_node_addr_drift: >-
+      {{ ((_rn_existing_node.address | default('')) != remnawave_node_address_effective)
+         or ((_rn_existing_node.port | default('') | string) != (remnawave_node_port | string)) }}
+  when: (_rn_existing_node.uuid | default('')) | length > 0
+
+- name: Reconcile the reused node's address on the panel
+  include_tasks: providers/remnawave/update_node.yml
+  when:
+    - (_rn_existing_node.uuid | default('')) | length > 0
+    - _rn_node_addr_drift | default(false) | bool
+    - remnawave_node_reconcile_address | default(false) | bool
+
+- name: Warn that the panel-side address differs from this run (not reconciled)
+  debug:
+    msg: >-
+      Panel node "{{ random_hostname }}" is registered as
+      {{ _rn_existing_node.address | default('?') }}:{{ _rn_existing_node.port | default('?') }},
+      but this run resolves {{ remnawave_node_address_effective }}:{{ remnawave_node_port }}.
+      Left as-is — set remnawave_node_reconcile_address=true to PATCH it here, or
+      run change/migrate mode, or edit the node in the Panel UI.
+  when:
+    - (_rn_existing_node.uuid | default('')) | length > 0
+    - _rn_node_addr_drift | default(false) | bool
+    - not (remnawave_node_reconcile_address | default(false) | bool)
+
 - name: Register node with Panel
   uri:
     url: "{{ remnawave_panel_url }}/api/nodes"
@@ -74,10 +112,12 @@
     body:
       name: "{{ random_hostname }}"
       # Management/control-plane endpoint the panel dials on node_port (default
-      # 2222). Defaults to the public data-plane hostname, but can be a Tailscale
-      # MagicDNS name / IP when the panel reaches nodes over Tailscale rather than
-      # the public internet (cross-site routing). Independent of the data plane.
-      address: "{{ remnawave_node_address }}"
+      # 2222) — resolved above: the IP of remnawave_node_address_interface (e.g.
+      # tailscale0) when set, else remnawave_node_address (the origin name by
+      # default). Prefer the interface when the panel reaches nodes over an
+      # overlay — the panel's Docker container resolves MagicDNS names
+      # unreliably. Independent of the data plane either way.
+      address: "{{ remnawave_node_address_effective }}"
       port: "{{ remnawave_node_port | int }}"
       countryCode: "{{ remnawave_panel_country_code }}"
       configProfile:
@@ -119,7 +159,7 @@
 
 - name: Log node registration
   debug:
-    msg: "Registered node (uuid persisted to {{ remnawave_node_install_dir }}/.node_uuid) address={{ remnawave_node_address }} port={{ remnawave_node_port }}"
+    msg: "Registered node (uuid persisted to {{ remnawave_node_install_dir }}/.node_uuid) address={{ remnawave_node_address_effective }} port={{ remnawave_node_port }}"
   when:
     - remnawave_node_uuid is defined
     - remnawave_node_uuid | length > 0
