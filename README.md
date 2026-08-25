@@ -2,101 +2,74 @@
 
 [![CI](https://github.com/unredacted/ansible-role-freesocks/actions/workflows/ci.yml/badge.svg)](https://github.com/unredacted/ansible-role-freesocks/actions/workflows/ci.yml)
 
-An Ansible role for deploying and managing VPN servers for [FreeSocks](https://freesocks.org/). The role supports two backends:
+An Ansible role for deploying and managing VPN servers for [FreeSocks](https://freesocks.org/). It supports two mutually-exclusive backends per host:
 
 - **Outline** — Shadowsocks proxy via the Outline `shadowbox` Docker container
-- **Remnawave** — Xray-core node managed by an external [Remnawave Panel](https://docs.rw)
+- **Remnawave** — Xray-core node managed by an external Remnawave Panel
 
-Both backends share the same role plumbing (DNS, control-plane registration, hostname rotation, migration) but are mutually exclusive per host. New deployments can target either; the eventual plan is to deprecate Outline.
+Both share the same plumbing — DNS, control-plane registration, hostname rotation, migration. New deployments can target either; the long-term plan is to deprecate Outline.
 
-Features:
-
-- Automated installation and configuration of the chosen backend
-- Pluggable provider architecture for DNS and CDN
-- Cloudflare integration for DNS (origin A/AAAA records)
-- Registration with the [FreeSocks Control Plane](https://freesocks.org/) (FCP) admin API
-- Optional Fastly CDN fronting
-- Hostname rotation for DNS blocking bypass
-- Server migration between hosts
-- Optional Remnawave Panel API integration (auto-fetch SECRET_KEY, auto-register node)
+**Features:** automated backend install; pluggable DNS/CDN providers (Cloudflare DNS, optional Fastly fronting); registration with the [FreeSocks Control Plane](https://freesocks.org/) (FCP); hostname rotation to bypass DNS blocking; server migration; optional Remnawave Panel API integration (auto-fetch SECRET_KEY, auto-register node).
 
 ## Requirements
 
-- Debian-based Linux system (tested on Debian 12)
-- Python 3.x
-- Docker (will be installed by the role)
-- The `community.docker` Ansible collection (>=3.4.0). Install with:
-  `ansible-galaxy collection install -r requirements.yml`
-- Provider-specific requirements (see Provider Configuration)
-
-## Quick start: brand-new deployment
-
-This role provisions and fronts **one** proxy node and registers it with FCP. A first
-deploy touches three systems **in order** — do the prerequisites before running the
-role, or the run fails (or, if you skip Remnawave Phase 0, silently issues dead keys).
-
-### 0. Prerequisites (do these first)
-
-**Control plane (FCP)** — stand it up (see the FCP repo's deploy runbook), then:
-
-- Confirm the admin API is reachable; the panel-wide squads are bound to FCP's
-  per-mode placement pools once at bootstrap (no tier seeding needed — tier
-  binding was removed).
-- Mint a headless automation token on the FCP host and store the printed `fsv1_…`
-  value in your vault as `fcp_api_token`:
+- Debian-based Linux target (tested on Debian 12), Python 3.x, ports **80 and 443 free** (Caddy uses HTTP-01 on 80, TLS on 443)
+- Docker (installed by the role)
+- Controller: ansible-core ≥ 2.15 and the collections in `requirements.yml`:
   ```sh
-  bunx convex run adminApi:mintAutomationToken \
-    '{"name":"ansible","scopes":["admin:servers:read","admin:servers:write"]}'
-  # admin:servers:write also covers the mode-placement (squad pool) binding.
-  # add "admin:settings:write" only if you set fcp_default_connection_mode
-  # add "admin:status:read"    only if you enable fcp_status_gate
+  ansible-galaxy collection install -r requirements.yml
   ```
 
-**Remnawave panel** (Remnawave nodes only — the panel objects a working key needs:
-a Config Profile + inbounds + an internal squad). Two ways to create them:
+## Operation modes
 
-- **Automated (recommended) — `operation_mode=bootstrap`:** run the role once against
-  the panel (host-agnostic, `delegate_to: localhost`) and it creates the Config Profile
-  (`FreeSocks-Config`) with the BASE WS / Reality / relay inbounds (born compliant
-  with the FreeSocks no-log Xray posture), generates an x25519 keypair per REALITY
-  transport, creates the three **panel-wide squads** (`FreeSocks-Fastly` for the
-  WS/CDN side, `FreeSocks-Reality` for direct Reality, `FreeSocks-Relay` for
-  REALITY behind an external L4 proxy), and binds them to FCP's per-mode placement
-  pools (`freedom-ws` / `privacy-reality` / `freedom-reality`). Every node deploy then activates the SHARED base inbounds and
-  creates its own Hosts — subscriptions carry every node's endpoint, and rotation or
-  teardown never touches squads. Bootstrap PRINTS the created Config Profile + base
-  inbound UUIDs; copy them into your node-deploy vars.
-  Needs a panel API token and an `fsv1_` token with `admin:servers:write`:
+Passed at run time via `operation_mode`:
+
+| Mode | Purpose |
+|------|---------|
+| `deploy` | Install a new server with selected components on a random hostname |
+| `change` | Rotate the hostname (optionally to a different domain) to bypass DNS blocking |
+| `migrate` | Move an existing server to a new host (auto-detects backend and transport) |
+| `update` | Add components to / re-sync an existing server |
+| `bootstrap` | One-time, panel-only Remnawave setup (host-agnostic; see below) |
+
+`environment_mode` (`prod`\|`dev`) is still required via `--extra-vars` but is now cosmetic — it no longer selects KV namespaces (KV was removed).
+
+## Quick start (new deployment)
+
+A first deploy touches three systems **in order**. Do the prerequisites first, or the run fails (or, if you skip Remnawave Phase 0, silently issues dead keys).
+
+### 0. Prerequisites
+
+**Control plane (FCP)** — stand it up, confirm the admin API is reachable, then mint a headless token on the FCP host and vault the printed `fsv1_…` value as `fcp_api_token`:
+
+```sh
+bunx convex run adminApi:mintAutomationToken \
+  '{"name":"ansible","scopes":["admin:servers:read","admin:servers:write"]}'
+# admin:servers:write also covers mode-placement (squad pool) binding.
+# add "admin:settings:write" only if you set fcp_default_connection_mode
+# add "admin:status:read"    only if you enable fcp_status_gate
+```
+
+**Remnawave panel** (Remnawave nodes only) — a working key needs a Config Profile + inbounds + a squad. Two ways to create them:
+
+- **Automated (recommended)** — `operation_mode=bootstrap` runs the role once against the panel (`delegate_to: localhost`, no host touched). It creates the `FreeSocks-Config` Config Profile with the base WS / Reality / relay inbounds (born compliant with the no-log Xray posture), generates an x25519 keypair **per REALITY transport**, creates the three panel-wide squads (`FreeSocks-Fastly` for WS/CDN, `FreeSocks-Reality` for direct Reality, `FreeSocks-Relay` for REALITY behind an external L4 proxy), and binds them to FCP's per-mode placement pools (`freedom-ws` / `privacy-reality` / `freedom-reality`). It **prints** the Config Profile + inbound UUIDs to copy into your node-deploy vars. Re-running it reconciles missing base inbounds by tag.
   ```sh
   ansible-playbook playbook.yml --ask-vault-pass \
     --extra-vars "operation_mode=bootstrap remnawave_panel_url=https://panel.example.com fcp_enabled=true"
   ```
-- **Manual:** in the panel UI create a Config Profile with your transport inbound(s) and
-  the internal squad(s), then record each inbound's `configProfileInboundUuid`, the
-  Config Profile UUID, and the squad UUID. Create a panel API token.
-- **Skipping this leaves the node with no Hosts and no working keys — silently.**
+- **Manual** — create the Config Profile, inbound(s), and squad(s) in the panel UI, then record each inbound's `configProfileInboundUuid`, the Config Profile UUID, and the squad UUID, plus a panel API token.
 
-**DNS** — a Cloudflare zone for your domain + a scoped API token (`Zone:DNS:Edit`).
+> Skipping this leaves the node with no Hosts and no working keys — silently.
 
-**Target host** — a clean **Debian 12** box reachable over SSH as root (or a sudo user
-with `--become`), with ports **80 and 443 free** (Caddy uses HTTP-01 on 80, TLS on 443).
+**DNS** — a Cloudflare zone + scoped API token (`Zone:DNS:Edit`).
 
-**Controller** — ansible-core ≥ 2.15 and the collections:
+**Target host** — a clean Debian 12 box reachable over SSH as root (or a sudo user with `--become`).
 
-```sh
-ansible-galaxy collection install -r requirements.yml
-```
+### 1. Secrets and domains
 
-### 1. Configure secrets + domains
+Put every secret in an **Ansible Vault**. For a fronted Remnawave node that is `cloudflare_api_token`, `fcp_api_token`, `remnawave_panel_api_token` (and/or `remnawave_panel_secret_key`), and `fastly_api_token` (only if `cdn_provider: fastly`).
 
-Put every secret in an **Ansible Vault** — for a fronted Remnawave node that is
-`cloudflare_api_token`, `fcp_api_token`, `remnawave_panel_api_token` (and/or
-`remnawave_panel_secret_key`), and `fastly_api_token` (only if `cdn_provider: fastly`).
-
-> The vault-decryption guard checks all of `cloudflare_api_token`, `fcp_api_token`,
-> `remnawave_panel_api_token`, and `remnawave_panel_secret_key` for undecrypted vault
-> blobs and fails fast. It still cannot catch a plain-text `your-…` placeholder — confirm
-> every secret is filled before running.
+> The vault-decryption guard fails fast on undecrypted vault blobs in those secrets, but cannot catch a plain-text `your-…` placeholder — confirm every secret is filled.
 
 Define your domain → provider map (in `group_vars` or the playbook):
 
@@ -104,25 +77,25 @@ Define your domain → provider map (in `group_vars` or the playbook):
 domain_providers:
   example.com:
     dns_provider: cloudflare
-    cdn_provider: fastly # or 'none' for a Reality / unfronted node
+    cdn_provider: fastly        # or 'none' for a Reality / relay / unfronted node
     fastly_domain_mode: shared
     zone_id: "<cloudflare-zone-id>"
 ```
 
 ### 2. Deploy
 
-Write a `playbook.yml` that applies the role to your host. A **fronted Remnawave node**:
+A **fronted Remnawave node** playbook:
 
 ```yaml
 - hosts: new_node
   become: true
-  vars_files: [vault.yml] # cloudflare_api_token, fcp_api_token, remnawave_panel_api_token, …
+  vars_files: [vault.yml]
   vars:
-    domain_providers: { } # as above (or in group_vars)
+    domain_providers: {}                       # as above (or in group_vars)
     outline_enabled: false
     remnawave_enabled: true
     remnawave_panel_url: "https://panel.example.org"
-    remnawave_secret_key_source: "panel_api" # fetch SECRET_KEY from the panel
+    remnawave_secret_key_source: "panel_api"   # fetch SECRET_KEY from the panel
     remnawave_caddy_enabled: true
     remnawave_caddy_email: "admin@example.org"
     remnawave_panel_register_node: true
@@ -131,696 +104,280 @@ Write a `playbook.yml` that applies the role to your host. A **fronted Remnawave
       - { name: ws, network: ws, path: "/ws", internal_port: 8443, inbound_uuid: "<ws-inbound-uuid>", alpn: "http/1.1", fingerprint: chrome, enabled: true }
     fcp_enabled: true
     fcp_api_url: "https://control-plane.example.org"
-    fcp_register_remnawave_panel: true # register the panel row (once)
-    # the panel-wide squads (FreeSocks-Fastly / -Reality / -Relay) were created
-    # and bound to FCP's mode pools at bootstrap — this deploy only registers
-    # the node against the SHARED base inbounds and creates its Hosts
+    fcp_register_remnawave_panel: true
+    # the panel-wide squads were created and bound to FCP's mode pools at
+    # bootstrap — this deploy only registers the node against the SHARED base
+    # inbounds and creates its Hosts
   roles:
     - ansible-role-freesocks
 ```
-
-The operation mode is passed at run time; `--ask-vault-pass` decrypts the vault:
 
 ```sh
 ansible-playbook -i inventory playbook.yml --ask-vault-pass \
   --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com"
 ```
 
-A minimal **Outline** node is simpler — Outline is the default backend and WSS/FCP are
-opt-in; a play that leaves `outline_enabled: true` and sets `fcp_enabled: true` plus the
-FCP + Cloudflare vars deploys an Outline server with the same run command.
+A minimal **Outline** node is simpler: Outline is the default backend, WSS/FCP are opt-in. `example-playbook.yml` has ready-to-adapt plays for every component combination.
 
-`example-playbook.yml` has ready-to-adapt plays for every component combination; the
-sections below document each variable.
+### 3. Verify
 
-### 3. Verify it worked
-
-- **FCP admin dashboard** → the backend row for this host appears and reads healthy (the
-  deploy already hard-asserts FCP could reach it unless `fcp_verify_connectivity=false`).
-- **Remnawave panel** → the node is listed + online, with one Host per enabled transport.
-- **Decoy** → `curl -sI https://<hostname>/` returns the camouflage site (HTTP 200) on any
-  non-transport path.
+- **FCP dashboard** → the backend row for this host appears healthy (the deploy hard-asserts FCP reachability unless `fcp_verify_connectivity=false`).
+- **Remnawave panel** → node listed + online, with one Host per enabled transport.
+- **Decoy** → `curl -sI https://<hostname>/` returns the camouflage site (HTTP 200) on any non-transport path. (Not applicable to Reality/relay nodes, which serve no web root.)
 - Issue a test key from FCP and confirm it connects.
 
-## Provider Configuration
-
-The role uses a pluggable provider architecture for DNS and CDN. Server endpoint data is published to the FreeSocks Control Plane (FCP) rather than to a key/value store (see [FreeSocks Control Plane Registration](#freesocks-control-plane-registration)).
+## Provider configuration
 
 | Provider | Options | Purpose |
 |----------|---------|---------|
-| `dns_provider` | `cloudflare` | DNS record management (origin A/AAAA records) |
+| `dns_provider` | `cloudflare` | DNS record management (origin A/AAAA) |
 | `cdn_provider` | `cloudflare`, `fastly`, `none` | Optional CDN/WSS fronting |
 
-### Cloudflare Provider Requirements
+All domain-specific config lives in `domain_providers`. Each entry needs `dns_provider` + `zone_id`; add `cdn_provider`, `fastly_domain_mode`, and per-domain `cloudflare_api_token`/`cloudflare_account_id` as needed for multi-account setups. Zone IDs are looked up from this map by the active domain — no separate zone variables.
 
-When using the Cloudflare DNS provider, you need:
-- API token with DNS edit permissions
-- Account ID and Zone ID(s)
+> **Removed:** Cloudflare Tunnel (`cloudflared`) and Cloudflare KV. The `tunnel_provider`/`kv_provider` options, `cloudflare_*_kv_namespace_*` vars, and Access Team / AUD-tag settings are gone. Origin DNS via Cloudflare is unchanged; endpoint data now goes to FCP.
 
-> **Removed:** Cloudflare Tunnel (`cloudflared`) and Cloudflare KV are no longer used by this role. The previous `tunnel_provider` and `kv_provider` options, the `cloudflare_*_kv_namespace_*` variables, and the Access Team / AUD-tag tunnel settings have all been removed. Origin DNS via Cloudflare is unchanged; server endpoint data is now pushed to FCP.
+## Role variables
 
-## Role Variables
-
-### Required Variables
+### Required (via `--extra-vars` or playbook)
 
 ```yaml
-# Provider Configuration (required via --extra-vars)
+operation_mode: "deploy"        # deploy | change | migrate | update | bootstrap
+environment_mode: "prod"        # or "dev" (cosmetic)
 dns_provider: "cloudflare"
 
-# Environment Mode (required via --extra-vars)
-# NOTE: environment_mode is retained for compatibility but no longer selects
-# KV namespaces (KV has been removed). It is effectively cosmetic.
-environment_mode: "prod"  # or "dev"
-
-# Operation Mode
-operation_mode: "deploy"  # deploy | migrate | change | update | bootstrap
-# bootstrap = one-time, panel-only: create the Remnawave Config Profile
-# (FreeSocks-Config) + inbounds + the panel-wide squads (FreeSocks-Fastly /
-# FreeSocks-Reality / FreeSocks-Relay) and bind them to FCP's mode pools
-# (no host touched). Re-running it reconciles missing base inbounds by tag.
-# Legacy per-node placement (clones + per-node squads) is opt-in via
-# remnawave_per_node_placement=true.
-
-# Cloudflare Configuration (for the DNS provider)
 cloudflare_api_endpoint: "https://api.cloudflare.com/client/v4"
-cloudflare_api_token: "your-api-token"  # API Token (not Global API Key)
-cloudflare_account_id: "your-account-id"
-cloudflare_zone_id: "your-zone-id"
+cloudflare_api_token: "..."     # API Token (not Global API Key)
+cloudflare_account_id: "..."
 
-# FreeSocks Control Plane (FCP) registration — replaces Cloudflare KV
 fcp_enabled: true
 fcp_api_url: "https://fcp.example.org"
-fcp_api_token: "your-fcp-fsv1-token"   # vault-encrypted fsv1_ service token
+fcp_api_token: "..."            # vault-encrypted fsv1_ token
 
-# Domain Configuration
-# Zone IDs are looked up from domain_providers based on the domain
-# Optionally include per-domain credentials for multi-account setups
-domain_providers:
-  example.com:
-    dns_provider: cloudflare
-    zone_id: "your-zone-id-for-com"
-  example.app:
-    dns_provider: cloudflare
-    zone_id: "your-zone-id-for-app"
-  # Domain on a different Cloudflare account
-  other-domain.com:
-    dns_provider: cloudflare
-    zone_id: "zone-id-for-other-account"
-    # Override credentials for this domain
-    cloudflare_api_token: "your-api-token-for-other-account"
-    cloudflare_account_id: "account-id-for-other-account"
+domain_providers: {}            # see Provider configuration
+base_domain: "example.com"      # usually set by deploy_target_domain / change_target_domain
+```
 
-# Active domain for operations (typically set via deploy_target_domain or change_target_domain)
-base_domain: "example.com"
-api_domain: "example.com"
-prom_domain: "example.com"
+Optionally, `envoy_mappings` maps an inventory host to explicit IPs for multi-IP DNS records:
 
-# Envoy Mappings (for multi-IP DNS records)
+```yaml
 envoy_mappings:
   outline1-ams:
     ipv4: ["1.2.3.4", "5.6.7.8"]
-    ipv6: ["2001:db8::1", "2001:db8::2"]
+    ipv6: ["2001:db8::1"]
 ```
 
-### Optional Variables
+### Common optional variables
 
 ```yaml
-# Server Configuration
-outline_keys_port: 443
-outline_api_port: 8443
-hostname_extension: ""
-
-# Custom hostname override (optional)
-# If set, uses this instead of auto-generating random hostname
-custom_hostname: "my-server"  # Example: results in my-server.example.com
-
-# Number of words in randomly generated hostnames
-hostname_word_count: 3  # Default: 3 (e.g., apple-banana-cherry)
-
-# DNS Proxy (Cloudflare orange cloud, Fastly shield, etc.)
-# When true, traffic is proxied through the CDN
-dns_proxied: false  # Set to true for CDN proxy mode
-
-# Migration Settings
-source_hostname: ""
-destination_hostname: ""
+custom_hostname: "my-server"    # override auto-generated hostname
+hostname_word_count: 3          # words in a random hostname (e.g. apple-banana-cherry)
+dns_proxied: false              # true routes through the CDN proxy
+outline_keys_port: 443          # move off 443 (e.g. 853) when WSS needs 443 for Caddy
 ```
 
-### FreeSocks Control Plane Registration
+## FreeSocks Control Plane (FCP) registration
 
-The role publishes each server's connection details to the **FreeSocks Control Plane (FCP)** instead of writing to a key/value store. FCP is a self-hosted [Convex](https://www.convex.dev/) backend (previously Cloudflare Workers + KV); it no longer reads KV. Instead it stores each server's management credential and dials **out** to the server.
+The role publishes each server's connection details to FCP, a self-hosted [Convex](https://www.convex.dev/) backend that stores each server's management credential and dials **out** to it (no KV).
 
 Registration is a single **idempotent upsert keyed by `slug`**:
 
-- `PUT /api/v1/admin/backend-servers/by-slug/{slug}` — creates the server record, or merges into the existing one (keep-secret-on-blank), returning `{created}`. No GET-list or client-side id resolution, so a re-run never clashes.
-- After registering, the role optionally probes `POST …/backend-servers/test-connection` so a mistyped or unreachable backend fails the play loudly instead of leaving a dead row (gated by `fcp_verify_connectivity`, default `true`).
+- `PUT /api/v1/admin/backend-servers/by-slug/{slug}` — creates or merges (keep-secret-on-blank). No GET-list or id resolution, so re-runs never clash.
+- Optionally probes `POST …/test-connection` afterward so a mistyped/unreachable backend fails loudly (`fcp_verify_connectivity`, default `true`).
 
-Requests use an `fsv1_` service token with `admin:servers:write` (plus `admin:servers:read` for the test-connection probe). Mint it headlessly on the FCP host:
-
-    bunx convex run adminApi:mintAutomationToken '{"scopes":["admin:servers:read","admin:servers:write"]}'
-
-This returns a scoped token attributed to a synthetic, credential-less `automation` admin (it can never sign in) — or create one in the FCP admin CMS → API Tokens.
+Requests use an `fsv1_` token with `admin:servers:write` (+ `admin:servers:read` for the probe).
 
 ```yaml
-# Enable FCP registration (default: false)
 fcp_enabled: true
-
-# FCP admin API base URL
 fcp_api_url: "https://fcp.example.org"
-
-# fsv1_ service token with admin:servers:read + admin:servers:write scopes (store in vault!)
-fcp_api_token: "fsv1_..."
-
-# Display name for this server in FCP (optional)
-fcp_server_name: ""
-
-# Unique slug used for idempotent create/update (defaults to the random hostname)
-fcp_server_slug: ""
-
-# Remnawave only: register the PANEL with FCP (default: false)
-fcp_register_remnawave_panel: false
-
-# Slug for the Remnawave panel record in FCP
+fcp_api_token: "fsv1_..."             # vault!
+fcp_server_name: ""                   # display name (default: random hostname)
+fcp_server_slug: ""                   # idempotency key (default: random hostname)
+fcp_register_remnawave_panel: false   # Remnawave: register the PANEL row
 fcp_remnawave_panel_slug: "remnawave-primary"
-
-# Optional capacity/ordering hints on the backend-servers row (empty = not sent)
-fcp_max_keys: ""                     # cap issuance onto this instance ("null" clears)
-fcp_priority: ""                     # pool ordering (lower = preferred)
-
-# Opt-in post-deploy gate: poll GET /api/v1/admin/status until this slug reports
-# healthy (needs admin:status:read; FCP's healthcheck cron runs every ~10 min).
-fcp_status_gate: false
+fcp_max_keys: ""                      # optional issuance cap (empty = not sent)
+fcp_priority: ""                      # optional pool ordering (lower = preferred)
+fcp_status_gate: false                # poll GET /admin/status until healthy (admin:status:read)
 ```
 
-**What gets registered depends on the backend:**
+**What gets registered:**
 
-- **Outline** — each server is one FCP `backendServers` row. The role registers the Caddy-proxied management `apiUrl` (which must present a **valid public TLS cert** — FCP rejects self-signed certs), plus `websocketEnabled` and `websocketDomain` (the Fastly edge domain when fronted, otherwise the origin hostname).
+- **Outline** — one `backendServers` row: the Caddy-proxied management `apiUrl` (must present a **valid public TLS cert** — FCP rejects self-signed), plus `websocketEnabled` and `websocketDomain` (Fastly edge when fronted, else origin hostname). This requires the Caddy API proxy, configured automatically when `outline_wss_enabled=true` or via the no-WSS path that runs when `fcp_enabled=true`.
+- **Remnawave** — FCP stores only the **panel** (`baseUrl` + `apiToken`), never individual nodes; per-node config reaches users via the panel's subscription output. Opt in with `fcp_register_remnawave_panel: true`.
 
-  > Because FCP requires a valid-TLS `apiUrl`, an Outline server registered with FCP needs the **Caddy API proxy**. That proxy is configured automatically when `outline_wss_enabled=true`, or via the no-WSS path that runs when `fcp_enabled=true`.
+**Node placement (per-mode squad pools).** FCP homes each new key into the chosen connection mode's squad pool, bound via `PATCH /api/v1/admin/backends/remnawave/mode-placements` (scope `admin:servers:write`; needs the FCP 2026-07-28 DB-driven mode-catalog release — older role versions used the still-alive `/api/v1/admin/remnawave/mode-placements` alias with the pre-rename ids `evade`/`privacy`). The default topology is **one panel-wide squad per transport**: bootstrap creates `FreeSocks-Fastly` (→ `freedom-ws`), `FreeSocks-Reality` (→ `privacy-reality`) and `FreeSocks-Relay` (→ `freedom-reality`) and binds them as the pools; every node activates the shared base inbounds and adds its own Hosts, so a subscription carries every node's endpoint. Retiring a node (`force_wipe_remnawave`) deletes its Hosts and node entry; squads and pools stay. Squad UUIDs are `no_log`'d — FCP validates them server-side and audits only a `poolBound` boolean + pool size. A **legacy per-node model** (`remnawave_per_node_placement: true`) clones inbounds per node with its own `FSF-`/`FSR-<hostname>` squad (panel caps names at 30 chars), appended to the pools and detached at teardown.
 
-  > **Fixed WSS paths:** With WSS + FCP, the role forces the WSS listener paths to `/tcp` + `/udp` to match FCP's fixed client paths (see [WebSocket (WSS) Support](#websocket-wss-support)).
+**Migrate cleans up the source row.** An Outline migration registers the destination under its own slug, then deletes the source's row by the source slug (`source_kv_hostname`) — a single idempotent `DELETE …/by-slug/{slug}`. Skipped when source and destination slugs match.
 
-- **Remnawave** — FCP stores only the **panel** (`baseUrl` + `apiToken`), **not** individual nodes. Per-node config reaches users through the panel's subscription output. The role still registers the node and creates Hosts on the panel (separate, unchanged behavior). Registering the panel with FCP is opt-in via `fcp_register_remnawave_panel: true` (with `fcp_remnawave_panel_slug`).
+## Fastly fronting (CDN)
 
-**Node placement (per-mode squad pools).** FCP no longer binds squads to tiers — it homes each new key into the chosen connection mode's squad POOL, bound via `PATCH /api/v1/admin/backends/remnawave/mode-placements` (scope `admin:servers:write`, the same one registration uses; requires the FCP 2026-07-28 DB-driven mode-catalog release — older role versions used the still-alive `/api/v1/admin/remnawave/mode-placements` alias with the pre-rename ids `evade`/`privacy`). The default topology is **one panel-wide squad per transport**: bootstrap creates `FreeSocks-Fastly` (WS/CDN → `freedom-ws`), `FreeSocks-Reality` (direct → `privacy-reality`) and `FreeSocks-Relay` (REALITY behind an external L4 proxy → `freedom-reality`) and binds them as the pools; every node activates the shared base inbounds and adds its own Hosts, so a subscription carries every node's endpoint. Retiring a node (`force_wipe_remnawave`) deletes its Hosts and its node entry — the squads and pools stay. Squad UUIDs are treated as sensitive (requests are `no_log`; FCP validates them server-side, audits only a `poolBound` boolean + pool size, and never echoes them back). A **legacy per-node model** (`remnawave_per_node_placement: true`) remains available for per-node least-loaded homing: each node clones the base inbounds under its own tag and gets its own squad (`FSF-<hostname>` / `FSR-<hostname>` — the panel caps squad names at 30 chars), appended to the pools (`addSquadUuids`) and detached at teardown (`tasks/providers/remnawave/teardown_node_placement.yml`).
-
-**Migrate cleans up the source row.** When an Outline server is migrated to a new host, the destination is registered under its own slug and the role then **deletes the source server's FCP `backendServers` row** (by the source slug, `source_kv_hostname`) via `tasks/providers/fcp/delete_server.yml` — a single idempotent `DELETE …/backend-servers/by-slug/{slug}` (no GET-list / id resolution; no-ops if absent). This leaves no orphaned row behind, and is skipped when source and destination slugs are identical.
-
-### Fastly fronting (CDN)
-
-Fastly provides WebSocket passthrough in front of a node (both Outline WSS and
-Remnawave-via-Caddy). Set `cdn_provider: fastly` on the domain and pick ONE
-client-edge scheme:
+Fastly provides WebSocket passthrough in front of a node (Outline WSS and Remnawave-via-Caddy). Set `cdn_provider: fastly` on the domain and pick one client-edge scheme:
 
 | Scheme | Vars | Client edge | Notes |
 |---|---|---|---|
-| Shared label | `fastly_edge_label: "cdn-content"` | `cdn-content.global.ssl.fastly.net` | Chosen, memorable; globally first-come |
+| Shared label | `fastly_edge_label: "cdn-content"` | `cdn-content.global.ssl.fastly.net` | Memorable; globally first-come |
 | Shared random | `fastly_edge_random: true` | `fs-<hostname>.global.ssl.fastly.net` | Opt-in random |
-| **Fronting domains** | `fastly_fronting_domains: ["video-streams.org", …]` | your own domains | **Recommended** — `global.ssl.fastly.net` is blocked in many places |
-| Legacy custom | `fastly_domain_mode: custom` on the domain | `<hostname>.<base_domain>` | Same-domain edge |
+| **Fronting domains** | `fastly_fronting_domains: [...]` / `fastly_fronting_zones: [...]` | your own domains | **Recommended** — `global.ssl.fastly.net` is widely blocked |
+| Legacy custom | `fastly_domain_mode: custom` | `<hostname>.<base_domain>` | Same-domain edge |
 
-**Fronting edges** (two complementary lists — the effective edge set is their
-union, first entry = primary):
-
-```yaml
-# Exact, stable edge names (operator-chosen; follow the node through rotation):
-fastly_fronting_domains: ["cdn-content.com"]
-# Zones under which a RANDOM edge subdomain is generated per node
-# (e.g. quiet-river.video-streams.org, fresh per rotation):
-fastly_fronting_zones: ["video-streams.org", "quick-cdn.net"]
-```
-
-- **Generated edges** (`fastly_fronting_zones`) are the recommended default:
-  unique, unguessable, innocuous-looking (2 dictionary words, not DGA-looking
-  alnum) edge names per node. They are **ephemeral** — rotation generates
-  fresh labels and the old ones (edge CNAME, TLS subscription, ACME record)
-  are retired automatically via the persisted `fastly_edge_domains` file.
-  Because they are subdomains, **many nodes can share the same zones**
-  (Fastly's one-domain-per-service limit applies per FQDN).
-- **Exact edges** (`fastly_fronting_domains`) are stable operator-chosen
-  names; their CNAMEs are re-pointed on rotation, never deleted.
-- Each edge gets its **own Fastly TLS subscription** (Let's Encrypt ACME
-  dns-01) and an edge CNAME to its lettered `x.sni.global.fastly.net` target,
-  written in **its own DNS zone** (exact domains: longest-suffix match against
-  `domain_providers`; generated: the zone entry itself). Every domain/zone
-  must be covered there (with `zone_id` + optional per-zone
-  `cloudflare_api_token`) — the role fails fast listing any uncovered entry.
-- Remnawave **Hosts are created per transport × edge**, so subscriptions
-  carry every edge and clients can fail over. With more than one edge a
-  deterministic 6-hex suffix is added to the Host remark.
-- Edge CNAME writes are **idempotent and non-destructive**: an
-  already-correct CNAME is left untouched, a stale-target CNAME is replaced,
-  and your A/AAAA records on a fronting name are **never auto-deleted** — the
-  role fails with guidance instead.
-- Edges are set at deploy time — adding one to a live node means rotating.
-  N edges = N TLS subscriptions (possible Fastly cost).
-
-**Node identity and the hidden origin.** Whatever the edge scheme, the node is
-identified everywhere by its hostname (`custom_hostname` for ops-meaningful
-names like `xray1-front-mci1-fs-ce`): the Fastly service name, the Remnawave
-node name, the Host remarks, and the FCP name/slug. The node's only public A
-record is the **unguessable origin** `<hostname>-<rand8>.<base_domain>` —
-
-- shared + fronting modes: `dns_hostname` **is** the suffixed origin (Caddy
-  cert, Fastly SNI, panel management address, and FCP apiUrl all use it), so
-  passive-DNS enumeration of the zone can't map a hostname to an origin IP;
-- legacy custom mode: the clean hostname CNAMEs to the edge; the origin record
-  is written separately (and the panel dials it, not the CNAME'd edge);
-- Reality (no CDN): the clean hostname, no suffix — its address is public by
-  design (it goes into client links).
-
-The suffix is persisted (`fastly_origin_fqdn` next to `fastly_service_id`) and
-rotation generates a fresh one (the old origin record is deleted). Caveat: the
-suffix defeats zone enumeration/passive DNS, not public CT logs. Panel name
-caps respected throughout: node names ≤ 30, squad names ≤ 30, Host remarks ≤ 40.
-
-### WebSocket (WSS) Support
-
-Enable Shadowsocks over WebSocket for improved censorship resistance. This tunnels Shadowsocks traffic over HTTPS, making it appear as regular web traffic.
+**Fronting edges** — two complementary lists whose union is the effective edge set (first entry = primary):
 
 ```yaml
-# Enable WSS support
-outline_wss_enabled: true
-
-# Caddy configuration for automatic HTTPS
-outline_caddy_auto_https: true
-outline_caddy_email: "admin@example.com"
-outline_caddy_domain: ""  # Defaults to server hostname
-
-# WebSocket path configuration
-# Random paths use dictionary words (like hostnames) for natural-looking URLs
-outline_wss_random_paths: true  # Set to false to use custom paths
-outline_wss_random_path_min_words: 3  # Minimum words (e.g., /apple-banana-cherry)
-outline_wss_random_path_max_words: 5  # Maximum words (random in range)
-
-# Custom paths (used when outline_wss_random_paths is false)
-outline_wss_tcp_path: "/tcp"
-outline_wss_udp_path: "/udp"
-
-# Internal WebSocket server port (not externally exposed)
-outline_wss_server_port: 8080
-
-# API Proxy - enables valid TLS for API access (for control planes, etc.)
-outline_api_proxy_path: "/api"  # API available at https://domain/api/...
-
-# Hostname suffixes for API and Prometheus endpoints
-# Empty when using Caddy proxy (everything goes through port 443)
-# Set to "-api"/"-prom" for legacy separate subdomains
-api_hostname_suffix: ""   # e.g., "" -> abc123.domain.com, "-api" -> abc123-api.domain.com
-prom_hostname_suffix: ""
+fastly_fronting_domains: ["cdn-content.example"]                    # exact, stable, operator-chosen
+fastly_fronting_zones: ["video-streams.example", "quick-cdn.test"]  # zones for RANDOM per-node subdomains
 ```
 
-> **Important:** When using WSS, set `outline_keys_port` to a non-443 port (e.g., 853) 
-> so that Caddy can use port 443 for HTTPS/WebSocket traffic.
+- **Generated edges** (`fastly_fronting_zones`, recommended) mint unique, unguessable 2-word subdomains per node. They are **ephemeral** — rotation generates fresh labels and retires the old CNAME/TLS-subscription/ACME record automatically. Many nodes can share a zone.
+- **Exact edges** (`fastly_fronting_domains`) are stable; their CNAMEs are re-pointed on rotation, never deleted.
+- Each edge gets its **own Fastly TLS subscription** (Let's Encrypt ACME dns-01) and a CNAME in **its own DNS zone** (exact: longest-suffix match; generated: the zone itself). Every domain/zone must be covered in `domain_providers` with a `zone_id` — the role fails fast on any uncovered entry.
+- Remnawave **Hosts are created per transport × edge** for client failover; with more than one edge a deterministic 6-hex suffix is added to the remark.
+- CNAME writes are idempotent and non-destructive; your A/AAAA records on a fronting name are never auto-deleted.
+- Edges are set at deploy time — adding one to a live node means rotating. N edges = N TLS subscriptions (possible Fastly cost).
 
-> **FCP-managed Outline forces `/tcp` + `/udp`:** FCP issues Outline WSS keys with
-> **fixed** client paths (`/tcp` and `/udp`) and has no per-server path field. So when
-> both `fcp_enabled=true` and `outline_wss_enabled=true`, the role overrides the WSS
-> listener paths to `/tcp` + `/udp` and disables path randomization (logged at run
-> time) — otherwise issued keys would point at random paths Caddy isn't serving.
-> `outline_wss_random_paths` / `outline_wss_tcp_path` / `outline_wss_udp_path` only
-> take effect on a non-FCP Outline deploy. (A configurable path field is a possible
-> future FCP enhancement.)
+**Hidden origin.** The node's only public A record is the unguessable `<hostname>-<rand8>.<base_domain>`:
 
-### slipstream DNS Tunnel Support
+- **shared + fronting modes**: `dns_hostname` **is** the suffixed origin (Caddy cert, Fastly SNI, panel address, FCP apiUrl all use it), so zone enumeration can't map a hostname to an origin IP;
+- **legacy custom**: the clean hostname CNAMEs to the edge; the origin record is written separately;
+- **Reality (no CDN)**: the clean hostname, no suffix — its address is public by design.
 
-Enable DNS tunneling for extreme censorship resistance. Traffic is tunneled through DNS queries via recursive resolvers (e.g., Yandex DNS on Russia's allowlist).
+The suffix is persisted and regenerated on rotation (old origin record deleted). It defeats zone enumeration / passive DNS, not public CT logs. Panel caps are respected throughout: node names ≤ 30, squad names ≤ 30, Host remarks ≤ 40.
 
-**Note:** slipstream builds from source, requiring Rust on the target server. The build can take several minutes.
+## Remnawave node
 
-#### Configuration
+Deploys a `remnawave/node` Xray-core container managed by an external panel; all proxy/user config is pushed by the panel at runtime.
 
 ```yaml
-# Enable slipstream DNS tunnel
-slipstream_enabled: true
-
-# Mode: "shadowsocks" (default) or "raw"
-# - shadowsocks: Tunnel to local Shadowsocks (client needs ss-local)
-# - raw: Direct SOCKS5 proxy via microsocks (no ss-local needed)
-slipstream_mode: "shadowsocks"
-
-# Client resolvers (Yandex DNS on Russia allowlist)
-slipstream_resolver: "77.88.8.8:53"
-slipstream_resolver_backup: "77.88.8.1:53"
-
-# Version and repository
-slipstream_version: "main"
-slipstream_repo_url: "https://github.com/unredacted/slipstream-rust.git"
-
-# DNS listen port (default: 53)
-slipstream_dns_port: 53
-
-# Raw mode: SOCKS5 proxy port
-slipstream_socks_port: 1080
-```
-
-**Required DNS Variables** (must be set via `--extra-vars`):
-```yaml
-slipstream_base_domain: "your-dns.com"  # REQUIRED - Must be in domain_providers
-slipstream_subdomain: "dns1"             # REQUIRED - Tunnel subdomain
-slipstream_ns_hostname: "ns1"            # REQUIRED - Nameserver hostname
-slipstream_create_dns_records: true      # Optional - Auto-create DNS records (default: true)
-```
-
-#### DNS Setup (Automatic)
-
-When `slipstream_create_dns_records: true` (default), the role automatically creates:
-
-```dns
-dns1.your-dns.com.  IN NS    ns1.your-dns.com.
-ns1.your-dns.com.   IN A     <server-ipv4>
-ns1.your-dns.com.   IN AAAA  <server-ipv6>
-```
-
-**Natural-Looking Subdomain Examples:**
-- `dns1`, `dns2` - looks like DNS infrastructure
-- `mail1`, `mail2` - looks like mail servers  
-- `ns1`, `ns2` - looks like nameservers
-- `api1`, `cdn1` - looks like infrastructure
-
-**Multiple Servers:** Use different subdomains for each server:
-```bash
-# Server 1: dns1.your-dns.com
---extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
-
-# Server 2: dns2.your-dns.com  
---extra-vars "slipstream_subdomain=dns2 slipstream_ns_hostname=ns2"
-```
-
-**Requirements:**
-- `slipstream_base_domain` must exist in `domain_providers` with a valid `zone_id`
-- Cloudflare API credentials must be configured
-
-**Manual Setup** (if `slipstream_create_dns_records: false`):
-Create the DNS records manually in your DNS provider's dashboard.
-
-#### Mode Comparison
-
-| Feature | `shadowsocks` mode | `raw` mode |
-|---------|-------------------|------------|
-| Server target | outline-ss-server:443 | microsocks (SOCKS5):1080 |
-| Client needs | slipstream-client + ss-local | slipstream-client only |
-| Encryption layers | QUIC + Shadowsocks | QUIC only |
-| Setup complexity | Higher | Simpler |
-| Best for | Outline integration | Standalone proxy |
-
-#### Client Usage: Shadowsocks Mode
-
-```bash
-# Build slipstream-client
-git clone https://github.com/Mygod/slipstream-rust.git
-cd slipstream-rust && git submodule update --init --recursive
-cargo build --release -p slipstream-client
-
-# Start DNS tunnel (use your actual domain from deployment)
-./target/release/slipstream-client \
-  --tcp-listen-port 7000 \
-  --resolver 77.88.8.8:53 \
-  --domain dns1.your-dns.com \
-  --cert /path/to/server-cert.pem
-
-# Connect ss-local through tunnel
-ss-local -s 127.0.0.1 -p 7000 -l 1080 -k <password> -m chacha20-ietf-poly1305
-
-# Use SOCKS proxy at 127.0.0.1:1080
-```
-
-#### Client Usage: Raw Mode
-
-```bash
-# Build slipstream-client (same as above)
-# ...
-
-# Start DNS tunnel - this IS your SOCKS proxy!
-./target/release/slipstream-client \
-  --tcp-listen-port 1080 \
-  --resolver 77.88.8.8:53 \
-  --domain dns1.your-dns.com \
-  --cert /path/to/server-cert.pem
-
-# Configure apps to use SOCKS5 at 127.0.0.1:1080
-# No ss-local needed - slipstream-client IS the proxy!
-```
-
-
-### Remnawave Node Support
-
-Deploy a Remnawave (Xray-core) node managed by an external Remnawave Panel. The role only deploys the node container and its surrounding plumbing — all proxy and user configuration is pushed by the panel at runtime.
-
-```yaml
-# Component flag (mutually exclusive with outline_enabled)
 remnawave_enabled: true
-outline_enabled: false
+outline_enabled: false                      # mutually exclusive
 
-# Image and runtime
-remnawave_node_image: "remnawave/node:2.7.0"      # override via --extra-vars for upgrades
-remnawave_node_port: 2222                          # Panel ↔ Node API port
+remnawave_node_image: "remnawave/node:2.7.0"
+remnawave_node_port: 2222                    # Panel ↔ Node API port
 remnawave_node_install_dir: "/opt/remnanode"
 remnawave_log_dir: "/var/log/remnanode"
 
-# Panel connection (always required)
 remnawave_panel_url: "https://panel.example.com"
 
-# Where SECRET_KEY comes from
-#   "vault"     — vault-encrypted variable below (default)
-#   "panel_api" — role calls GET {panel_url}/api/keygen
+# SECRET_KEY source: "vault" (default) or "panel_api" (GET {panel_url}/api/keygen)
 remnawave_secret_key_source: "vault"
-remnawave_panel_secret_key: "<vault-encrypted base64 payload>"
+remnawave_panel_secret_key: "<vault base64 payload>"
+remnawave_panel_api_token: "<vault admin token>"   # needed for panel_api or register_node
 
-# Panel API integration (only required when secret_key_source=panel_api or
-# when remnawave_panel_register_node=true)
-remnawave_panel_api_token: "<vault-encrypted admin token>"
-
-# Auto-register the node entry on the panel via POST /api/nodes (opt-in)
-remnawave_panel_register_node: false
+remnawave_panel_register_node: false         # POST /api/nodes (opt-in)
 remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
-remnawave_panel_active_inbounds:
-  - "<inbound-uuid-1>"
 remnawave_panel_country_code: "US"
 
-# Where the PANEL dials this node to manage it (control plane, node_port).
-# Interface first — see "Panel-side node address" below.
-remnawave_node_address_interface: "tailscale0"  # empty = use the name below
-remnawave_node_address_family: "ipv4"           # ipv4 | ipv6
-remnawave_node_address: ""                      # a NAME; defaults to the node's origin FQDN
-remnawave_node_reconcile_address: false         # PATCH an already-registered node whose address drifted
-
-# Standalone Caddy on the host (TLS terminator + WS reverse-proxy)
-# Required for Fastly fronting and for VLESS-TLS / Trojan-TLS transports.
+# Standalone Caddy (TLS + WS reverse-proxy) — required for Fastly fronting / VLESS-TLS.
 # The Reality and relay transports don't need this (REALITY terminates in Xray).
 remnawave_caddy_enabled: false
 remnawave_caddy_email: "admin@example.com"
 remnawave_caddy_listen_port: 443
-# DEPRECATED alias — the Caddyfile now path-routes per remnawave_cdn_transports.
-# Kept so stale references resolve; equals the `ws` transport's internal_port.
+# DEPRECATED alias, kept so stale references resolve; equals the `ws` internal_port.
 remnawave_caddy_xray_internal_port: 8443
 
-# CDN transports (data-driven Caddy + Fastly VCL + Hosts). See the
-# "CDN transports (WebSocket)" section below.
-remnawave_cdn_transports:
-  - { name: ws, network: ws, path: "/ws", internal_port: 8443, inbound_uuid: "", alpn: "http/1.1", fingerprint: chrome, enabled: true }
-
-# Decoy/camouflage site served by Caddy on every non-transport path
-remnawave_decoy_root: "/var/www/decoy"
-
-# Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN). See the
-# "Reality transport" section below. Mutually exclusive with remnawave_caddy_enabled
-# and incompatible with Fastly; keys live on the panel inbound (role creates the Host).
-remnawave_reality_enabled: false
-remnawave_reality_inbound_uuid: ""   # configProfileInboundUuid of the Reality inbound
-remnawave_reality_sni: ""            # a serverName from the inbound (the borrowed domain)
-remnawave_reality_address: ""        # client-facing address; defaults to dns_hostname
-remnawave_reality_port: 443
-remnawave_reality_fingerprint: "chrome"
-
-# Relay transport (VLESS+REALITY behind an external L4/TCP proxy). See the
-# "Relay transport" section below. A DEDICATED node mode: the role asserts Caddy,
-# direct Reality, Fastly and per-node placement are all off. Empty port/fingerprint
-# mean "unset" (443 / chrome) so a lifecycle run cannot silently reset a deliberate
-# value — they are persisted in .relay_address and resolved at the point of use.
-remnawave_relay_enabled: false
-remnawave_relay_inbound_uuid: ""     # configProfileInboundUuid of the relay inbound
-remnawave_relay_address: ""          # the EXTERNAL proxy edge — REQUIRED, never defaulted
-remnawave_relay_sni: ""              # a serverName from the relay inbound
-remnawave_relay_port: ""             # client-facing port ON THE EDGE (empty = 443)
-remnawave_relay_fingerprint: ""      # empty = chrome
-remnawave_relay_repoint_ack: false   # required before change/migrate breaks the proxy origin
+remnawave_decoy_root: "/var/www/decoy"       # camouflage site on non-transport paths
 ```
 
-#### Two workflows
+> `SECRET_KEY` is **panel-wide**, not per-node — the same value is used by every node on a given panel. It bundles a JWT public key + ECC cert payload (base64).
 
-**Panel UI workflow (default — simplest)**
+### Two workflows
 
-1. In the Panel UI, click `Nodes` → `Management` → `+`. Fill in the node form.
-2. Copy the generated `SECRET_KEY` value into Ansible vault as `remnawave_panel_secret_key`.
-3. Run the role with `remnawave_enabled=true` and `remnawave_panel_url` set. The role deploys the container with the supplied key. After the container is up, finish the Panel UI flow by selecting a Config Profile and clicking `Create`.
+**Panel UI (default, simplest):** create the node in the Panel UI (`Nodes → Management → +`), copy the generated `SECRET_KEY` into vault as `remnawave_panel_secret_key`, run the role with `remnawave_enabled=true`, then finish the panel flow by selecting a Config Profile.
 
-**Panel API workflow (opt-in — fully automated)**
+**Panel API (opt-in, fully automated):** create a long-lived token via Panel UI → Tokens (`remnawave_panel_api_token`), set `remnawave_secret_key_source: panel_api` and/or `remnawave_panel_register_node: true`, and supply `remnawave_panel_config_profile_uuid` (from the bootstrap output). Active inbounds are derived from the enabled transports. The role calls `POST /api/nodes`, captures the returned UUID, and persists it to `/opt/remnanode/.node_uuid` for later change/migrate flows (which `PATCH /api/nodes` to keep the panel in sync).
 
-1. Create a long-lived API token via Panel UI → Tokens. Store as `remnawave_panel_api_token` in vault.
-2. Set `remnawave_secret_key_source: panel_api` (so the role fetches the key automatically) and/or `remnawave_panel_register_node: true` (so the role creates the panel-side node entry).
-3. When `register_node` is true, also supply `remnawave_panel_config_profile_uuid` (from the `bootstrap` mode output). The active inbounds are derived from `remnawave_cdn_transports[].inbound_uuid` (+ the Reality inbound when enabled). The role calls `POST /api/nodes`, captures the returned UUID, and persists it locally to `/opt/remnanode/.node_uuid` for use by future change/migrate flows (which then `PATCH /api/nodes` to keep the panel in sync with the new hostname).
+### Panel-side node address
 
-#### Panel-side node address
-
-The panel needs an address to reach each node's management API on
-`remnawave_node_port` (default 2222). Two ways to spell it, and the interface
-form is the reliable one on an overlay network:
+The panel needs an address to reach each node's management API on `remnawave_node_port` (default 2222). Two ways to spell it, and the interface form is the reliable one on an overlay network:
 
 ```yaml
 # Preferred: register the IP this node carries on an interface.
-remnawave_node_address_interface: "tailscale0"
-remnawave_node_address_family: "ipv4"    # ipv4 | ipv6 (global scope, unbracketed)
+remnawave_node_address_interface: "tailscale0"   # empty = use the name below
+remnawave_node_address_family: "ipv4"            # ipv4 | ipv6 (global scope, unbracketed)
 
 # Fallback: a name. Defaults to the node's origin FQDN (the unguessable
 # fastly_origin_fqdn when Fastly-fronted, else dns_hostname).
 remnawave_node_address: "node-a1b2c3d4.example.com"
+
+remnawave_node_reconcile_address: false   # PATCH a reused node whose address drifted
 ```
 
-Prefer the interface when the panel reaches nodes over Tailscale or WireGuard.
-The panel makes its node API calls from inside a Docker container, which
-resolves Tailscale MagicDNS names unreliably at best — so a MagicDNS name in
-this field is a node that goes unmanageable for reasons that look like nothing.
-The interface's address always dials. Deploy, change and migrate all resolve it
-the same way (`tasks/providers/remnawave/resolve_node_address.yml`), from facts
-gathered on the node itself, so nothing has to be restated per host.
+Prefer the interface when the panel reaches nodes over Tailscale or WireGuard. The panel makes its node API calls from **inside a Docker container**, which resolves Tailscale MagicDNS names unreliably at best — so a MagicDNS name here is a node that goes unmanageable for reasons that look like nothing. Deploy, change and migrate all resolve it the same way (`tasks/providers/remnawave/resolve_node_address.yml`), from facts gathered on the node itself, so nothing has to be restated per host.
 
-The resolution fails loudly rather than registering a blank or a guess: an
-interface that does not exist lists the ones that do, and an interface with no
-address in the requested family (or only a link-local IPv6) is an error.
-Facts are re-gathered on the fly when the interface is not in the current fact
-set, so `gather_facts: false` and "Tailscale came up earlier in this run" both
-work.
+Resolution fails loudly rather than registering a blank or a guess: a missing interface lists the ones that do exist, and an interface with no address in the requested family (or only a link-local IPv6) is an error. Facts are re-gathered on the fly when the interface isn't in the current fact set, so `gather_facts: false` and "Tailscale came up earlier in this run" both work.
 
-This is the **management** endpoint only. The data plane — the Fastly origin,
-the Reality address, the client-facing Hosts — is unaffected.
+This is the **management** endpoint only. The data plane — Fastly origin, Reality address, client-facing Hosts — is unaffected.
 
-**Moving an already-registered fleet.** Registration is GET-first: a node
-already on the panel under this name is reused and its address left alone. So
-switching a live fleet from hostnames to overlay IPs needs one of:
+**Moving an already-registered fleet.** Registration is GET-first: a node already on the panel under this name is reused and its address left alone. Switching a live fleet from hostnames to overlay IPs therefore needs `remnawave_node_reconcile_address: true`. Without it the drift is still logged every run (`Panel node "x" is registered as … but this run resolves …`), so nothing rots silently; a `change`/`migrate` run also PATCHes the address as part of its normal flow.
 
-```yaml
-remnawave_node_reconcile_address: true   # PATCH the reused node's address/port when it drifts
-```
-
-Without it the drift is still logged on every run (`Panel node "x" is registered
-as … but this run resolves …`), so nothing rots silently; a `change`/`migrate`
-run also PATCHes the address as part of its normal flow.
-
-For a node that is already deployed (where `deploy` refuses to run again), the
-transition is `update` mode with the same flag — the only lifecycle mode that
-touches a live node without rotating it. It needs the panel token (from vault)
-and the node's `.node_uuid` on disk; both are reported if missing, and neither
-is the deploy-time `remnawave_panel_register_node` flag:
+For a node already deployed (where `deploy` refuses to re-run), the transition is **`update` mode** with the same flag — the only lifecycle mode that touches a live node without rotating it. It needs the panel token (from vault) and the node's `.node_uuid` on disk; both are reported if missing, and neither is the deploy-time `remnawave_panel_register_node` flag:
 
 ```bash
 ansible-playbook -i inventory playbook.yml --ask-vault-pass --extra-vars "target=node-a operation_mode=update environment_mode=prod outline_enabled=false remnawave_enabled=true remnawave_panel_url=https://panel.example.com remnawave_node_address_interface=tailscale0 remnawave_node_reconcile_address=true"
 ```
 
-#### Caddy + Fastly coordination
+### Transports
 
-Remnawave's Xray runs in `network_mode: host`, so it shares ports with the rest of the host. When Fastly fronts the node, Fastly's origin needs a real public TLS cert at the node — which means **standalone Caddy on the host** (not embedded like Outline's Caddy). The Caddy install:
+Three transports, chosen by network environment:
 
-- Listens on `remnawave_caddy_listen_port` (default 443) — terminates TLS with a Let's Encrypt cert
-- Auto-issues the cert via HTTP-01 (port 80 must be free at provisioning time and during renewal)
-- **Path-routes** each enabled `remnawave_cdn_transports` entry (exact path match) to its Xray inbound on `127.0.0.1:<internal_port>`; every other path falls through to the decoy/camouflage site at `remnawave_decoy_root`
+| Transport | Enable | Strength | Best for |
+|-----------|--------|----------|----------|
+| **VLESS+WS+TLS** (via Caddy, real LE cert) | `remnawave_caddy_enabled` + a `ws` transport | Rides ordinary HTTPS — traverses forced proxies; TLS inspection sees normal HTTPS | **Business / school** networks |
+| **VLESS+Vision+REALITY** (direct) | `remnawave_reality_enabled` | Fastest; best against active probing (raw TCP, mimics a real site's TLS) | **Open** networks |
+| **VLESS+REALITY via an L4 relay** | `remnawave_relay_enabled` | REALITY's probe-resistance **plus** a hidden node IP; the edge is a shared address whose blocking carries collateral damage | **Heavily censored** networks |
 
-The panel-side Xray inbound configuration must match: bind on the internal port (e.g. `127.0.0.1:8443`) with **plaintext WebSocket** transport. TLS termination is handled by Caddy, not Xray.
+In one line: **WS+TLS** gets through forced HTTP proxies and TLS inspection because it looks like and rides normal HTTPS. **Reality** is fastest and strongest against active probing but does *not* traverse forced proxies. **Relay** trades one extra hop of latency for hiding the node IP entirely, which is what matters once a censor blocks endpoints by address.
 
 #### CDN transports (WebSocket)
 
-When the node is fronted by Fastly, the role models its CDN-fronted Xray transports as a **data-driven list**, `remnawave_cdn_transports`. Each entry corresponds to one panel Xray inbound, one Caddy path-route, one Fastly VCL rule, and one Remnawave Host — all driven from a single place so they can't drift.
+CDN-fronted transports are a **data-driven list** — each entry maps 1:1 to one panel inbound, one Caddy route, one Fastly VCL rule, and one Remnawave Host, so the layers can't drift.
 
 ```yaml
 remnawave_cdn_transports:
   - name: ws
-    network: ws                 # ws
-    path: "/ws"                 # PANEL-GLOBAL — must equal the inbound's wsSettings.path
-    internal_port: 8443         # must equal the inbound's listen port
-    inbound_uuid: ""            # configProfileInboundUuid from the Config Profile
+    network: ws
+    path: "/ws"            # PANEL-GLOBAL — must equal the inbound's wsSettings.path
+    internal_port: 8443    # must equal the inbound's listen port
+    inbound_uuid: ""       # configProfileInboundUuid
     alpn: "http/1.1"
     fingerprint: chrome
     enabled: true
-
-# Decoy/camouflage site served on every non-transport path
-remnawave_decoy_root: "/var/www/decoy"
 ```
 
-**Path is panel-global, not per-node-random.** Unlike Outline's WSS random paths, each transport's `path` must exactly equal the `wsSettings.path` of the matching inbound in the panel's shared Config Profile. Every node attached to that inbound uses the same path. Likewise `internal_port` must equal the inbound's `listen` port, and `inbound_uuid` is the `configProfileInboundUuid`.
+- **Path is panel-global, not per-node-random** (opposite of Outline WSS). Every node on that inbound uses the same path.
+- **Caddy + decoy:** Caddy path-routes each `ws` transport to its loopback inbound and serves a plausible "maintenance" page on all other paths, so a probe of `https://<host>/` sees an innocuous site. The panel-side inbound must bind the internal port (e.g. `127.0.0.1:8443`) with **plaintext WebSocket** — Caddy terminates TLS, not Xray.
+- **Automatic Host creation:** with node registration on, the role creates one Host per enabled transport (`POST /api/hosts`, idempotent by `remark`). Hosts are what put a node's keys into subscriptions — without them a registered node never appears in subscription output. Address/SNI is the Fastly edge when fronted, else the origin `dns_hostname` (a direct Caddy node is a complete endpoint, e.g. `wss://<dns_hostname>/ws`); port 443 with `securityLayer: TLS`. Gated on `remnawave_enabled` + `remnawave_panel_register_node` + `remnawave_caddy_enabled` + a `cdn_provider` of `fastly` or `none`. Rotation/migration deletes the old node's Hosts first.
 
-**Caddy + decoy site.** Caddy path-routes the `ws` transport to its loopback inbound via an exact-path `handle`, and serves a plausible static "maintenance" page (rooted at `remnawave_decoy_root`) on all other paths. A probe of `https://<host>/` therefore sees an innocuous site rather than a bare proxy or error.
+**Phase 0 (WS)** — one-time manual prerequisite (done for you by `operation_mode=bootstrap`): add a raw-Xray inbound to the Config Profile — tag `VLESS_WS_CDN`, `listen 127.0.0.1`, `port 8443`, `network ws`, `security none`, `wsSettings.path /ws` — and record its UUID (from `GET /api/config-profiles/inbounds`) into `remnawave_cdn_transports[].inbound_uuid`.
 
-**Automatic Host creation (Fastly and direct).** On a Remnawave deploy with node registration enabled, the role creates **one Remnawave Host per enabled transport** (`POST /api/hosts`, idempotent: it lists existing Hosts first and matches by `remark`). Hosts are what put a node's keys into client subscriptions — without them, a registered node never appears in subscription output. The Host's `address`/`sni`/`host` is the **Fastly edge domain when fronted, otherwise the origin `dns_hostname`** (`fastly_websocket_domain | default(dns_hostname)`) — Caddy already terminates a real Let's Encrypt cert on that origin and path-routes to the inbounds, so a direct (non-Fastly) node is a complete, directly-reachable endpoint (e.g. `wss://<dns_hostname>/ws`). Port is 443 with `securityLayer: TLS`. Hosts are gated on `remnawave_enabled` + `remnawave_panel_register_node` + `remnawave_caddy_enabled` + a `cdn_provider` of `fastly` **or** `none`; `remnawave_panel_active_inbounds` is **derived** from the enabled transports' `inbound_uuid`s, and hostname rotation / migration deletes the old node's Hosts (matched by remark prefix) before creating new ones.
+> **Why WS only (no XHTTP):** Fastly cannot relay XHTTP's long-lived streamed download — its `do_stream` is a cache feature that explicitly forbids endless responses, and Fastly staff confirmed the equivalent long-lived gRPC stream is impossible via VCL (only via Fastly Compute). Cloudflare fronting is off the table (VPN fronting is banned there). WS-over-Fastly is the shape Fastly supports.
 
-**Phase 0 — one-time manual panel prerequisite** (skipped by `operation_mode=bootstrap`, which creates this for you). The operator adds the WS raw-Xray inbound to the panel's Config Profile:
+#### Reality transport (direct, no Caddy/CDN)
 
-- **WS** — tag `VLESS_WS_CDN`, `listen 127.0.0.1`, `port 8443`, `network: ws`, `security: none`, `wsSettings.path: /ws`.
-
-Then record its UUID (from `GET /api/config-profiles/inbounds`) into the matching `remnawave_cdn_transports[].inbound_uuid`.
-
-**Why WS only (no XHTTP).** XHTTP was removed 2026-07-04: Fastly cannot relay XHTTP's long-lived streamed download — its `do_stream` is a cache feature ("Streaming Miss") that explicitly forbids endless responses, and Fastly staff confirmed the equivalent long-lived gRPC stream is impossible via VCL (only via Fastly Compute). Cloudflare fronting is off the table (VPN fronting is banned there). WS-over-Fastly is a first-class upgrade tunnel — the shape Fastly supports — and is the fronted transport.
-
-#### Reality transport (VLESS+Vision+REALITY — direct, no Caddy/CDN)
-
-Reality is a separate **direct** node mode (not part of `remnawave_cdn_transports`). Xray terminates TLS itself by borrowing a real site's handshake, so it binds `:443` directly with no Caddy and no CDN. Enable it with:
+Reality is a **direct** mode: Xray terminates TLS itself by borrowing a real site's handshake, binding `:443` directly.
 
 ```yaml
 remnawave_enabled: true
 outline_enabled: false
-
 remnawave_caddy_enabled: false           # MUST stay off — Reality binds :443 itself
 remnawave_reality_enabled: true
 remnawave_reality_inbound_uuid: "<configProfileInboundUuid of the Reality inbound>"
-remnawave_reality_sni: "www.some-real-site.com"   # a serverName from the inbound (borrowed domain)
+remnawave_reality_sni: "<a serverName from the inbound>"
 # remnawave_reality_address: ""          # client-facing address; defaults to dns_hostname
 # remnawave_reality_port: 443
 # remnawave_reality_fingerprint: chrome
-
-remnawave_panel_register_node: true       # role creates the Reality Host
-remnawave_panel_url: "https://panel.example.com"
-remnawave_panel_api_token: "<vault>"
+remnawave_panel_register_node: true
 remnawave_panel_config_profile_uuid: "<config-profile-uuid>"
 ```
 
-**Constraints (asserted by the role).** Reality is **mutually exclusive with `remnawave_caddy_enabled`** (both would bind `:443`) and **incompatible with Fastly**. The role asserts these and forces `dns_proxied: false` (a Reality endpoint must be reached directly).
-
-**Keys live on the panel, not the role.** The Reality `publicKey` / `shortIds` / `privateKey` / `flow` are configured on the **panel inbound** (raw Xray config). The role only creates the Remnawave Host (`tasks/providers/remnawave/create_reality_host.yml`): remark `<hostname>-reality`, `address`/`sni` from `remnawave_reality_address` (default `dns_hostname`) / `remnawave_reality_sni`, `securityLayer: DEFAULT` — the panel derives `pbk`/`sid`/`flow` from the inbound. The Reality inbound's UUID is also added to the derived `remnawave_panel_active_inbounds` when enabled. Reality is wired into deploy / change / migrate (gated on `remnawave_reality_enabled` + `remnawave_panel_register_node`).
-
-**Decoy sites are operator-supplied.** The role ships **no default** for `remnawave_bootstrap_reality_dest` / `_server_names` (nor their relay counterparts): which site a REALITY inbound borrows is deployment-specific and does not belong in a public repo. Set them in your own inventory — `operation_mode=bootstrap` asserts they are non-empty rather than creating a dead inbound. The mechanical requirements: `dest` must be a real, reachable TLS 1.3 host and must serve **every** name in `serverNames` (a probe sending an unserved name gets a cert mismatch, which burns the node), its certificate chain must fit Xray's hardcoded 8192-byte REALITY buffer ([xray-core #6356](https://github.com/XTLS/Xray-core/issues/6356)), and `remnawave_reality_sni` must be one of those `serverNames`.
-
-**Bootstrap-side inbound variables.** These shape the inbounds `operation_mode=bootstrap` creates on the panel; they are read during bootstrap only, never on a node deploy. Each REALITY transport carries its own set — and its own x25519 keypair, so a seized direct-Reality node does not burn relay:
-
-```yaml
-# Direct Reality
-remnawave_bootstrap_reality: true                  # set false to skip the inbound entirely
-remnawave_bootstrap_reality_dest: ""               # REQUIRED — "<decoy host>:443"
-remnawave_bootstrap_reality_server_names: []       # REQUIRED — names that dest serves
-remnawave_bootstrap_reality_short_ids: [""]
-remnawave_bootstrap_reality_network: "raw"
-remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
-
-# Relay (defaults to ON — set false if you are not deploying relay nodes yet,
-# otherwise bootstrap asserts on the empty dest/serverNames below)
-remnawave_bootstrap_relay: true
-remnawave_bootstrap_relay_dest: ""                 # REQUIRED when relay is on
-remnawave_bootstrap_relay_server_names: []         # REQUIRED when relay is on
-remnawave_bootstrap_relay_short_ids: [""]
-remnawave_bootstrap_relay_network: "raw"
-remnawave_bootstrap_relay_listen_port: 443         # port the inbound binds ON THE NODE
-remnawave_bootstrap_relay_accept_proxy_protocol: false
-remnawave_bootstrap_relay_squad_name: "FreeSocks-Relay"
-
-# Re-running bootstrap adds base inbounds missing from an existing profile, by tag
-remnawave_bootstrap_reconcile_inbounds: true
-```
-
-**Phase 0 (Reality) — one-time manual panel prerequisite.** Add a Reality inbound to the Config Profile — raw Xray: `vless`, `listen 0.0.0.0:443`, `security reality`, `realitySettings { dest, serverNames, privateKey, shortIds }`, `flow xtls-rprx-vision` — generate the x25519 keypair (panel UI / `GenerateX25519` endpoint / `xray x25519`), then record the inbound UUID (from `GET /api/config-profiles/inbounds`) into `remnawave_reality_inbound_uuid` and one serverName into `remnawave_reality_sni`.
+- **Constraints (asserted):** mutually exclusive with `remnawave_caddy_enabled` (both bind `:443`) and incompatible with Fastly; the role forces `dns_proxied: false`.
+- **Keys live on the panel,** not the role: `publicKey`/`shortIds`/`privateKey`/`flow` are on the panel inbound. The role only creates the Host (remark `<hostname>-reality`, `securityLayer: DEFAULT`; the panel derives `pbk`/`sid`/`flow`). The Reality inbound UUID joins the derived active-inbound set when enabled.
+- **Phase 0 (Reality):** add a Reality inbound (raw Xray: `vless`, `listen 0.0.0.0:443`, `security reality`, `realitySettings {dest, serverNames, privateKey, shortIds}`, `flow xtls-rprx-vision`), generate the x25519 keypair, and record the inbound UUID + one serverName into `remnawave_reality_inbound_uuid` / `remnawave_reality_sni`.
 
 #### Relay transport (VLESS+REALITY behind an external L4 proxy)
 
-The heaviest-censorship transport. The client dials an **external L4/TCP proxy edge** you create yourself; the proxy forwards **raw TCP** to the node, where REALITY terminates. An L4 forwarder is transparent to REALITY, so there is **no TLS at the edge** — no cert, no ACME, no Caddy, no decoy web root — and **the node's own address never appears in a client config**.
+The heaviest-censorship transport. The client dials an **external L4/TCP proxy edge you create yourself**; the proxy forwards **raw TCP** to the node, where REALITY terminates. An L4 forwarder is transparent to REALITY, so there is **no TLS at the edge** — no cert, no ACME, no Caddy, no decoy web root — and **the node's address never appears in a client config**.
 
-Versus the two transports above, relay adds two things direct Reality cannot have: the node IP is hidden behind the edge (so IP-blocking the node is not available to a censor), and the decoy can resolve into the *same network as the edge the client is talking to*, which removes the `(IP, SNI)` mismatch a censor can otherwise score.
+Versus direct Reality, relay adds two things: the node IP is hidden behind the edge (so IP-blocking the node isn't available to a censor), and the decoy can resolve into the *same network as the edge the client is talking to*, removing the `(IP, SNI)` mismatch a censor can otherwise score.
 
 ```yaml
 remnawave_enabled: true
@@ -837,517 +394,262 @@ remnawave_relay_enabled: true
 remnawave_relay_inbound_uuid: "<configProfileInboundUuid of the relay inbound>"
 remnawave_relay_address: "<the EXTERNAL proxy edge — FQDN or IP>"
 remnawave_relay_sni: "<a serverName from the relay inbound>"
-# remnawave_relay_port: 443               # client-facing port ON THE EDGE
-# remnawave_relay_fingerprint: chrome
+# remnawave_relay_port: ""                # client-facing port ON THE EDGE (empty = 443)
+# remnawave_relay_fingerprint: ""         # empty = chrome
+remnawave_relay_repoint_ack: false        # required before change/migrate breaks the proxy origin
 
 remnawave_panel_register_node: true
 ```
 
 **Two ports, and conflating them is the most common mistake.** `remnawave_relay_port` is the port **on the edge** that clients dial (it lands in the `vless://` link). `remnawave_bootstrap_relay_listen_port` is the port the inbound binds **on the node** — that is what you point the proxy's *backend* at. One edge can front several nodes by mapping a different edge port to each, so the former is per-node. Both bootstrap and the deploy summary print the exact backend target.
 
-Bootstrap echoes the node-side port into its output file as `remnawave_relay_node_listen_port` (alongside `remnawave_relay_inbound_uuid` and `remnawave_relay_sni`, taken from the first `serverNames` entry) purely so node deploys can print that line — it configures nothing. Because the output file loads as extra-vars, **do not also set `remnawave_relay_sni` in your own vars file**: the later `-e` would win and the effective value would depend on argument order.
+> Bootstrap echoes the node-side port into its output file as `remnawave_relay_node_listen_port` (alongside `remnawave_relay_inbound_uuid` and `remnawave_relay_sni`, taken from the first `serverNames` entry) purely so node deploys can print that line — it configures nothing. Because that file loads as extra-vars, **do not also set `remnawave_relay_sni` in your own vars file**: the later `-e` would win and the effective value would depend on argument order.
 
-**Adding relay to a panel that is already bootstrapped.** Bootstrap reconciles the Config Profile's base inbounds **by tag** (`remnawave_bootstrap_reconcile_inbounds`, default on): re-running it against an existing `FreeSocks-Config` adds any missing base inbound — the relay one included — via a full-replace `PATCH /api/config-profiles`. Existing inbounds are copied through **byte-for-byte and never rewritten**, so a re-run cannot rotate a live inbound's keys out from under connected clients. The corollary: editing `dest` / `serverNames` on an inbound that already exists is *not* reconciled — change it in the panel, or delete the inbound and re-run.
+**`remnawave_relay_address` has no default, on purpose.** It is asserted, never defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — worse than a failed run.
 
-**`remnawave_relay_address` has no default, on purpose.** It is asserted, not defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — a worse outcome than a failed run.
-
-**The edge is checked against the node, not just its hostname.** A single task file, `tasks/providers/remnawave/assert_relay_edge.yml`, owns the invariant. Deploy, `change` and `migrate` each include it as an early pre-flight, so a bad edge fails before anything is mutated — and `create_relay_host.yml` includes it again, which makes it unavoidable: every path that publishes a relay Host passes through there. That is why the check exists in exactly one file rather than once per mode. It refuses an edge that is, or resolves to, this node: `dns_hostname`, **both** FQDNs of a rotation (old and new), `default_ipv4` / `default_ipv6`, every entry of `all_ipv4_addresses` / `all_ipv6_addresses`, this host's `envoy_mappings` addresses, and finally a best-effort `getent` resolution of the edge name compared against all of the above. The resolution pass fails **only on a positive match** — an edge that cannot be resolved from the control host is not an error, since your resolver is not the client's. Documented limit: equivalent IPv6 *spellings* are not canonicalized (`2001:db8::1` vs `2001:0db8:0:0:0:0:0:1` compare as different strings), so give the edge in the same form the node's facts report; `tests/test_relay.yml` `(t3)` pins that gap deliberately so it cannot regress unnoticed.
+**The edge is checked against the node, not just its hostname.** One file, `tasks/providers/remnawave/assert_relay_edge.yml`, owns the invariant. Deploy, `change` and `migrate` each include it as an early pre-flight so a bad edge fails before anything is mutated, and `create_relay_host.yml` includes it again — which makes it unavoidable, since every path that publishes a relay Host goes through there. It refuses an edge that is, or resolves to, this node: `dns_hostname`, **both** FQDNs of a rotation, `default_ipv4`/`default_ipv6`, every entry of `all_ipv4_addresses`/`all_ipv6_addresses`, this host's `envoy_mappings` addresses, and a best-effort `getent` resolution compared against all of the above. The resolution pass fails **only on a positive match** — an edge you can't resolve from the control host isn't an error, since your resolver isn't the client's. Documented limit: equivalent IPv6 *spellings* are not canonicalized (`2001:db8::1` vs `2001:0db8:0:0:0:0:0:1` compare as different strings), so give the edge in the form the node's facts report; `tests/test_relay.yml` `(t3)` pins that gap so it can't regress unnoticed.
 
 **PROXY protocol.** Many L4 forwarders prepend a PROXY v1/v2 header. If yours does, set `remnawave_bootstrap_relay_accept_proxy_protocol: true` — otherwise REALITY reads the header bytes as a malformed ClientHello and **every connection fails with no useful error**. If yours does not, leave it off; the same failure happens in reverse.
 
-**What the role does not do.** It never talks to a proxy provider: you create the proxy and point its backend at the node by hand. On rotation (`change`) and migration the role tells you exactly what to re-point, and requires `remnawave_relay_repoint_ack=true` before doing anything that would break an FQDN-based proxy origin irrecoverably. An acknowledged rotation additionally requires `custom_hostname`, so the name the proxy must be pointed at is decided by you rather than regenerated.
+**What the role does not do.** It never talks to a proxy provider: you create the proxy and point its backend at the node by hand. On rotation and migration the role tells you exactly what to re-point, and requires `remnawave_relay_repoint_ack=true` before doing anything that would irrecoverably break an FQDN-based proxy origin. An acknowledged rotation additionally requires `custom_hostname`, so the name the proxy must point at is decided by you rather than regenerated.
 
-**The node remembers it is a relay node.** Deploy writes `address=` / `port=` / `fingerprint=` lines to `.relay_address` in the install dir (`remnawave_node_install_dir`, default `/opt/remnanode`), and **the existence of that file is the authoritative marker**. `change`, `migrate` and `update` read it, so they keep working on a relay node without re-passing the relay flags — and `migrate` uses it to tell a relay node from a direct-Reality one (neither has a Caddyfile, so nothing else can). It also means the endpoint survives a lifecycle run that forgets `remnawave_relay_port` / `_fingerprint`, instead of silently resetting to the defaults and re-creating the Host on every run.
+**The node remembers it is a relay node.** Deploy writes `address=`/`port=`/`fingerprint=` to `.relay_address` in the install dir, and **the existence of that file is the authoritative marker**. `change`, `migrate` and `update` read it, so they keep working without re-passing the relay flags — and `migrate` uses it to tell a relay node from a direct-Reality one (neither has a Caddyfile, so nothing else can). It also means the endpoint survives a lifecycle run that forgets `remnawave_relay_port`/`_fingerprint` instead of silently resetting to defaults and re-creating the Host every run.
 
 **FCP mode.** The relay squad binds to FCP's `freedom-reality` pool (direct Reality keeps `privacy-reality`). `freedom-reality` **ships disabled** in FCP's catalog and the role cannot enable it (that needs `admin:settings:write`, which the role's token deliberately does not hold) — enable it in **FCP Admin → Connection modes** once at least one relay node exists.
 
-#### Choosing a transport
+#### Decoys and bootstrap-side inbound variables
 
-| Transport | Setup | Strength | Best for |
-|-----------|-------|----------|----------|
-| **VLESS+WS+TLS** (via Caddy, real LE cert) | `remnawave_caddy_enabled` + `ws` transport | Rides ordinary HTTPS — traverses forced proxies; TLS inspection sees normal HTTPS (blocking it means blocking all HTTPS) | **Business / school networks** (forced proxies, TLS inspection) |
-| **VLESS+Vision+REALITY** (direct) | `remnawave_reality_enabled` | Fastest; best against active probing (raw TCP, mimics a real site's TLS) | **Open networks** |
-| **VLESS+REALITY via an L4 relay** | `remnawave_relay_enabled` | REALITY's probe-resistance **plus** a hidden node IP; the edge is a shared address whose blocking carries collateral damage | **Heavily censored networks**, where the other two are blocked |
+**Decoy sites are operator-supplied.** The role ships **no default** for `remnawave_bootstrap_reality_dest` / `_server_names` or their relay counterparts: which site a REALITY inbound borrows is deployment-specific and does not belong in a public repo. Set them in your own inventory — bootstrap asserts they are non-empty rather than creating a dead inbound. The mechanical requirements: `dest` must be a real, reachable TLS 1.3 host that serves **every** name in `serverNames` (a probe sending an unserved name gets a cert mismatch, which burns the node), its certificate chain must fit Xray's hardcoded 8192-byte REALITY buffer ([xray-core #6356](https://github.com/XTLS/Xray-core/issues/6356)), and `remnawave_reality_sni` must be one of those `serverNames`.
 
-The tradeoff in one line: **WS+TLS via Caddy** is the choice for restrictive **business/school** networks because it looks like — and rides — normal HTTPS, so it gets through forced HTTP proxies and TLS inspection. **Reality** is the **fastest** option and the strongest against active probing, but it does **not** traverse forced HTTP proxies / TLS inspection, so it is for **open** networks. **Relay** trades a little latency (one extra hop) for hiding the node IP entirely, which is what matters once a censor is blocking endpoints by address.
+These shape the inbounds bootstrap creates; they are read during bootstrap only, never on a node deploy. Each REALITY transport carries its own set — and its own x25519 keypair, so a seized direct-Reality node does not burn relay:
 
-#### Notes
+```yaml
+# Direct Reality
+remnawave_bootstrap_reality: true                  # false to skip the inbound entirely
+remnawave_bootstrap_reality_dest: ""               # REQUIRED — "<decoy host>:443"
+remnawave_bootstrap_reality_server_names: []       # REQUIRED — names that dest serves
+remnawave_bootstrap_reality_short_ids: [""]
+remnawave_bootstrap_reality_network: "raw"
+remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
 
-- **slipstream coexistence**: `slipstream_enabled=true` with `slipstream_mode=raw` (microsocks-backed) works alongside Remnawave. `slipstream_mode=shadowsocks` requires Outline.
-- **FCP registers the panel, not the node**: For Remnawave, FCP stores only the panel (`baseUrl` + `apiToken`); per-node config reaches users via the panel's subscription output. Set `fcp_register_remnawave_panel: true` to register the panel with FCP (see [FreeSocks Control Plane Registration](#freesocks-control-plane-registration)).
-- **TLS certificates for non-Caddy setups**: If you don't enable `remnawave_caddy_enabled`, you're responsible for either using Reality (no public cert needed) or mounting your own cert files into the container at `/var/lib/remnawave/configs/xray/ssl/`.
+# Relay (defaults ON — set false if you aren't deploying relay nodes yet,
+# otherwise bootstrap asserts on the empty dest/serverNames below)
+remnawave_bootstrap_relay: true
+remnawave_bootstrap_relay_dest: ""                 # REQUIRED when relay is on
+remnawave_bootstrap_relay_server_names: []         # REQUIRED when relay is on
+remnawave_bootstrap_relay_short_ids: [""]
+remnawave_bootstrap_relay_network: "raw"
+remnawave_bootstrap_relay_listen_port: 443         # port the inbound binds ON THE NODE
+remnawave_bootstrap_relay_accept_proxy_protocol: false
+remnawave_bootstrap_relay_squad_name: "FreeSocks-Relay"
 
-
-## Quick Reference Guide
-
-### Deploy Mode Examples
-
-```bash
-# Basic Outline server
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com"
-
-# Outline + WebSocket (CDN fronting)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_wss_enabled=true"
-
-# Outline + slipstream (DNS tunnel to SS server)
-# DNS records are auto-created from slipstream_base_domain
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "slipstream_enabled=true slipstream_base_domain=your-dns.com"
-
-# Outline + slipstream raw (two independent transports)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com"
-
-# slipstream only (raw mode, no Outline)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com"
-
-# Full stack (all transports)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_wss_enabled=true slipstream_enabled=true slipstream_base_domain=your-dns.com"
-
-# Remnawave node (Panel UI workflow — paste SECRET_KEY into vault first)
-ansible-playbook playbook.yml --ask-vault-pass \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false remnawave_enabled=true" \
-  --extra-vars "remnawave_panel_url=https://panel.example.com"
-
-# Remnawave node (Panel API workflow — role fetches SECRET_KEY + registers node)
-ansible-playbook playbook.yml --ask-vault-pass \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false remnawave_enabled=true" \
-  --extra-vars "remnawave_panel_url=https://panel.example.com" \
-  --extra-vars "remnawave_secret_key_source=panel_api remnawave_panel_register_node=true" \
-  --extra-vars "remnawave_panel_config_profile_uuid=<uuid>" \
-  --extra-vars "remnawave_panel_country_code=US"
-
-# Remnawave node + standalone Caddy (Fastly fronting / VLESS-TLS support)
-ansible-playbook playbook.yml --ask-vault-pass \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false remnawave_enabled=true" \
-  --extra-vars "remnawave_panel_url=https://panel.example.com" \
-  --extra-vars "remnawave_caddy_enabled=true remnawave_caddy_email=admin@example.com"
-
-# Remnawave + slipstream raw (independent transports)
-ansible-playbook playbook.yml --ask-vault-pass \
-  --extra-vars "operation_mode=deploy environment_mode=prod" \
-  --extra-vars "deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false remnawave_enabled=true" \
-  --extra-vars "remnawave_panel_url=https://panel.example.com" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com"
+# Re-running bootstrap adds base inbounds missing from an existing profile, by tag
+remnawave_bootstrap_reconcile_inbounds: true
 ```
 
-### Change Mode Examples
+**Adding relay to a panel that is already bootstrapped.** Reconciliation is **by tag**: re-running bootstrap against an existing `FreeSocks-Config` adds any missing base inbound via a full-replace `PATCH /api/config-profiles`. Existing inbounds are copied through **byte-for-byte and never rewritten**, so a re-run cannot rotate a live inbound's keys out from under connected clients. The corollary: editing `dest`/`serverNames` on an inbound that already exists is *not* reconciled — change it in the panel, or delete the inbound and re-run.
 
-```bash
-# Rotate hostname (same domain)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=change environment_mode=prod" \
-  --extra-vars "change_target_domain=example.com"
+### Caddy + Xray port coordination
 
-# Change to different domain
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=change environment_mode=prod" \
-  --extra-vars "change_target_domain=example.app"
+Xray runs in `network_mode: host`, so it shares host ports. When Fastly fronts the node, its origin needs a real public TLS cert at the node — hence **standalone Caddy on the host** (not embedded like Outline's). Caddy listens on `remnawave_caddy_listen_port` (default 443), auto-issues via HTTP-01 (port 80 must be free at provisioning and renewal), and path-routes each enabled transport to `127.0.0.1:<internal_port>`, with all other paths falling through to the decoy. The panel-side inbound must match: bind the internal port with **plaintext WebSocket** — TLS termination is Caddy's job, not Xray's.
 
-# Keep old DNS records
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=change environment_mode=prod" \
-  --extra-vars "change_target_domain=example.app" \
-  --extra-vars "change_delete_old_dns=false"
+If Caddy is disabled, use Reality or relay (no public cert needed) or mount your own cert files into the container at `/var/lib/remnawave/configs/xray/ssl/`.
+
+### Notes
+
+- **slipstream coexistence:** `slipstream_mode=raw` (microsocks-backed) works alongside Remnawave; `slipstream_mode=shadowsocks` requires Outline.
+- **FCP registers the panel, not the node** — see the FCP section above.
+
+## Outline: WebSocket (WSS) support
+
+`outline_wss_enabled: true` makes Caddy handle HTTPS on 443 and proxy WebSocket traffic to Shadowsocks, so it looks like regular web traffic.
+
+```yaml
+outline_wss_enabled: true
+outline_caddy_auto_https: true
+outline_caddy_email: "admin@example.com"
+outline_caddy_domain: ""              # defaults to server hostname
+
+outline_wss_random_paths: true        # false to use custom paths below
+outline_wss_random_path_min_words: 3
+outline_wss_random_path_max_words: 5
+outline_wss_tcp_path: "/tcp"
+outline_wss_udp_path: "/udp"
+outline_wss_server_port: 8080         # internal, not exposed
+
+outline_api_proxy_path: "/api"        # valid-TLS API at https://domain/api/... (for FCP)
+api_hostname_suffix: ""               # "" = same domain; "-api"/"-prom" = legacy subdomains
+prom_hostname_suffix: ""
 ```
 
-### Migrate Mode Examples
+> When using WSS, set `outline_keys_port` off 443 (e.g. 853) so Caddy can use 443.
 
-```bash
-# Migrate server to new host
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=migrate environment_mode=prod" \
-  --extra-vars "source_hostname=old-server source_kv_hostname=apple-banana" \
-  --extra-vars "destination_hostname=new-server destination_kv_hostname=apple-banana" \
-  --extra-vars "dns_provider=cloudflare"
+> **FCP forces `/tcp` + `/udp`:** FCP issues Outline WSS keys with fixed client paths and no per-server path field. When both `fcp_enabled` and `outline_wss_enabled` are true, the role overrides the WSS paths to `/tcp` + `/udp` and disables randomization (logged) — otherwise issued keys would point at random paths Caddy isn't serving. Path randomization only applies on a non-FCP Outline deploy.
+
+## Outline: slipstream DNS tunnel
+
+`slipstream_enabled: true` tunnels traffic through DNS queries via recursive resolvers for extreme censorship resistance. slipstream **builds from source** (Rust on the target; can take several minutes).
+
+```yaml
+slipstream_enabled: true
+slipstream_mode: "shadowsocks"        # or "raw"
+slipstream_resolver: "77.88.8.8:53"   # Yandex DNS (on Russia's allowlist)
+slipstream_resolver_backup: "77.88.8.1:53"
+slipstream_version: "main"
+slipstream_dns_port: 53
+slipstream_socks_port: 1080           # raw mode
+
+# Required (via --extra-vars):
+slipstream_base_domain: "your-dns.example"  # must be in domain_providers
+slipstream_subdomain: "dns1"                # tunnel subdomain
+slipstream_ns_hostname: "ns1"               # nameserver hostname
+slipstream_create_dns_records: true         # auto-create NS + A/AAAA (default true)
 ```
 
-### Update Mode Examples
+| | `shadowsocks` mode | `raw` mode |
+|---|---|---|
+| Server target | outline-ss-server:443 | microsocks (SOCKS5):1080 |
+| Client needs | slipstream-client + ss-local | slipstream-client only |
+| Encryption | QUIC + Shadowsocks | QUIC only |
+| Coexists with | Outline | Outline **or** Remnawave |
 
-```bash
-# Add slipstream (raw mode) to existing Outline server
-# DNS records auto-created: dns1.your-dns.com → ns1.your-dns.com → server IP
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com"
+When `slipstream_create_dns_records: true`, the role delegates the tunnel subdomain to the server (`dns1 IN NS ns1`, plus `ns1` A/AAAA). Use different `slipstream_subdomain`/`slipstream_ns_hostname` per server (`dns1`/`ns1`, `dns2`/`ns2`, …); infrastructure-looking names (`dns`, `mail`, `ns`, `api`, `cdn`) draw less attention. Client build/usage is documented in the slipstream-rust repo.
 
-# Add slipstream (shadowsocks mode) to existing Outline server
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_base_domain=your-dns.com"
+> slipstream artifacts (cert, resolver config) are generated on the server; they are **not** published to FCP today. Delivering them to clients is out of scope for control-plane registration.
 
-# Add second slipstream server (dns2.your-dns.com)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com" \
-  --extra-vars "slipstream_subdomain=dns2 slipstream_ns_hostname=ns2"
-
-# Add WebSocket to existing server
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "outline_wss_enabled=true"
-
-# Add both slipstream and WebSocket
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com" \
-  --extra-vars "outline_wss_enabled=true"
-
-# Re-pull and recreate a Remnawave node (e.g. to pick up a new image tag)
-ansible-playbook playbook.yml --ask-vault-pass \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "outline_enabled=false remnawave_enabled=true" \
-  --extra-vars "remnawave_panel_url=https://panel.example.com" \
-  --extra-vars "remnawave_node_image=remnawave/node:2.7.1" \
-  --extra-vars "force_reinstall_remnawave=true"
-```
-
-### Component Flags Reference
+## Component flags reference
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `outline_enabled` | `true` | Deploy Outline Shadowsocks server (mutually exclusive with `remnawave_enabled`) |
-| `outline_wss_enabled` | `false` | Enable WebSocket transport (requires Outline; also requires `outline_keys_port != 443`) |
-| `remnawave_enabled` | `false` | Deploy Remnawave Xray-core node (mutually exclusive with `outline_enabled`) |
-| `remnawave_panel_register_node` | `false` | Auto-register node on the Panel via `POST /api/nodes` |
-| `remnawave_caddy_enabled` | `false` | Install standalone Caddy (TLS terminator + WS proxy) — required for Fastly fronting |
-| `remnawave_reality_enabled` | `false` | VLESS+Vision+Reality direct node (no Caddy/CDN; requires `remnawave_reality_inbound_uuid` + `_sni`) |
-| `remnawave_relay_enabled` | `false` | VLESS+REALITY behind an external L4 proxy — DEDICATED node (asserts Caddy / direct Reality / Fastly / per-node placement all off; requires `remnawave_relay_inbound_uuid` + `_address` + `_sni`) |
-| `remnawave_relay_repoint_ack` | `false` | Acknowledge that you will re-point the external proxy's backend before a relay `change`/`migrate` breaks it |
-| `remnawave_per_node_placement` | `false` | Legacy opt-in: per-node inbound clones + squads (`FSF-`/`FSR-<hostname>`), appended to FCP's mode pools. Default = shared panel-wide squads bound at bootstrap |
+| `outline_enabled` | `true` | Outline Shadowsocks server (excludes `remnawave_enabled`) |
+| `outline_wss_enabled` | `false` | WebSocket transport (needs Outline; `outline_keys_port != 443`) |
+| `remnawave_enabled` | `false` | Remnawave Xray node (excludes `outline_enabled`) |
+| `remnawave_panel_register_node` | `false` | Auto-register node via `POST /api/nodes` |
+| `remnawave_caddy_enabled` | `false` | Standalone Caddy (TLS + WS proxy) — required for Fastly fronting |
+| `remnawave_reality_enabled` | `false` | VLESS+Vision+Reality direct node (needs `_inbound_uuid` + `_sni`) |
+| `remnawave_relay_enabled` | `false` | VLESS+REALITY behind an external L4 proxy — DEDICATED node (asserts Caddy / direct Reality / Fastly / per-node placement all off; needs `_inbound_uuid` + `_address` + `_sni`) |
+| `remnawave_relay_repoint_ack` | `false` | Acknowledge you'll re-point the proxy backend before a relay `change`/`migrate` breaks it |
+| `remnawave_node_reconcile_address` | `false` | PATCH a reused panel node whose address/port drifted |
+| `remnawave_per_node_placement` | `false` | Legacy per-node inbound clones + squads (default = shared squads) |
 | `force_reinstall_remnawave` | `false` | Re-template compose + recreate the node container |
 | `force_wipe_remnawave` | `false` | **Destructive**: tear down placement, delete panel node + install dir |
-| `fcp_enabled` | `false` | Register the server (Outline) / panel (Remnawave, opt-in) with the control plane |
+| `fcp_enabled` | `false` | Register server (Outline) / panel (Remnawave, opt-in) with FCP |
 | `slipstream_enabled` | `false` | Deploy slipstream DNS tunnel |
 | `slipstream_mode` | `shadowsocks` | `shadowsocks` (tunnel to SS) or `raw` (direct SOCKS5) |
-| `slipstream_base_domain` | **required** | Base domain for DNS (must be in domain_providers) |
-| `slipstream_subdomain` | **required** | Tunnel subdomain (dns1, mail1, etc.) |
-| `slipstream_ns_hostname` | **required** | Nameserver hostname (ns1, ns2, etc.) |
-| `slipstream_resolver` | `77.88.8.8:53` | DNS resolver for clients |
-| `force_reinstall_slipstream` | `false` | Force reinstall slipstream even if already installed |
-| `force_reinstall_wss` | `false` | Force reinstall WebSocket even if already installed |
+| `force_reinstall_slipstream` | `false` | Reinstall slipstream even if present |
+| `force_rebuild_slipstream` | `false` | Rebuild the slipstream binary from source |
+| `force_reinstall_wss` | `false` | Regenerate WSS config |
 
+## Mode examples
 
-
-## Operation Modes
-
-### Deploy Mode
-
-Deploys a server with selected components. Deploy mode is **component-based**, allowing various combinations:
-
-**Component Selection:**
-```yaml
-# Components (set in playbook or via --extra-vars)
-outline_enabled: true         # Outline Shadowsocks server (default: true)
-slipstream_enabled: false     # slipstream DNS tunnel (default: false)
-slipstream_mode: "shadowsocks"  # or "raw" for standalone SOCKS5
-outline_wss_enabled: false    # WebSocket transport (requires Outline)
-```
-
-**Deployment Combinations:**
-| Combination | Components | Use Case |
-|-------------|------------|----------|
-| Default | Outline only | Standard FreeSocks server |
-| Outline + WSS | Outline + WebSocket | CDN-fronted censorship resistance |
-| Outline + slipstream | Outline + slipstream (SS mode) | DNS tunnel to SS server |
-| slipstream only | slipstream (raw mode) | Standalone DNS tunnel proxy |
-| Full stack | Outline + WSS + slipstream | Maximum transport options |
-
-**Steps:**
-1. Validates component selection and configuration
-2. Generates random hostname for the target domain
-3. Sets up DNS records via configured provider (BEFORE install — the Outline installer's self-check would otherwise negative-cache the missing name)
-4. Installs base packages
-5. Deploys enabled components (Outline, WebSocket, slipstream)
-6. Registers the server with FCP (if `fcp_enabled`)
-
-**Example Commands:**
 ```bash
-# Default: Outline only
+# Deploy: Outline only (default backend)
 ansible-playbook playbook.yml \
   --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com"
 
-# Outline + slipstream (shadowsocks mode)
+# Deploy: Outline + WSS (CDN fronting)
+ansible-playbook playbook.yml \
+  --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com outline_wss_enabled=true"
+
+# Deploy: slipstream only (raw mode, no Outline)
 ansible-playbook playbook.yml \
   --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com" \
-  --extra-vars "slipstream_enabled=true slipstream_base_domain=your-dns.com"
+  --extra-vars "outline_enabled=false slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.example"
 
-# slipstream only (raw mode - no Outline needed)
-ansible-playbook playbook.yml \
+# Deploy: Remnawave node (Panel API workflow — role fetches SECRET_KEY + registers node)
+ansible-playbook playbook.yml --ask-vault-pass \
   --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false slipstream_enabled=true slipstream_mode=raw"
-```
+  --extra-vars "outline_enabled=false remnawave_enabled=true remnawave_panel_url=https://panel.example.com" \
+  --extra-vars "remnawave_secret_key_source=panel_api remnawave_panel_register_node=true" \
+  --extra-vars "remnawave_panel_config_profile_uuid=<uuid> remnawave_panel_country_code=US"
 
-### Migrate Mode
+# Change: rotate hostname (optionally to a different domain)
+ansible-playbook playbook.yml \
+  --extra-vars "operation_mode=change environment_mode=prod change_target_domain=example.app"
+# add change_delete_old_dns=false to keep old records
+# a relay node also needs remnawave_relay_repoint_ack=true and custom_hostname=<name>
 
-Migrates an existing Outline or Remnawave server to a new location:
-1. Verifies the source server state and **detects the installed backend** (`/opt/outline` vs `/opt/remnanode`) and, for Remnawave, which transport it runs (the `.relay_address` marker distinguishes a relay node from a direct-Reality one — neither has a Caddyfile) — the flow routes accordingly
-2. Verifies the destination has no conflicting installation
-3. Installs the matching backend on the destination (Outline, or Docker for Remnawave)
-4. Copies configuration from source to destination
-5. Updates DNS records for the destination
-6. Updates the FCP registration to point at the destination (if `fcp_enabled`), and deletes the stale source row (Outline)
+# Migrate: move a server to a new host (backend + transport auto-detected)
+ansible-playbook playbook.yml \
+  --extra-vars "operation_mode=migrate environment_mode=prod dns_provider=cloudflare" \
+  --extra-vars "source_hostname=old-server source_kv_hostname=apple-banana" \
+  --extra-vars "destination_hostname=new-server destination_kv_hostname=apple-banana"
 
-### Change Mode
-
-Rotates the hostname on an existing server when the current hostname is blocked by DNS filtering. This mode supports changing to a different domain entirely (e.g., from `example.com` to `example.app`).
-
-1. Validates `change_target_domain` is configured in `domain_providers`
-2. Reads existing API info from server
-3. Generates new random hostname for the target domain
-4. Creates new DNS records using the domain's configured provider
-5. Updates Caddy domain configuration (triggers new TLS certificate)
-6. Updates server hostname setting
-7. Updates local config files (shadowbox_server_config.json, access.txt, Caddy config)
-8. **Restarts container** to apply changes
-9. **Waits for health check** to confirm API accessibility
-10. Updates the FCP registration with the new endpoint (if `fcp_enabled`)
-11. Optionally deletes old DNS records
-
-**Required Configuration:**
-```yaml
-# In your playbook vars
-domain_providers:
-  example.com:
-    dns_provider: cloudflare
-    zone_id: "your-zone-id-for-com"
-  example.app:
-    dns_provider: cloudflare
-    zone_id: "your-zone-id-for-app"
-  # Future providers (framework ready)
-  # example.org:
-  #   dns_provider: fastly
-```
-
-**Required Variable:**
-```yaml
-# Must be passed via --extra-vars
-change_target_domain: "example.app"  # Domain to generate new hostname for
-```
-
-**Optional Settings:**
-```yaml
-# Whether to delete old DNS records after hostname change
-change_delete_old_dns: true
-```
-
-**Usage:**
-```bash
-# Change hostname to a new random hostname on example.app
-ansible-playbook -i inventory playbook.yml \
-  --extra-vars "operation_mode=change environment_mode=prod" \
-  --extra-vars "change_target_domain=example.app"
-```
-
-This generates something like `apple-banana-cherry.example.app` and uses the Cloudflare provider configured for that domain.
-
-### Update Mode
-
-Adds new components (slipstream, WebSocket) to an **existing** server without reinstalling Outline. Automatically detects the existing hostname and installed components, and re-syncs the server's FCP registration.
-
-**Use Cases:**
-- Add slipstream DNS tunnel to existing Outline server
-- Add WebSocket transport to existing Outline server
-- Switch slipstream modes (shadowsocks ↔ raw)
-- Update slipstream configuration (resolvers, domain)
-- **Recover from partial installations** (using force reinstall)
-
-**Idempotent Behavior:**
-- Components already installed are automatically skipped
-- Use `force_reinstall_slipstream=true` or `force_reinstall_wss=true` to reinstall
-
-**Steps:**
-1. Detects existing Outline installation and hostname
-2. Detects existing components (slipstream binary, WebSocket in config)
-3. Installs requested components that aren't already installed (or force reinstall)
-4. Re-syncs the server's FCP registration with the new component configuration (if `fcp_enabled`)
-
-**Usage:**
-```bash
-# Add slipstream raw to existing server
+# Update: add slipstream (raw) to an existing Outline server
 ansible-playbook playbook.yml \
   --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com" \
+  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.example" \
   --extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
 
-# Force reinstall slipstream (e.g., after partial failure or config change)
-ansible-playbook playbook.yml \
+# Update: re-pull and recreate a Remnawave node (new image tag)
+ansible-playbook playbook.yml --ask-vault-pass \
   --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.com" \
-  --extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1" \
-  --extra-vars "force_reinstall_slipstream=true"
-
-# Force reinstall WebSocket (regenerate config)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "outline_wss_enabled=true force_reinstall_wss=true"
+  --extra-vars "outline_enabled=false remnawave_enabled=true remnawave_panel_url=https://panel.example.com" \
+  --extra-vars "remnawave_node_image=remnawave/node:2.7.1 force_reinstall_remnawave=true"
 ```
 
+**What each mode does:**
 
-## Directory Structure
+- **deploy** — validate → generate hostname → create DNS (before install, so the Outline installer's self-check can't negative-cache the missing name) → install base + enabled components → register with FCP.
+- **change** — read existing config → new hostname on the target domain → create DNS → update hostname, then Caddy (that order matters: the reverse breaks API access) → restart + health check → re-sync FCP → optionally delete old DNS.
+- **migrate** — verify source + detect backend *and transport* (the `.relay_address` marker distinguishes relay from direct Reality; neither has a Caddyfile) → verify destination is clean → install matching backend → copy config → update DNS → re-point FCP (and delete the stale source row for Outline).
+- **update** — detect existing install + components → cross-check requested vs detected backend → add requested components (idempotent; `force_reinstall_*` to redo) → re-sync FCP.
+
+## Directory structure
 
 ```
 tasks/
-├── main.yml                 # Orchestrator with provider routing
-├── setup/
-│   ├── install.yml          # Base package installation
-│   ├── outline.yml          # Outline server setup
-│   ├── outline_api_proxy.yml # Caddy API proxy (no-WSS path for FCP)
-│   ├── websocket.yml        # WebSocket (WSS) configuration
-│   ├── wss_paths.yml        # WSS listener path resolution (random/configured/FCP-forced)
-│   ├── docker.yml           # Docker CE install (Remnawave)
-│   ├── remnawave.yml        # Remnawave node container deployment
-│   ├── caddy.yml            # Standalone Caddy (Remnawave) + decoy
-│   ├── decoy.yml            # Decoy/camouflage web root + index page
-│   └── slipstream.yml       # slipstream DNS tunnel setup
-├── change/
-│   ├── change.yml           # Backend-detect dispatcher
-│   ├── outline_change.yml   # Outline hostname rotation
-│   └── remnawave_change.yml # Remnawave hostname rotation
-├── migrate/
-│   ├── migrate.yml          # Migration orchestration
-│   ├── transfer_config.yml  # Outline config transfer
-│   ├── transfer_remnawave.yml # Remnawave config transfer
-│   ├── containers.yml       # Outline container management
-│   └── remnawave_containers.yml # Remnawave container management
-├── update/
-│   └── remnawave_update.yml # Update mode for Remnawave hosts
+├── main.yml                    # Orchestrator + provider routing
+├── setup/                      # install, outline, outline_api_proxy, websocket,
+│                               #   wss_paths, docker, remnawave, caddy, decoy, slipstream
+├── change/                     # change (dispatcher), outline_change, remnawave_change
+├── migrate/                    # migrate, transfer_config, transfer_remnawave, containers
+├── update/                     # remnawave_update
 └── providers/
-    ├── cloudflare/
-    │   ├── dns.yml          # DNS management (origin A/AAAA records)
-    │   ├── slipstream_dns.yml # slipstream NS/A/AAAA record automation
-    │   └── migrate/         # Migration-specific DNS tasks
-    ├── fastly/
-    │   ├── origin_identity.yml # Per-node origin derivation (<hostname>-<suffix>) + fronting zones
-    │   ├── service.yml      # Create/reuse Fastly service (named after the hostname) + WebSocket
-    │   ├── tls.yml          # TLS subscription driver (one per edge domain)
-    │   ├── tls_domain.yml   # TLS subscription engine (per domain)
-    │   ├── dns.yml          # Origin records (legacy custom) + edge CNAME orchestrator
-    │   ├── dns_edge.yml     # One edge CNAME (delete-then-create, per domain/zone)
-    │   └── cleanup.yml      # Delete old Fastly service (+ legacy custom TLS sub)
-    ├── remnawave/
-    │   ├── keygen.yml             # GET /api/keygen → SECRET_KEY
-    │   ├── register_node.yml      # POST /api/nodes (captures UUID)
-    │   ├── update_node.yml        # PATCH /api/nodes
-    │   ├── delete_node.yml        # DELETE /api/nodes/{uuid}
-    │   ├── create_hosts.yml       # POST /api/hosts per transport × edge domain
-    │   ├── create_reality_host.yml # POST /api/hosts for the Reality node
-    │   ├── create_relay_host.yml   # POST /api/hosts for the relay node (advertises the EDGE)
-    │   ├── assert_relay_edge.yml   # refuse a relay edge that resolves to this node
-    │   ├── cleanup_hosts.yml      # DELETE old Hosts (exact remark match)
-    │   ├── gen_x25519.yml         # Reality x25519 keypair (bootstrap)
-    │   ├── create_config_profile.yml # Config Profile + inbounds (bootstrap)
-    │   ├── create_squad.yml       # Shared panel-wide squads ×3 (bootstrap — default topology)
-    │   ├── create_node_placement.yml  # LEGACY per-node inbound clones + squads
-    │   └── teardown_node_placement.yml # Undo per-node placement (legacy path)
-    └── fcp/                 # FreeSocks Control Plane registration (REST API)
-        ├── register_server.yml          # Outline backendServers row
-        ├── register_remnawave_panel.yml # Remnawave panel record
-        ├── delete_server.yml            # DELETE a backendServers row by slug
-        ├── bind_placements.yml          # PATCH per-mode squad pools
-        ├── bind_default_mode.yml        # PATCH default connection mode (opt-in)
-        └── status_gate.yml              # Post-deploy health gate (opt-in)
+    ├── cloudflare/             # dns, slipstream_dns, migrate/
+    ├── fastly/                 # origin_identity, service, tls, tls_domain, dns, dns_edge, cleanup
+    ├── remnawave/              # keygen, resolve_node_address, register_node, update_node,
+    │                           #   delete_node, create_hosts, create_reality_host,
+    │                           #   create_relay_host, assert_relay_edge, cleanup_hosts,
+    │                           #   gen_x25519, create_config_profile, create_squad,
+    │                           #   create_node_placement, teardown_node_placement
+    └── fcp/                    # register_server, register_remnawave_panel, delete_server,
+                                #   bind_placements, bind_default_mode, status_gate
 ```
-
-> The `cloudflare/` provider no longer contains `install.yml` (cloudflared), `tunnel.yml`, or `kv.yml` — Cloudflare Tunnel and KV have been removed.
 
 ## Testing
 
-Every push and PR runs three CI jobs (`.github/workflows/ci.yml`): **lint**
-(YAML parse + playbook syntax checks), **unit** (offline expression tests), and
-**integration** — a full end-to-end run against a **real Remnawave panel**.
+Every push and PR runs three CI jobs (`.github/workflows/ci.yml`): **lint** (YAML + syntax), **unit** (offline expression tests), and **integration** (end-to-end against a real Remnawave panel).
 
-**Unit tests** (offline, `connection: local`, no hosts or APIs):
-
-- **`tests/test_bootstrap.yml`** — the bootstrap/placement filter expressions:
-  the three base inbounds and their tag→UUID mapping, FCP mode-placement bodies
-  (full-replace + per-node `addSquadUuids`), the per-node inbound plan + clone
-  logic (incl. re-run idempotency), x25519/response shape tolerance.
-- **`tests/test_relay.yml`** — the relay transport and the lifecycle gates it
-  shares with the other direct transports: the `cleanup_hosts.yml` remark regex,
-  the migrate source-capability truth table (via the `tests/relay_detect_case.yml`
-  helper), `.relay_address` parsing and precedence, the change/migrate repoint
-  gates, relay-only inbound activation, Host drift, the anti-leak invariant (a
-  relay edge that resolves back to the node is refused), and **structural** guards
-  that pin task ORDERING — destination gates before the first mutation, Host GET
-  before the idempotency decision, gates keyed on the resolved `*_effective` facts
-  rather than raw flags.
-- **`tests/test_caddyfile_render.yml`** — renders the Remnawave Caddyfile
-  template and asserts its structure (transport routes + decoy fallback).
-- **`tests/test_fcp_and_hosts.yml`** — the FCP Outline `apiUrl` construction and
-  the Remnawave Host request-body shaping.
-- **`tests/test_wss_paths.yml`** — the WSS path-resolution precedence
-  (configured paths, FCP-forced `/tcp` + `/udp`).
-- **`tests/test_fastly_edge.yml`** — Fastly edge-name selection (label / random
-  / fronting domains) + the service-is-named-after-the-hostname rule.
-- **`tests/test_origin_identity.yml`** — includes the real
-  `providers/fastly/origin_identity.yml`: suffix shape, dns_hostname reshaping
-  per mode, fronting-zone longest-suffix resolution, mutual-exclusion failures,
-  node-address fallback, multi-edge Host remarks + cleanup regex.
+**Unit tests** (offline, `connection: local`, no hosts/APIs):
 
 ```bash
-tests/run.sh                                   # every tests/test_*.yml
-ansible-playbook tests/test_bootstrap.yml      # or one at a time
+tests/run.sh                              # every tests/test_*.yml
+ansible-playbook tests/test_bootstrap.yml # or one at a time
 ```
 
-**Integration harness** (`tests/run_integration.sh`) — stands up an ephemeral
-**Remnawave panel** (`tests/panel/`, pinned to the fleet's release, fresh DB
-every run), a **contract-strict mock FCP** (`tests/mock_fcp.py` — validates
-requests exactly like the real control plane, including Convex-style
-undeclared-field rejection and squad-UUID checks), and a **mock Cloudflare API**
-(`tests/mock_cloudflare.py`), then runs two playbooks:
+| Test | Covers |
+|---|---|
+| `test_bootstrap.yml` | the three base inbounds + tag→UUID mapping, FCP mode-placement bodies (full-replace + per-node `addSquadUuids`), the legacy per-node inbound plan/clone logic incl. re-run idempotency, x25519 shape tolerance |
+| `test_relay.yml` | the relay transport and the lifecycle gates it shares with the other direct transports: `.relay_address` parsing/precedence, the `cleanup_hosts.yml` remark regex, the migrate source-capability truth table, change/migrate repoint gates, relay-only inbound activation, Host drift, the anti-leak invariant, plus **structural** guards pinning task ORDERING (destination gates before the first mutation, Host GET before the idempotency decision, gates keyed on resolved `*_effective` facts rather than raw flags) |
+| `test_node_address.yml` | interface-vs-name precedence, IPv6 global-scope selection, sanitized fact keys, both platform fact shapes, and every fail-closed path |
+| `test_caddyfile_render.yml` | the Remnawave Caddyfile structure (transport routes + decoy fallback) |
+| `test_fcp_and_hosts.yml` | FCP Outline `apiUrl` construction + Remnawave Host body shaping |
+| `test_wss_paths.yml` | WSS path precedence (configured vs FCP-forced `/tcp` + `/udp`) |
+| `test_fastly_edge.yml` | Fastly edge-name selection + the service-named-after-hostname rule |
+| `test_origin_identity.yml` | origin suffix shape, `dns_hostname` reshaping per mode, fronting-zone resolution, mutual-exclusion failures, multi-edge remarks + cleanup regex |
 
-1. **`tests/test_integration.yml`** — task-level: `operation_mode=bootstrap`
-   (asserts the profile is born with the no-log Xray posture, that all three
-   base inbounds exist, and that the three shared squads are created and bound
-   to the FCP pools), two shared-model node registrations (no clones, no
-   per-node squads, no pool appends), a **relay node** (it inherits the WS
-   transport from the bootstrap output and must still activate only its relay
-   inbound; its Host must advertise the edge, never the node; endpoint drift
-   re-points the Host; the `.relay_address` marker round-trips), a shared-model
-   retire (Host cleanup by remark — one node's Hosts only — then node DELETE;
-   fleet state untouched) and a relay retire, plus the LEGACY per-node placement
-   path for two simulated nodes (idempotent re-runs, the duplicate inbound-port
-   case, append-only FCP pools, teardown).
-2. **`tests/test_deploy.yml`** (with `RUN_DEPLOY_PHASE=1`) — the **real
-   `operation_mode=deploy` path**, exactly as production runs it: validation,
-   hostname, (mock) DNS, apt installs, a **real `remnawave/node` container**
-   the panel actually connects to over the node port, the Reality Host, and
-   FCP registration + bound pools + the status gate. A Reality node is used
-   because it is the one production topology needing no public TLS issuance.
+**Integration harness** (`tests/run_integration.sh`) stands up an ephemeral Remnawave panel (pinned release, fresh DB per run), a contract-strict mock FCP (`tests/mock_fcp.py` — validates requests exactly like the real control plane, including Convex-style undeclared-field rejection and squad-UUID checks), and a mock Cloudflare API, then runs:
+
+1. **`tests/test_integration.yml`** — task-level: bootstrap (no-log posture, all three base inbounds, three shared squads created and bound to the FCP pools), two shared-model node registrations (no clones, no per-node squads, no pool appends), a **relay node** (it inherits the WS transport from the bootstrap output yet must activate only its relay inbound; its Host must advertise the edge, never the node; endpoint drift re-points the Host; the `.relay_address` marker round-trips), a shared-model retire (Host cleanup by remark — one node's Hosts only — then node DELETE) and a relay retire, plus the legacy per-node placement path for two simulated nodes (idempotent re-runs, the duplicate inbound-port case, append-only pools, teardown).
+2. **`tests/test_deploy.yml`** (`RUN_DEPLOY_PHASE=1`) — the real `operation_mode=deploy` path: validation, hostname, mock DNS, apt installs, a real `remnawave/node` container the panel actually connects to, the Reality Host, and FCP registration + bound pools + the status gate. Reality is used because it's the one production topology needing no public TLS issuance.
 
 ```bash
 bash tests/run_integration.sh                     # task-level phases (any OS)
-RUN_DEPLOY_PHASE=1 bash tests/run_integration.sh  # + the real deploy (Linux + passwordless sudo)
+RUN_DEPLOY_PHASE=1 bash tests/run_integration.sh  # + real deploy (Linux + passwordless sudo)
 ```
 
-Requires Docker, ansible-core ≥ 2.15, and python3. Both mocks are ephemeral and
-everything is torn down on exit (including `/opt/remnanode` from the deploy
-phase). CI always runs the deploy phase.
-
-A syntax check of the example playbook is also useful:
+Requires Docker, ansible-core ≥ 2.15, python3. Both mocks are ephemeral and everything is torn down on exit (including `/opt/remnanode` from the deploy phase); CI always runs the deploy phase. A syntax check of the example is also useful:
 
 ```bash
 ansible-playbook --syntax-check example-playbook.yml
@@ -1359,4 +661,4 @@ GNU General Public License v3.0
 
 ## Author Information
 
-This role is maintained by the [Unredacted](https://unredacted.org/) Team.
+Maintained by the [Unredacted](https://unredacted.org/) Team.
