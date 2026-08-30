@@ -39,7 +39,7 @@
   set_fact:
     _rw_reality_inbound:
       tag: "VLESS_REALITY"
-      listen: "0.0.0.0"
+      listen: "{{ remnawave_xray_public_listen }}"
       port: 443
       protocol: "vless"
       settings: { clients: [], decryption: "none" }
@@ -63,7 +63,7 @@
   set_fact:
     _rw_relay_inbound:
       tag: "VLESS_RELAY_REALITY"
-      listen: "0.0.0.0"
+      listen: "{{ remnawave_xray_public_listen }}"
       port: "{{ remnawave_bootstrap_relay_listen_port | int }}"
       protocol: "vless"
       settings: { clients: [], decryption: "none" }

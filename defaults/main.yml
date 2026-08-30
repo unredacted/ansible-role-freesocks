@@ -767,6 +767,13 @@ remnawave_bootstrap_reconcile_inbounds: true
 # The WS inbound (raw Xray) the bootstrap POSTs into the Config Profile.
 # The tag MUST match what create_config_profile reads back + what create_squad
 # binds (VLESS_WS_CDN); ports/paths MUST match remnawave_cdn_transports.
+# Bind address for the PUBLIC Xray inbounds (Reality + relay). "::" binds
+# dual-stack on Linux (bindv6only=0 default), so the node accepts IPv4 AND
+# IPv6 members once its hostname has an AAAA record. Set "0.0.0.0" only for a
+# host whose kernel disables IPv6 entirely (binding "::" would fail there and
+# Xray would crash-loop).
+remnawave_xray_public_listen: "::"
+
 remnawave_bootstrap_cdn_inbounds:
   - tag: "VLESS_WS_CDN"
     listen: "127.0.0.1"
