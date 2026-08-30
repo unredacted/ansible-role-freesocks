@@ -774,6 +774,13 @@ remnawave_bootstrap_reconcile_inbounds: true
 # Xray would crash-loop).
 remnawave_xray_public_listen: "::"
 
+# Opt-in: when re-running bootstrap against an EXISTING Config Profile, also
+# move live public inbounds off 0.0.0.0 to remnawave_xray_public_listen. Off by
+# default because a "::" bind fails (Xray crash-loops) on any node whose kernel
+# disables IPv6, and the profile is panel-wide — enable only after verifying
+# `sysctl -n net.ipv6.conf.all.disable_ipv6` returns 0 on EVERY node.
+remnawave_reconcile_public_listen: false
+
 remnawave_bootstrap_cdn_inbounds:
   - tag: "VLESS_WS_CDN"
     listen: "127.0.0.1"
