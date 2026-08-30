@@ -1,0 +1,109 @@
+---
+# tasks/providers/remnawave/reconcile_subscription_template.yml
+#
+# One iteration of manage_subscription_templates.yml: reconcile the panel
+# template of type `_rw_tpl_item.key` against the role file `_rw_tpl_item.value`.
+# Reads the FULL row per uuid before comparing (the list row may omit fields on
+# future panel versions — same rule as the config-profile reconcile), and
+# PATCHes only on drift, so a re-run is a no-op.
+#
+# Every fact is (re)set unconditionally at the top of the iteration:
+# include_tasks loops share the fact namespace, so a value left over from the
+# previous template type must never leak into this one's comparisons.
+
+- name: "Resolve the live {{ _rw_tpl_item.key }} template row"
+  set_fact:
+    _rw_tpl_row: >-
+      {{ (_rw_templates | selectattr('templateType', 'equalto', _rw_tpl_item.key)
+          | list | first) | default({}, true) }}
+    _rw_tpl_is_json: "{{ _rw_tpl_item.value.endswith('.json') }}"
+    _rw_tpl_drifted: false
+  no_log: true
+
+- name: "Note an unknown template type ({{ _rw_tpl_item.key }})"
+  debug:
+    msg: >-
+      Panel has no subscription template of type {{ _rw_tpl_item.key }} —
+      skipping (the panel owns the type list; nothing was changed).
+  when: (_rw_tpl_row.uuid | default('')) == ''
+
+# `.json` files are dict-compared as templateJson; anything else is
+# byte-compared as base64 encodedTemplateYaml, read with rstrip=False so the
+# file's EXACT bytes travel (the lookup default strips trailing whitespace,
+# which would corrupt e.g. a YAML literal block with keep chomping). The
+# unused shape is set to its empty value (NOT omitted — omit inside set_fact
+# stores a sentinel string).
+- name: "Load the desired {{ _rw_tpl_item.key }} template from the role file"
+  set_fact:
+    _rw_tpl_desired_json: >-
+      {{ (lookup('file', _rw_tpl_item.value, rstrip=False) | from_json)
+         if (_rw_tpl_is_json | bool) else {} }}
+    _rw_tpl_desired_yaml_b64: >-
+      {{ '' if (_rw_tpl_is_json | bool)
+         else (lookup('file', _rw_tpl_item.value, rstrip=False) | b64encode) }}
+  no_log: true
+  when: (_rw_tpl_row.uuid | default('')) != ''
+
+- name: "Fetch the full live {{ _rw_tpl_item.key }} template"
+  uri:
+    url: "{{ remnawave_panel_url }}/api/subscription-templates/{{ _rw_tpl_row.uuid }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_tpl_full
+  when: (_rw_tpl_row.uuid | default('')) != ''
+
+- name: "Determine {{ _rw_tpl_item.key }} template drift"
+  set_fact:
+    _rw_tpl_drifted: >-
+      {{ ((_rw_tpl_full.json.response.templateJson | default({})) != _rw_tpl_desired_json)
+         if (_rw_tpl_is_json | bool)
+         else ((_rw_tpl_full.json.response.encodedTemplateYaml | default('')) != _rw_tpl_desired_yaml_b64) }}
+  no_log: true
+  when: (_rw_tpl_row.uuid | default('')) != ''
+
+- name: "Note the {{ _rw_tpl_item.key }} template reconcile outcome"
+  debug:
+    msg: >-
+      Subscription template {{ _rw_tpl_item.key }}:
+      {{ 'DRIFTED from ' + _rw_tpl_item.value + ' — updating' if (_rw_tpl_drifted | bool) else 'matches ' + _rw_tpl_item.value }}.
+  when: (_rw_tpl_row.uuid | default('')) != ''
+
+- name: "Update the {{ _rw_tpl_item.key }} template (full replace)"
+  uri:
+    url: "{{ remnawave_panel_url }}/api/subscription-templates"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: >-
+      {{ {'uuid': _rw_tpl_row.uuid, 'templateJson': _rw_tpl_desired_json}
+         if (_rw_tpl_is_json | bool)
+         else {'uuid': _rw_tpl_row.uuid, 'encodedTemplateYaml': _rw_tpl_desired_yaml_b64} }}
+    # Fail-soft on a write-scope gap (read worked, write refused): warn and
+    # move on rather than abort bootstrap mid-way.
+    status_code: [200, 401, 403]
+  delegate_to: localhost
+  no_log: true
+  register: _rw_tpl_patch
+  when:
+    - (_rw_tpl_row.uuid | default('')) != ''
+    - _rw_tpl_drifted | bool
+
+- name: "WARN when the {{ _rw_tpl_item.key }} template update was refused"
+  debug:
+    msg: >-
+      Subscription template {{ _rw_tpl_item.key }} is DRIFTED but the update was
+      refused (HTTP {{ _rw_tpl_patch.status }}) — the panel token lacks the
+      subscription-templates write scope. The live template was NOT changed.
+  when:
+    - (_rw_tpl_row.uuid | default('')) != ''
+    - _rw_tpl_drifted | bool
+    - (_rw_tpl_patch.status | default(200)) != 200

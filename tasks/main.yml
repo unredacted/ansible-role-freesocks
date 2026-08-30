@@ -1310,7 +1310,9 @@
           - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
         fail_msg: >-
           Bootstrap requires remnawave_panel_url and remnawave_panel_api_token (a
-          panel API token with config-profile, internal-squad, and system-tools scopes).
+          panel API token with config-profile, internal-squad, and system-tools scopes;
+          add the subscription-templates scope too if the role should own the
+          subscription templates — without it that step warns and skips).
       no_log: true
 
     # Relay has NO per-node placement path — deploy asserts relay is incompatible
@@ -1362,6 +1364,12 @@
 
     - name: Ensure the Config Profile + inbounds exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_config_profile.yml
+
+    # Own the panel's subscription templates (see defaults): a panel rebuild
+    # reseeds stock templates, and the stock SINGBOX one breaks sing-box >= 1.13.
+    - name: Reconcile the subscription templates the role owns
+      include_tasks: providers/remnawave/manage_subscription_templates.yml
+      when: (remnawave_managed_subscription_templates | default({})) | length > 0
 
     # THE default topology: one panel-wide squad per transport (FreeSocks-Fastly
     # for the WS/CDN side, FreeSocks-Reality for direct Reality), spanning the
