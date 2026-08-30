@@ -223,10 +223,15 @@
 #
 # Reconcile by TAG: fetch the live profile, append only the desired inbounds
 # whose tag is absent, and full-replace PATCH (same contract as
-# create_node_placement.yml). Existing inbounds are NEVER rewritten, so a re-run
-# cannot rotate a live inbound's REALITY keys out from under connected clients.
-# The corollary: changing dest/serverNames on an EXISTING tag is NOT reconciled
-# — edit it in the panel, or delete the inbound and re-run.
+# create_node_placement.yml). Existing inbounds are NEVER rewritten — so a re-run
+# cannot rotate a live inbound's REALITY keys out from under connected clients —
+# with ONE additive exception: `sniffing.routeOnly: true` is merged into every
+# live inbound (base AND per-node clones) that has sniffing enabled, because a
+# profile bootstrapped before the routeOnly fix keeps rewriting destinations to
+# the sniffed SNI and Tor stays broken there (the very population the fix
+# targets). The merge preserves every other key on the inbound untouched.
+# The corollary still holds: changing dest/serverNames on an EXISTING tag is NOT
+# reconciled — edit it in the panel, or delete the inbound and re-run.
 - name: Resolve the live Config Profile (for missing-inbound reconciliation)
   set_fact:
     _rw_live_profile: >-
@@ -242,18 +247,43 @@
          | list }}
   no_log: true
 
-- name: Note which base inbounds are being reconciled
+# Merge `sniffing.routeOnly: true` into every live inbound that sniffs. Purely
+# additive per inbound: only the sniffing mapping gains a key; clients, stream
+# settings, and REALITY keys pass through byte-identical.
+- name: Merge sniffing routeOnly into the live profile inbounds
+  set_fact:
+    _rw_live_inbounds_reconciled: >-
+      {%- set out = [] -%}
+      {%- for ib in (_rw_live_profile.config.inbounds | default([])) -%}
+        {%- if (ib.sniffing | default({})).enabled | default(false) -%}
+          {%- set _ = out.append(ib | combine({'sniffing': (ib.sniffing | combine({'routeOnly': true}))})) -%}
+        {%- else -%}
+          {%- set _ = out.append(ib) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true
+  when: _rw_profile_exists
+
+- name: Determine whether the sniffing merge changes anything
+  set_fact:
+    _rw_sniffing_changed: >-
+      {{ _rw_profile_exists
+         and (_rw_live_inbounds_reconciled | default([])) != (_rw_live_profile.config.inbounds | default([])) }}
+
+- name: Note what is being reconciled into the existing Config Profile
   debug:
     msg: >-
-      Reconciling {{ _rw_missing_inbounds | length }} missing base inbound(s)
-      into the existing Config Profile:
-      {{ _rw_missing_inbounds | map(attribute='tag') | list | join(', ') }}.
+      Reconciling into the existing Config Profile:
+      {{ _rw_missing_inbounds | length }} missing base inbound(s)
+      ({{ _rw_missing_inbounds | map(attribute='tag') | list | join(', ') | default('none', true) }});
+      sniffing routeOnly merge {{ 'CHANGES live inbounds' if (_rw_sniffing_changed | default(false)) else 'already in place' }}.
   when:
     - _rw_profile_exists
     - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
-    - _rw_missing_inbounds | length > 0
+    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false))
 
-- name: Append the missing base inbounds to the existing Config Profile
+- name: Reconcile the existing Config Profile (sniffing routeOnly + missing base inbounds)
   uri:
     url: "{{ remnawave_panel_url }}/api/config-profiles"
     method: PATCH
@@ -264,7 +294,7 @@
     body_format: json
     body:
       uuid: "{{ remnawave_panel_config_profile_uuid }}"
-      config: "{{ _rw_live_profile.config | combine({'inbounds': (_rw_live_profile.config.inbounds | default([])) + _rw_missing_inbounds}) }}"
+      config: "{{ _rw_live_profile.config | combine({'inbounds': (_rw_live_inbounds_reconciled | default(_rw_live_profile.config.inbounds | default([]))) + _rw_missing_inbounds}) }}"
     status_code: [200]
   delegate_to: localhost
   no_log: true
@@ -277,7 +307,7 @@
     # the case that needs populating. `| default([])` in the combine below already
     # handles a missing key, and gating on it made bootstrap fail the read-back
     # assertions instead of filling the profile in.
-    - _rw_missing_inbounds | length > 0
+    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false))
 
 - name: List Config Profile inbounds (read back the created UUIDs)
   uri:
