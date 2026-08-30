@@ -784,7 +784,7 @@ remnawave_bootstrap_cdn_inbounds:
       network: "ws"
       security: "none"
       wsSettings: { path: "/ws" }
-    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
 
 # Opt-in: set FCP's default connection mode at bootstrap, by mode slug
 # ('freedom-ws' = Freedom Mode / fronted WS, 'privacy-reality' = Privacy Mode /
