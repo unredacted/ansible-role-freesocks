@@ -781,6 +781,18 @@ remnawave_xray_public_listen: "::"
 # `sysctl -n net.ipv6.conf.all.disable_ipv6` returns 0 on EVERY node.
 remnawave_reconcile_public_listen: false
 
+# Subscription templates the role OWNS. Templates live in the panel DATABASE:
+# upgrades seed defaults only when a row is absent (edits survive), but a
+# REBUILT panel reseeds stock templates — and the stock SINGBOX template uses
+# the legacy config format that modern sing-box cores (>= 1.13) refuse
+# outright. Each entry maps a panel templateType to a file: `.json` files
+# reconcile templateJson (dict-compared), other extensions reconcile
+# encodedTemplateYaml as base64 of the file's exact bytes. Relative paths
+# resolve against the role's files/ dir; point at your own files to customize,
+# or set {} to leave panel templates unmanaged.
+remnawave_managed_subscription_templates:
+  SINGBOX: "subscription-templates/SINGBOX.json"
+
 remnawave_bootstrap_cdn_inbounds:
   - tag: "VLESS_WS_CDN"
     listen: "127.0.0.1"

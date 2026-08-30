@@ -1363,6 +1363,12 @@
     - name: Ensure the Config Profile + inbounds exist (capture their UUIDs)
       include_tasks: providers/remnawave/create_config_profile.yml
 
+    # Own the panel's subscription templates (see defaults): a panel rebuild
+    # reseeds stock templates, and the stock SINGBOX one breaks sing-box >= 1.13.
+    - name: Reconcile the subscription templates the role owns
+      include_tasks: providers/remnawave/manage_subscription_templates.yml
+      when: (remnawave_managed_subscription_templates | default({})) | length > 0
+
     # THE default topology: one panel-wide squad per transport (FreeSocks-Fastly
     # for the WS/CDN side, FreeSocks-Reality for direct Reality), spanning the
     # fleet — every node activates the shared base inbounds, so users homed to a

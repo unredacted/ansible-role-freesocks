@@ -1,0 +1,46 @@
+---
+# tasks/providers/remnawave/manage_subscription_templates.yml
+#
+# Reconcile the panel's subscription TEMPLATES against the files the role ships
+# (remnawave_managed_subscription_templates). Templates live in the panel
+# DATABASE: upgrades seed defaults only when a row is absent (operator edits
+# survive), but a rebuilt panel reseeds STOCK templates — which for SINGBOX
+# means the legacy config format that modern sing-box cores (>= 1.13) refuse
+# outright ("legacy DNS fakeip options … removed in sing-box 1.14.0"; legacy
+# inbound fields removed in 1.13). Owning the template here makes the fix
+# reproducible instead of a one-off panel edit.
+#
+# Full-replace by templateType. `.json` files reconcile `templateJson`
+# (dict-compared, so key order and whitespace don't matter); any other
+# extension reconciles `encodedTemplateYaml` as base64 of the file's exact
+# bytes (byte-compared — reformatting the file counts as drift, which is the
+# point: the file is canonical). A templateType the panel doesn't know is
+# reported and skipped, never created — the panel owns the type list.
+
+- name: List the panel subscription templates
+  uri:
+    url: "{{ remnawave_panel_url }}/api/subscription-templates"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _rw_tpl_list
+
+- name: Normalize the subscription-template list payload
+  set_fact:
+    _rw_templates: >-
+      {{ _rw_tpl_list.json.response.templates
+         if (_rw_tpl_list.json.response is mapping and 'templates' in _rw_tpl_list.json.response)
+         else _rw_tpl_list.json.response }}
+  no_log: true
+
+- name: Reconcile each managed subscription template
+  include_tasks: providers/remnawave/reconcile_subscription_template.yml
+  loop: "{{ remnawave_managed_subscription_templates | dict2items | sort(attribute='key') }}"
+  loop_control:
+    loop_var: _rw_tpl_item
+    label: "{{ _rw_tpl_item.key }}"
