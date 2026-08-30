@@ -169,7 +169,11 @@
             "0": { statsUserOnline: false }
         inbounds: "{{ _rw_bootstrap_inbounds }}"
         outbounds:
-          - { protocol: "freedom", tag: "DIRECT" }
+          # UseIPv4v6: keep the v4-first dial for dual-stack destinations but
+          # fall back to IPv6 for AAAA-only ones — the default AsIs cannot dial
+          # v6-only sites at all ("IPv6 doesn't work" through the tunnel even
+          # on a dual-stack node).
+          - { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: "UseIPv4v6" } }
           - { protocol: "blackhole", tag: "BLOCK" }
     status_code: [200, 201, 409]
     return_content: yes
