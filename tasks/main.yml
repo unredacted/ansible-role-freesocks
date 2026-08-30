@@ -1310,7 +1310,9 @@
           - remnawave_panel_api_token is defined and remnawave_panel_api_token | length > 0
         fail_msg: >-
           Bootstrap requires remnawave_panel_url and remnawave_panel_api_token (a
-          panel API token with config-profile, internal-squad, and system-tools scopes).
+          panel API token with config-profile, internal-squad, and system-tools scopes;
+          add the subscription-templates scope too if the role should own the
+          subscription templates — without it that step warns and skips).
       no_log: true
 
     # Relay has NO per-node placement path — deploy asserts relay is incompatible

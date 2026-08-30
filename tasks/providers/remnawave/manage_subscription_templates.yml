@@ -16,6 +16,13 @@
 # bytes (byte-compared — reformatting the file counts as drift, which is the
 # point: the file is canonical). A templateType the panel doesn't know is
 # reported and skipped, never created — the panel owns the type list.
+#
+# FAIL-SOFT on missing permission: the subscription-template endpoints sit
+# behind their own panel scope, which the least-privilege bootstrap token
+# (config-profile + internal-squad + system-tools) does not carry. A 401/403
+# here must never abort bootstrap on an existing deployment — warn loudly and
+# skip instead. Grant the subscription-templates scope to enable, or set
+# remnawave_managed_subscription_templates: {} to silence the warning.
 
 - name: List the panel subscription templates
   uri:
@@ -24,11 +31,21 @@
     headers:
       Authorization: "Bearer {{ remnawave_panel_api_token }}"
       Accept: "application/json"
-    status_code: [200]
+    status_code: [200, 401, 403]
     return_content: yes
   delegate_to: localhost
   no_log: true
   register: _rw_tpl_list
+
+- name: WARN when the panel token cannot read subscription templates
+  debug:
+    msg: >-
+      Subscription-template reconcile SKIPPED: the panel API token was refused
+      (HTTP {{ _rw_tpl_list.status }}) by /api/subscription-templates. Grant the
+      token the subscription-templates scope to let the role own the templates,
+      or set remnawave_managed_subscription_templates: {} to disable this
+      feature (and this warning). Bootstrap continues either way.
+  when: _rw_tpl_list.status != 200
 
 - name: Normalize the subscription-template list payload
   set_fact:
@@ -37,6 +54,7 @@
          if (_rw_tpl_list.json.response is mapping and 'templates' in _rw_tpl_list.json.response)
          else _rw_tpl_list.json.response }}
   no_log: true
+  when: _rw_tpl_list.status == 200
 
 - name: Reconcile each managed subscription template
   include_tasks: providers/remnawave/reconcile_subscription_template.yml
@@ -44,3 +62,4 @@
   loop_control:
     loop_var: _rw_tpl_item
     label: "{{ _rw_tpl_item.key }}"
+  when: _rw_tpl_list.status == 200

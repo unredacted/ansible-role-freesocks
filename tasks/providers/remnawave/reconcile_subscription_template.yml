@@ -28,14 +28,19 @@
   when: (_rw_tpl_row.uuid | default('')) == ''
 
 # `.json` files are dict-compared as templateJson; anything else is
-# byte-compared as base64 encodedTemplateYaml. The unused shape is set to its
-# empty value (NOT omitted — omit inside set_fact stores a sentinel string).
+# byte-compared as base64 encodedTemplateYaml, read with rstrip=False so the
+# file's EXACT bytes travel (the lookup default strips trailing whitespace,
+# which would corrupt e.g. a YAML literal block with keep chomping). The
+# unused shape is set to its empty value (NOT omitted — omit inside set_fact
+# stores a sentinel string).
 - name: "Load the desired {{ _rw_tpl_item.key }} template from the role file"
   set_fact:
     _rw_tpl_desired_json: >-
-      {{ (lookup('file', _rw_tpl_item.value) | from_json) if (_rw_tpl_is_json | bool) else {} }}
+      {{ (lookup('file', _rw_tpl_item.value, rstrip=False) | from_json)
+         if (_rw_tpl_is_json | bool) else {} }}
     _rw_tpl_desired_yaml_b64: >-
-      {{ '' if (_rw_tpl_is_json | bool) else (lookup('file', _rw_tpl_item.value) | b64encode) }}
+      {{ '' if (_rw_tpl_is_json | bool)
+         else (lookup('file', _rw_tpl_item.value, rstrip=False) | b64encode) }}
   no_log: true
   when: (_rw_tpl_row.uuid | default('')) != ''
 
@@ -82,9 +87,23 @@
       {{ {'uuid': _rw_tpl_row.uuid, 'templateJson': _rw_tpl_desired_json}
          if (_rw_tpl_is_json | bool)
          else {'uuid': _rw_tpl_row.uuid, 'encodedTemplateYaml': _rw_tpl_desired_yaml_b64} }}
-    status_code: [200]
+    # Fail-soft on a write-scope gap (read worked, write refused): warn and
+    # move on rather than abort bootstrap mid-way.
+    status_code: [200, 401, 403]
   delegate_to: localhost
   no_log: true
+  register: _rw_tpl_patch
   when:
     - (_rw_tpl_row.uuid | default('')) != ''
     - _rw_tpl_drifted | bool
+
+- name: "WARN when the {{ _rw_tpl_item.key }} template update was refused"
+  debug:
+    msg: >-
+      Subscription template {{ _rw_tpl_item.key }} is DRIFTED but the update was
+      refused (HTTP {{ _rw_tpl_patch.status }}) — the panel token lacks the
+      subscription-templates write scope. The live template was NOT changed.
+  when:
+    - (_rw_tpl_row.uuid | default('')) != ''
+    - _rw_tpl_drifted | bool
+    - (_rw_tpl_patch.status | default(200)) != 200
