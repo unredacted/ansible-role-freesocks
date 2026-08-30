@@ -51,7 +51,7 @@
           serverNames: "{{ remnawave_bootstrap_reality_server_names }}"
           privateKey: "{{ remnawave_reality_private_key | default('') }}"
           shortIds: "{{ remnawave_bootstrap_reality_short_ids }}"
-      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
   no_log: true
   when: remnawave_bootstrap_reality | default(true) | bool
 
@@ -75,7 +75,7 @@
           serverNames: "{{ remnawave_bootstrap_relay_server_names }}"
           privateKey: "{{ remnawave_relay_private_key | default('') }}"
           shortIds: "{{ remnawave_bootstrap_relay_short_ids }}"
-      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+      sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
   no_log: true
   when: remnawave_bootstrap_relay | default(true) | bool
 
