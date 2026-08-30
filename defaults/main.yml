@@ -792,6 +792,13 @@ remnawave_reconcile_public_listen: false
 # or set {} to leave panel templates unmanaged.
 remnawave_managed_subscription_templates:
   SINGBOX: "subscription-templates/SINGBOX.json"
+  # Clash-family: the stock templates plus `ipv6: true` (+ dns.ipv6 where the
+  # dns block exists) so those clients resolve AAAA and carry v6 through the
+  # tunnel. Preserve the "# LEAVE THIS LINE!" injection anchors byte-exact
+  # when editing these files - the panel splices proxies in at those lines.
+  MIHOMO: "subscription-templates/MIHOMO.yaml"
+  STASH: "subscription-templates/STASH.yaml"
+  CLASH: "subscription-templates/CLASH.yaml"
 
 remnawave_bootstrap_cdn_inbounds:
   - tag: "VLESS_WS_CDN"
