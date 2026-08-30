@@ -39,7 +39,7 @@
   set_fact:
     _rw_reality_inbound:
       tag: "VLESS_REALITY"
-      listen: "0.0.0.0"
+      listen: "{{ remnawave_xray_public_listen }}"
       port: 443
       protocol: "vless"
       settings: { clients: [], decryption: "none" }
@@ -63,7 +63,7 @@
   set_fact:
     _rw_relay_inbound:
       tag: "VLESS_RELAY_REALITY"
-      listen: "0.0.0.0"
+      listen: "{{ remnawave_xray_public_listen }}"
       port: "{{ remnawave_bootstrap_relay_listen_port | int }}"
       protocol: "vless"
       settings: { clients: [], decryption: "none" }
@@ -169,7 +169,11 @@
             "0": { statsUserOnline: false }
         inbounds: "{{ _rw_bootstrap_inbounds }}"
         outbounds:
-          - { protocol: "freedom", tag: "DIRECT" }
+          # UseIPv4v6: keep the v4-first dial for dual-stack destinations but
+          # fall back to IPv6 for AAAA-only ones — the default AsIs cannot dial
+          # v6-only sites at all ("IPv6 doesn't work" through the tunnel even
+          # on a dual-stack node).
+          - { protocol: "freedom", tag: "DIRECT", settings: { domainStrategy: "UseIPv4v6" } }
           - { protocol: "blackhole", tag: "BLOCK" }
     status_code: [200, 201, 409]
     return_content: yes
@@ -230,6 +234,15 @@
 # profile bootstrapped before the routeOnly fix keeps rewriting destinations to
 # the sniffed SNI and Tor stays broken there (the very population the fix
 # targets). The merge preserves every other key on the inbound untouched.
+# Two IPv6 reconciles ride the same PATCH:
+#   - the DIRECT freedom outbound gains domainStrategy UseIPv4v6 when it has
+#     NONE (an operator-set strategy is never clobbered) — without it, AAAA-only
+#     destinations are undialable;
+#   - public inbounds still listening on 0.0.0.0 move to
+#     remnawave_xray_public_listen ONLY when remnawave_reconcile_public_listen
+#     is true (opt-in: a "::" bind fails on a kernel with IPv6 disabled, and a
+#     panel-wide profile cannot be gated per node from here — verify
+#     `sysctl -n net.ipv6.conf.all.disable_ipv6` is 0 fleet-wide first).
 # The corollary still holds: changing dest/serverNames on an EXISTING tag is NOT
 # reconciled — edit it in the panel, or delete the inbound and re-run.
 - name: Resolve the live Config Profile (for missing-inbound reconciliation)
@@ -250,26 +263,50 @@
 # Merge `sniffing.routeOnly: true` into every live inbound that sniffs. Purely
 # additive per inbound: only the sniffing mapping gains a key; clients, stream
 # settings, and REALITY keys pass through byte-identical.
-- name: Merge sniffing routeOnly into the live profile inbounds
+- name: Merge sniffing routeOnly (+ opt-in dual-stack listen) into the live profile inbounds
   set_fact:
     _rw_live_inbounds_reconciled: >-
       {%- set out = [] -%}
       {%- for ib in (_rw_live_profile.config.inbounds | default([])) -%}
+        {%- set ns = namespace(item=ib) -%}
         {%- if (ib.sniffing | default({})).enabled | default(false) -%}
-          {%- set _ = out.append(ib | combine({'sniffing': (ib.sniffing | combine({'routeOnly': true}))})) -%}
+          {%- set ns.item = ns.item | combine({'sniffing': (ib.sniffing | combine({'routeOnly': true}))}) -%}
+        {%- endif -%}
+        {%- if (remnawave_reconcile_public_listen | default(false)) and (ns.item.listen | default('')) == '0.0.0.0' -%}
+          {%- set ns.item = ns.item | combine({'listen': remnawave_xray_public_listen}) -%}
+        {%- endif -%}
+        {%- set _ = out.append(ns.item) -%}
+      {%- endfor -%}
+      {{ out }}
+  no_log: true
+  when: _rw_profile_exists
+
+# The DIRECT freedom outbound: add domainStrategy UseIPv4v6 when it has none
+# (AsIs-by-default cannot dial AAAA-only destinations). An explicit
+# operator-set strategy is preserved as-is.
+- name: Merge freedom domainStrategy into the live profile outbounds
+  set_fact:
+    _rw_live_outbounds_reconciled: >-
+      {%- set out = [] -%}
+      {%- for ob in (_rw_live_profile.config.outbounds | default([])) -%}
+        {%- if (ob.protocol | default('')) == 'freedom' and (ob.settings | default({})).domainStrategy is not defined -%}
+          {%- set _ = out.append(ob | combine({'settings': ((ob.settings | default({})) | combine({'domainStrategy': 'UseIPv4v6'}))})) -%}
         {%- else -%}
-          {%- set _ = out.append(ib) -%}
+          {%- set _ = out.append(ob) -%}
         {%- endif -%}
       {%- endfor -%}
       {{ out }}
   no_log: true
   when: _rw_profile_exists
 
-- name: Determine whether the sniffing merge changes anything
+- name: Determine whether the live-profile merges change anything
   set_fact:
     _rw_sniffing_changed: >-
       {{ _rw_profile_exists
          and (_rw_live_inbounds_reconciled | default([])) != (_rw_live_profile.config.inbounds | default([])) }}
+    _rw_outbounds_changed: >-
+      {{ _rw_profile_exists
+         and (_rw_live_outbounds_reconciled | default([])) != (_rw_live_profile.config.outbounds | default([])) }}
 
 - name: Note what is being reconciled into the existing Config Profile
   debug:
@@ -277,13 +314,14 @@
       Reconciling into the existing Config Profile:
       {{ _rw_missing_inbounds | length }} missing base inbound(s)
       ({{ _rw_missing_inbounds | map(attribute='tag') | list | join(', ') | default('none', true) }});
-      sniffing routeOnly merge {{ 'CHANGES live inbounds' if (_rw_sniffing_changed | default(false)) else 'already in place' }}.
+      sniffing/listen merge {{ 'CHANGES live inbounds' if (_rw_sniffing_changed | default(false)) else 'already in place' }};
+      freedom domainStrategy merge {{ 'CHANGES live outbounds' if (_rw_outbounds_changed | default(false)) else 'already in place' }}.
   when:
     - _rw_profile_exists
     - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
-    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false))
+    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false)) or (_rw_outbounds_changed | default(false))
 
-- name: Reconcile the existing Config Profile (sniffing routeOnly + missing base inbounds)
+- name: Reconcile the existing Config Profile (sniffing/listen/outbound merges + missing base inbounds)
   uri:
     url: "{{ remnawave_panel_url }}/api/config-profiles"
     method: PATCH
@@ -294,7 +332,10 @@
     body_format: json
     body:
       uuid: "{{ remnawave_panel_config_profile_uuid }}"
-      config: "{{ _rw_live_profile.config | combine({'inbounds': (_rw_live_inbounds_reconciled | default(_rw_live_profile.config.inbounds | default([]))) + _rw_missing_inbounds}) }}"
+      config: >-
+        {{ _rw_live_profile.config
+           | combine({'inbounds': (_rw_live_inbounds_reconciled | default(_rw_live_profile.config.inbounds | default([]))) + _rw_missing_inbounds})
+           | combine({'outbounds': (_rw_live_outbounds_reconciled | default(_rw_live_profile.config.outbounds | default([])))}) }}
     status_code: [200]
   delegate_to: localhost
   no_log: true
@@ -307,7 +348,7 @@
     # the case that needs populating. `| default([])` in the combine below already
     # handles a missing key, and gating on it made bootstrap fail the read-back
     # assertions instead of filling the profile in.
-    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false))
+    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false)) or (_rw_outbounds_changed | default(false))
 
 - name: List Config Profile inbounds (read back the created UUIDs)
   uri:
