@@ -3,7 +3,11 @@
 # NOT for production — a throwaway panel the integration playbook drives the
 # role's bootstrap + per-node placement tasks against, so a panel contract
 # drift (endpoint path / DTO shape / version bump) fails CI instead of a
-# production node deploy. Pinned to the same Remnawave release the fleet runs.
+# production node deploy. Pinned to the same Remnawave release the fleet runs
+# (3.4.3 since 2026-09-03; Remnawave 3.0 dropped the user uuid — users are
+# addressed by a numeric id — and 2.8.1+ requires APP_SECRET, see panel.env).
+# Keep this on the node image's major line (defaults/main.yml
+# remnawave_node_image): the real-deploy CI phase pairs the two.
 #
 # Fresh state every `up` (no persistent DB volume) so bootstrap_panel.py can
 # always register the first admin. Mirrors FCP's docker-compose.remnawave-test.yml.
@@ -14,7 +18,7 @@ name: role-rw-test
 
 services:
   rw-test-backend:
-    image: remnawave/backend:2.8.0
+    image: remnawave/backend:3.4.3
     container_name: role-rw-test-backend
     hostname: rw-test-backend
     restart: 'no'
@@ -59,7 +63,7 @@ services:
         condition: service_started
 
   rw-test-db:
-    image: postgres:18.4
+    image: postgres:18.6
     container_name: role-rw-test-db
     hostname: rw-test-db
     shm_size: 512mb
