@@ -250,7 +250,8 @@ Deploys a `remnawave/node` Xray-core container managed by an external panel; all
 remnawave_enabled: true
 outline_enabled: false                      # mutually exclusive
 
-remnawave_node_image: "remnawave/node:2.7.0"
+remnawave_node_image: "remnawave/node:3.4.1"   # keep on the panel's major line
+remnawave_node_nftables_logging: false       # node 3.x: no nftables kernel log lines (client IPs)
 remnawave_node_port: 2222                    # Panel ↔ Node API port
 remnawave_node_install_dir: "/opt/remnanode"
 remnawave_log_dir: "/var/log/remnanode"
@@ -585,7 +586,7 @@ ansible-playbook playbook.yml \
 ansible-playbook playbook.yml --ask-vault-pass \
   --extra-vars "operation_mode=update environment_mode=prod" \
   --extra-vars "outline_enabled=false remnawave_enabled=true remnawave_panel_url=https://panel.example.com" \
-  --extra-vars "remnawave_node_image=remnawave/node:2.7.1 force_reinstall_remnawave=true"
+  --extra-vars "remnawave_node_image=remnawave/node:3.4.1 force_reinstall_remnawave=true"
 ```
 
 **What each mode does:**

@@ -30,5 +30,8 @@ services:
     environment:
       - NODE_PORT={{ remnawave_node_port }}
       - SECRET_KEY={{ remnawave_panel_secret_key }}
+      # No-log posture: never emit nftables kernel log lines (client IPs) from
+      # the node's plugin firewall table (node 3.x defaults this to true).
+      - NFTABLES_LOGGING={{ 'true' if remnawave_node_nftables_logging | bool else 'false' }}
     volumes:
       - {{ remnawave_log_dir }}:/var/log/remnanode
