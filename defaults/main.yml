@@ -265,8 +265,16 @@ remnawave_enabled: false
 
 # Image and runtime
 # Pin to a specific tag for reproducible deploys; override via --extra-vars
-# remnawave_node_image=remnawave/node:2.7.0 or similar.
-remnawave_node_image: "remnawave/node:2.7.0"
+# remnawave_node_image=remnawave/node:3.4.1 or similar. Keep the node on the
+# same major line as the panel (3.x since 2026-09; the 2.x node still speaks to
+# a 3.x panel, but only 3.x carries current Xray-core and security fixes).
+remnawave_node_image: "remnawave/node:3.4.1"
+# Node 3.x builds an nftables table for its connection-drop/filter plugins
+# (the container has NET_ADMIN) and, by default, attaches kernel `log`
+# statements to those rules — a matched drop would write the client IP to the
+# host journal. FreeSocks uses none of those plugins, so no rule ever matches,
+# but the no-log posture is stated explicitly rather than left incidental.
+remnawave_node_nftables_logging: false
 remnawave_node_port: 2222 # Panel → Node API
 remnawave_xtls_api_port: 61000 # Internal Xray API (container-local; reserved, currently unused)
 remnawave_node_install_dir: "/opt/remnanode"
