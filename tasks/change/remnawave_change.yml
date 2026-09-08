@@ -153,6 +153,13 @@
          else (((_change_relay_text | regex_search('^fingerprint=.+', multiline=true) | default('', true))
                 | regex_replace('^fingerprint=', '')) | default('chrome', true)) }}
 
+# Derived in its own task: a set_fact cannot read a key it defines in the same
+# task under 2.19. A relay node publishes no record of its own by default; every
+# DNS task for the NEW name below is gated on this.
+- name: Derive whether this rotation publishes the node's own DNS record
+  set_fact:
+    _change_relay_skip_dns: "{{ (_change_relay_effective | bool) and (remnawave_relay_skip_dns | default(true) | bool) }}"
+
 # Mirror migrate's "caller flag OR detected on disk" derivation. Without this, a
 # rotation that omits remnawave_panel_register_node skips Host create, cleanup AND
 # the panel address update on a node that WAS registered at deploy — while still
@@ -301,7 +308,26 @@
     - _change_relay_effective | bool
     - >-
       ((remnawave_relay_inbound_uuid | default('')) | length == 0)
-      or ((remnawave_relay_sni | default('')) | length == 0)
+      or (((remnawave_relay_snis | default([])) | length == 0)
+          and ((remnawave_relay_sni | default('')) | length == 0))
+
+# Same rule as deploy: with remnawave_relay_skip_dns the NEW name is never
+# published, so the panel must not be re-pointed at it. Only the registered path
+# PATCHes the panel, and only a name-based address is affected.
+- name: Validate the panel node address is not an unpublished FQDN (rotation, skip_dns)
+  fail:
+    msg: |
+      remnawave_relay_skip_dns=true: no DNS record will be created for the new
+      name {{ dns_hostname }}, yet the panel would be re-pointed at it as the node
+      address (remnawave_node_address_interface empty, remnawave_node_address
+      empty or equal to the new dns_hostname). Set
+      remnawave_node_address_interface (e.g. tailscale0) or a resolvable
+      remnawave_node_address, or pass -e remnawave_relay_skip_dns=false.
+  when:
+    - _change_relay_skip_dns | default(false) | bool
+    - _change_register_node_effective | bool
+    - (remnawave_node_address_interface | default('')) | length == 0
+    - (remnawave_node_address | default('', true)) in ['', dns_hostname]
 
 # The anti-leak invariant, enforced in this mode's pre-flight too. Rotation lets a
 # caller override the persisted endpoint (-e remnawave_relay_address=...), so the
@@ -454,7 +480,9 @@
   delegate_to: localhost
   no_log: true  # carries the Cloudflare API token in the Authorization header
   register: existing_dns_records
-  when: effective_dns_provider == 'cloudflare'
+  when:
+    - effective_dns_provider == 'cloudflare'
+    - not (_change_relay_skip_dns | default(false) | bool)
 
 - name: Delete existing DNS records for new hostname (Cloudflare)
   uri:
@@ -469,11 +497,15 @@
   loop: "{{ existing_dns_records.json.result | default([]) }}"
   when:
     - effective_dns_provider == 'cloudflare'
+    - not (_change_relay_skip_dns | default(false) | bool)
     - existing_dns_records.json.result | default([]) | length > 0
 
 - name: Include DNS tasks (Cloudflare)
   include_tasks: ../providers/cloudflare/dns.yml
-  when: effective_dns_provider == 'cloudflare'
+  when:
+    - effective_dns_provider == 'cloudflare'
+    # A relay node publishes no record of its own (remnawave_relay_skip_dns).
+    - not (_change_relay_skip_dns | default(false) | bool)
 
 # ============================================================================
 # STEP 4: Update local hostname file + Caddyfile

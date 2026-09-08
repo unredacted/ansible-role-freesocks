@@ -38,6 +38,20 @@
     migrate_component: "{{ hostvars[source_hostname].migrate_component }}"
   when: inventory_hostname == destination_hostname
 
+# Run on the source, delegated to the destination, so a failed probe removes
+# the source from the play before it can transfer files or stop its container.
+- name: Check destination listener support before Remnawave migration
+  block:
+    - name: Probe destination Remnawave listener
+      include_tasks:
+        file: setup/remnawave_ipv6.yml
+        apply:
+          delegate_to: "{{ destination_hostname }}"
+  any_errors_fatal: true
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+
 # Remnawave capability detection on the SOURCE — the parity block below
 # re-creates Caddy/Hosts based on what the source actually runs, so a Remnawave
 # migrate does not silently lose Caddy/Hosts when the caller forgets to re-pass
@@ -307,6 +321,15 @@
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
 
+# Derived separately: a set_fact cannot read a key it defines in the same task
+# (2.19). A relay destination publishes no record of its own by default.
+- name: Resolve whether the destination publishes its own DNS record
+  set_fact:
+    _migrate_relay_skip_dns_effective: "{{ (_migrate_relay_effective | bool) and (remnawave_relay_skip_dns | default(true) | bool) }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
 # Both of these fail EARLY so the create/cleanup asymmetry later can never bite:
 # cleanup_hosts.yml is gated only on the *_effective flags, while the create
 # includes carry extra uuid gates. A missing uuid used to SKIP the create while
@@ -367,6 +390,26 @@
     - migrate_component == 'remnawave'
     - _migrate_register_node_effective | bool
 
+# With remnawave_relay_skip_dns the destination name is never published, so the
+# panel must not be re-pointed at it — and update_node runs AFTER the transfer, so
+# this has to be refused here with the other pre-flights.
+- name: Validate the panel node address is not an unpublished FQDN (migration, skip_dns)
+  fail:
+    msg: |
+      remnawave_relay_skip_dns=true: no DNS record will be created for
+      {{ dns_hostname }} on the destination, yet the panel would be re-pointed at
+      that name (remnawave_node_address_interface empty, remnawave_node_address
+      empty or equal to dns_hostname). Set remnawave_node_address_interface
+      (e.g. tailscale0) or a resolvable remnawave_node_address, or pass
+      -e remnawave_relay_skip_dns=false.
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+    - _migrate_relay_skip_dns_effective | default(false) | bool
+    - _migrate_register_node_effective | bool
+    - (remnawave_node_address_interface | default('')) | length == 0
+    - (remnawave_node_address | default('', true)) in ['', dns_hostname]
+
 - name: Validate the Reality inbound UUID is available before touching Hosts
   fail:
     msg: |
@@ -397,7 +440,8 @@
     - _migrate_relay_effective | bool
     - >-
       ((remnawave_relay_inbound_uuid | default('')) | length == 0)
-      or ((remnawave_relay_sni | default('')) | length == 0)
+      or (((remnawave_relay_snis | default([])) | length == 0)
+          and ((remnawave_relay_sni | default('')) | length == 0))
 
 - name: Validate the relay endpoint is known before migrating
   fail:
@@ -528,6 +572,8 @@
   when:
     - inventory_hostname == destination_hostname
     - effective_dns_provider | default('') == 'cloudflare'
+    # A relay destination publishes no record of its own (remnawave_relay_skip_dns).
+    - not (_migrate_relay_skip_dns_effective | default(false) | bool)
 
 # ============================================================================
 # Fastly re-point on the destination (Outline only)

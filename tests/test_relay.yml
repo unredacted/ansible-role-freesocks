@@ -57,6 +57,20 @@
 #   (d) the change/migrate repoint gates. Rotating or moving a relay node changes
 #       the ORIGIN the manual proxy dials, and only a human can update the proxy
 #       console — so the gates decide when the role refuses to proceed.
+#   (y) a skip-DNS relay node may deploy WITHOUT deploy_target_domain: the
+#       _deploy_domainless predicate, the bare-vs-domained dns_hostname derivation,
+#       and STRUCTURALLY that every deploy-mode domain assert and the provider
+#       set_fact carry the domainless gate (one ungated assert = the option is dead).
+#   (x) one relay Host PER SNI (remnawave_relay_snis): the remark derivation (bare
+#       for one, sha256[:6]-suffixed for several — every remark must match the
+#       cleanup skeleton), the stale-set selection that makes 1->N and N->1
+#       converge without touching another node's Hosts, and the fallback to the
+#       single remnawave_relay_sni.
+#   (w) a relay node publishes NO DNS record of its own (remnawave_relay_skip_dns,
+#       default on): STRUCTURAL — every task that would write the node's A/AAAA
+#       record in deploy, change and migrate is gated on the skip fact — plus the
+#       truth table of the guard that refuses to hand the panel the unpublished
+#       FQDN as the node address.
 #
 # The label list is loaded from defaults/main.yml rather than restated, so the
 # task and this test cannot disagree about which transports get torn down. The
@@ -826,6 +840,7 @@
         _gates_at: >-
           {{ [_mig.find('Fail on contradictory effective transports for the destination'),
               _mig.find('Validate the panel token is available for the registered path'),
+              _mig.find('Validate the panel node address is not an unpublished FQDN (migration, skip_dns)'),
               _mig.find('Validate the relay endpoint is known before migrating'),
               _mig.find('Assert the relay edge is not one of the destination'),
               _mig.find('Require acknowledgement that the relay proxy will be re-pointed')] }}
@@ -882,6 +897,7 @@
           {{ [_chg.find('Validate the panel token is available for the registered path (rotation)'),
               _chg.find('Validate relay is not combined with Caddy, direct Reality or Fastly (rotation)'),
               _chg.find('Validate the relay endpoint is known before rotating'),
+              _chg.find('Validate the panel node address is not an unpublished FQDN (rotation, skip_dns)'),
               _chg.find("Assert the relay edge is not one of this node's own addresses (rotation)"),
               _chg.find('Require acknowledgement before deleting the old DNS name of a relay node')] }}
         _cm: >-
@@ -1088,6 +1104,7 @@
     - name: Read the three Host-creation task files
       set_fact:
         _f_relay: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_relay_host.yml') }}"
+        _f_relay_one: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_relay_host_one.yml') }}"
         _f_real: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_reality_host.yml') }}"
         _f_ws: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_hosts.yml') }}"
 
@@ -1098,8 +1115,12 @@
     # worse than none, because it reads as coverage.
     - name: Assert each file fetches existing Hosts before deciding what to create
       vars:
+        # relay is split: the DRIVER fetches once and then includes the per-SNI file,
+        # whose decision (_relay_existing) must read the driver's list, never re-GET.
         _relay_get: "{{ _f_relay.find('register: remnawave_relay_hosts_list') }}"
-        _relay_dec: "{{ _f_relay.find('_relay_existing') }}"
+        _relay_dec: "{{ _f_relay.find('include_tasks: providers/remnawave/create_relay_host_one.yml') }}"
+        _relay_one_dec: "{{ _f_relay_one.find('_relay_existing') }}"
+        _relay_one_get: "{{ _f_relay_one.find('register: remnawave_relay_hosts_list') }}"
         _real_get: "{{ _f_real.find('register: remnawave_reality_hosts_list') }}"
         _real_dec: "{{ _f_real.find('not in (_remnawave_hosts') }}"
         _ws_get: "{{ _f_ws.find('register: remnawave_hosts_list') }}"
@@ -1107,6 +1128,7 @@
       assert:
         that:
           - (_relay_get | int) > 0 and (_relay_dec | int) > 0 and (_relay_get | int) < (_relay_dec | int)
+          - (_relay_one_dec | int) > 0 and (_relay_one_get | int) == -1
           - (_real_get | int) > 0 and (_real_dec | int) > 0 and (_real_get | int) < (_real_dec | int)
           - (_ws_get | int) > 0 and (_ws_dec | int) > 0 and (_ws_get | int) < (_ws_dec | int)
         fail_msg: >-
@@ -1324,6 +1346,256 @@
       vars:
         _u_cases_ref: *u_cases
 
+    # --- (y) domainless relay deploy --------------------------------------------
+    # Mirrors tasks/main.yml. Only a relay node that publishes no record may omit
+    # the domain; every other combination keeps the hard requirement.
+    - name: Evaluate the domainless predicate
+      set_fact:
+        _y_domainless: >-
+          {{ (item.mode == 'deploy') and (item.relay | bool) and (item.skip | bool)
+             and ((item.domain | default('')) | length == 0) }}
+      loop: &y_cases
+        - { name: "relay, skip, no domain -> domainless",   mode: deploy, relay: true,  skip: true,  domain: "",            want: true  }
+        - { name: "relay, skip, domain given -> domained",  mode: deploy, relay: true,  skip: true,  domain: "example.test", want: false }
+        - { name: "relay, skip OFF, no domain -> required", mode: deploy, relay: true,  skip: false, domain: "",            want: false }
+        - { name: "not relay, no domain -> required",       mode: deploy, relay: false, skip: true,  domain: "",            want: false }
+        - { name: "change mode never",                      mode: change, relay: true,  skip: true,  domain: "",            want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _ys
+
+    - name: Assert the predicate fires only for a skip-DNS relay with no domain
+      assert:
+        that:
+          - (item.0.ansible_facts._y_domainless | bool) == (item.1.want | bool)
+        fail_msg: "{{ item.1.name }}: got {{ item.0.ansible_facts._y_domainless }}, want {{ item.1.want }}"
+        success_msg: "{{ item.1.name }}"
+      loop: "{{ _ys.results | zip(_y_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _y_cases_ref: *y_cases
+
+    - name: Derive dns_hostname with and without a domain
+      set_fact:
+        _y_bare: "{{ 'quiet-falcon' ~ (('.' ~ '') if (('' | length) > 0) else '') }}"
+        _y_domained: "{{ 'quiet-falcon' ~ (('.' ~ 'example.test') if (('example.test' | length) > 0) else '') }}"
+
+    - name: Assert a domainless node gets a BARE name (no trailing dot)
+      assert:
+        that:
+          - _y_bare == 'quiet-falcon'
+          - _y_domained == 'quiet-falcon.example.test'
+          - (_y_bare.split('.')[1:] | join('.')) == ''
+        fail_msg: "bare={{ _y_bare }} domained={{ _y_domained }}"
+        success_msg: "(y) bare hostname has no trailing dot; a later split yields an empty base_domain."
+
+    # Structural: each deploy-mode domain assert and the provider set_fact must carry
+    # the gate. An ungated one fails a domainless deploy at validation, which is the
+    # failure mode this option exists to remove.
+    - name: Slice every deploy-mode task that must carry the domainless gate
+      set_fact:
+        _y_segments: >-
+          {{ (_y_segments | default([])) + [{
+               'task': item,
+               'start': _mainy.find('- name: ' ~ item),
+               'body': _mainy[_mainy.find('- name: ' ~ item) : _mainy.find('- name:', _mainy.find('- name: ' ~ item) + 8)] }] }}
+      loop:
+        - 'Fail if deploy_target_domain is not provided (Deploy Mode)'
+        - 'Fail if domain_providers is not configured (Deploy Mode)'
+        - 'Fail if target domain not found in domain_providers (Deploy Mode)'
+        - 'Fail if the deploy target domain lacks dns_provider/zone_id'
+        - 'Set provider configuration for deploy target domain'
+        - 'Set provider configuration for a domainless relay deploy'
+
+    - name: Assert each of those tasks is gated on _deploy_domainless
+      assert:
+        that:
+          - (item.start | int) > 0
+          - "'_deploy_domainless' in item.body"
+        fail_msg: >-
+          tasks/main.yml :: '{{ item.task }}' (at {{ item.start }}) is not gated on
+          _deploy_domainless — a domainless relay deploy would fail here. -1 means the
+          task was renamed and this guard went blind.
+        success_msg: "(y) '{{ item.task }}' carries the domainless gate."
+      loop: "{{ _y_segments }}"
+      loop_control:
+        label: "{{ item.task }}"
+
+    # --- (x) one relay Host per SNI ---------------------------------------------
+    # Mirrors create_relay_host.yml: the SNI set (list, else the single var), the
+    # index-aligned remarks, and the stale selection. The remark rule must agree with
+    # cleanup_hosts.yml's skeleton `^<host>-(...|relay)(-[0-9a-f]{6})?$` or rotation
+    # and wipe would orphan suffixed relay Hosts exactly the way they once orphaned
+    # every relay Host.
+    - name: Resolve the SNI set and remarks for each case
+      set_fact:
+        _x_snis: >-
+          {{ (item.snis | default([]) | select('string') | reject('equalto', '') | list)
+             if ((item.snis | default([])) | length > 0)
+             else ([item.sni] if ((item.sni | default('')) | length > 0) else []) }}
+      loop: &x_cases
+        - { name: "single sni via the list",      snis: ["a.example"],                          sni: "",          want_n: 1, want_bare: true  }
+        - { name: "three snis",                   snis: ["a.example", "b.example", "c.example"], sni: "",          want_n: 3, want_bare: false }
+        - { name: "list empty -> single var",     snis: [],                                     sni: "a.example", want_n: 1, want_bare: true  }
+        - { name: "list wins over the single var", snis: ["b.example", "c.example"],            sni: "a.example", want_n: 2, want_bare: false }
+        - { name: "blank entries dropped",        snis: ["a.example", ""],                      sni: "",          want_n: 1, want_bare: true  }
+        - { name: "nothing set -> empty (assert fires)", snis: [],                              sni: "",          want_n: 0, want_bare: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _xs
+
+    - name: Derive remarks per case (host quiet-falcon)
+      set_fact:
+        _x_remarks: >-
+          {{ (_x_remarks | default([])) + [ (['quiet-falcon-relay'] if (item.ansible_facts._x_snis | length == 1)
+               else (item.ansible_facts._x_snis | map('hash', 'sha256') | map('truncate', 6, true, '')
+                     | map('regex_replace', '^', 'quiet-falcon-relay-') | list)) if (item.ansible_facts._x_snis | length > 0) else [] ] }}
+      loop: "{{ _xs.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Assert the SNI set and remark shape per case
+      assert:
+        that:
+          - (item.0.ansible_facts._x_snis | length) == item.1.want_n
+          - (item.2 | length) == item.1.want_n
+          - (item.2 | unique | length) == item.1.want_n
+          - (('quiet-falcon-relay' in item.2) | bool) == (item.1.want_bare | bool)
+          - item.2 | reject('match', '^quiet-falcon-(ws|reality|relay)(-[0-9a-f]{6})?$') | list | length == 0
+        fail_msg: >-
+          {{ item.1.name }}: snis={{ item.0.ansible_facts._x_snis }} remarks={{ item.2 }}
+          (want {{ item.1.want_n }} entries, bare={{ item.1.want_bare }}, every remark
+          matching the cleanup skeleton).
+        success_msg: "{{ item.1.name }} -> {{ item.2 }}"
+      loop: "{{ _xs.results | zip(_x_cases_ref, _x_remarks) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _x_cases_ref: *x_cases
+
+    # Suffix is per-SNI, so a reordered list keeps every remark: pin that, and that
+    # the suffix is what create_hosts.yml would compute for the same string.
+    - name: Assert the suffix is per-SNI and order-independent
+      assert:
+        that:
+          - (['b.example', 'a.example'] | map('hash', 'sha256') | map('truncate', 6, true, '') | map('regex_replace', '^', 'h-relay-') | sort | list)
+            == (['a.example', 'b.example'] | map('hash', 'sha256') | map('truncate', 6, true, '') | map('regex_replace', '^', 'h-relay-') | sort | list)
+          - ('a.example' | hash('sha256') | truncate(6, true, '')) == ('a.example' | hash('sha256'))[:6]
+        success_msg: "(x) remark suffix is sha256(sni)[:6], independent of list order."
+
+    # Stale selection: this node's relay Hosts not in the desired set, and ONLY this
+    # node's — the anchored, escaped hostname keeps quiet-falcon-2's Hosts out.
+    - name: Select stale relay Hosts for the 1->3 and 3->1 transitions
+      set_fact:
+        _x_stale_up: >-
+          {{ _x_hosts | selectattr('remark', 'match', '^' ~ ('quiet-falcon' | regex_escape) ~ '-relay(-[0-9a-f]{6})?$')
+             | rejectattr('remark', 'in', _x_three) | map(attribute='remark') | list }}
+        _x_stale_down: >-
+          {{ _x_hosts | selectattr('remark', 'match', '^' ~ ('quiet-falcon' | regex_escape) ~ '-relay(-[0-9a-f]{6})?$')
+             | rejectattr('remark', 'in', ['quiet-falcon-relay']) | map(attribute='remark') | list }}
+      vars:
+        _x_three: "{{ ['a.example', 'b.example', 'c.example'] | map('hash', 'sha256') | map('truncate', 6, true, '') | map('regex_replace', '^', 'quiet-falcon-relay-') | list }}"
+        _x_hosts:
+          - { uuid: "u1", remark: "quiet-falcon-relay" }                                                     # bare: stale after 1->3
+          - { uuid: "u2", remark: "quiet-falcon-relay-{{ 'a.example' | hash('sha256') | truncate(6, true, '') }}" }
+          - { uuid: "u3", remark: "quiet-falcon-relay-deadbe" }                                              # an SNI no longer in the list
+          - { uuid: "u4", remark: "quiet-falcon-reality" }                                                   # other transport: never
+          - { uuid: "u5", remark: "quiet-falcon-2-relay" }                                                   # other node: never
+          - { uuid: "u6", remark: "quiet-falcon-2-relay-{{ 'a.example' | hash('sha256') | truncate(6, true, '') }}" }
+
+    - name: Assert stale selection retires exactly the right Hosts
+      assert:
+        that:
+          - _x_stale_up | sort == ['quiet-falcon-relay', 'quiet-falcon-relay-deadbe'] | sort
+          - _x_stale_down | sort == ['quiet-falcon-relay-' ~ ('a.example' | hash('sha256') | truncate(6, true, '')), 'quiet-falcon-relay-deadbe'] | sort
+        fail_msg: "stale up={{ _x_stale_up }} down={{ _x_stale_down }}"
+        success_msg: "(x) 1->3 retires the bare + unknown-suffix Hosts; 3->1 retires the suffixed ones; other nodes/transports untouched."
+
+    # --- (w) a relay node publishes NO DNS record of its own -------------------
+    # The A record has no consumer on a relay node (clients dial the edge, the proxy
+    # dials the node by IP, the panel dials it over the overlay); all it does is tie
+    # the hidden node IP to a FreeSocks domain in passive DNS. Structural: every
+    # task that would write that record is gated on the skip fact — a new DNS task
+    # added without the gate would silently re-publish the node.
+    - name: Read defaults/main.yml
+      set_fact:
+        _w_defaults: "{{ lookup('file', playbook_dir ~ '/../defaults/main.yml') }}"
+
+    - name: Assert the skip is the shipped default
+      assert:
+        that:
+          - "'remnawave_relay_skip_dns: true' in _w_defaults"
+        fail_msg: "remnawave_relay_skip_dns must default to true — a relay node must not publish its own address."
+        success_msg: "(w) remnawave_relay_skip_dns defaults on."
+
+    - name: Slice every task that would publish the node's own record
+      set_fact:
+        _w_segments: >-
+          {{ (_w_segments | default([])) + [{
+               'file': item.file, 'task': item.task, 'needle': item.needle,
+               'start': item.text.find('- name: ' ~ item.task),
+               'body': item.text[item.text.find('- name: ' ~ item.task)
+                                 : item.text.find('- name:', item.text.find('- name: ' ~ item.task) + 8)] }] }}
+      loop:
+        - { file: 'tasks/main.yml',                   needle: 'remnawave_relay_skip_dns',          task: 'Include DNS tasks (Cloudflare)',                          text: "{{ _mainy }}" }
+        - { file: 'tasks/change/remnawave_change.yml', needle: '_change_relay_skip_dns',            task: 'Get existing DNS records for new hostname (Cloudflare)',   text: "{{ _chg }}" }
+        - { file: 'tasks/change/remnawave_change.yml', needle: '_change_relay_skip_dns',            task: 'Delete existing DNS records for new hostname (Cloudflare)', text: "{{ _chg }}" }
+        - { file: 'tasks/change/remnawave_change.yml', needle: '_change_relay_skip_dns',            task: 'Include DNS tasks (Cloudflare)',                          text: "{{ _chg }}" }
+        - { file: 'tasks/migrate/migrate.yml',         needle: '_migrate_relay_skip_dns_effective', task: 'Include DNS record management tasks (Cloudflare)',        text: "{{ _mig }}" }
+      loop_control:
+        label: "{{ item.file }} :: {{ item.task }}"
+
+    - name: Assert each of those tasks is gated on the skip fact
+      assert:
+        that:
+          - (item.start | int) > 0
+          - item.needle in item.body
+        fail_msg: >-
+          {{ item.file }} :: '{{ item.task }}' (at {{ item.start }}) is not gated on
+          {{ item.needle }} — a relay node would publish its own A/AAAA record. -1
+          means the task was renamed and this guard went blind.
+        success_msg: "(w) {{ item.file }} :: {{ item.task }} is gated on {{ item.needle }}."
+      loop: "{{ _w_segments }}"
+      loop_control:
+        label: "{{ item.file }} :: {{ item.task }}"
+
+    # The three modes also refuse to hand the panel the unpublished FQDN as the node
+    # address. The predicate is the same in all three (deploy keys on the raw flags,
+    # change/migrate on their *_effective facts); this pins its truth table.
+    - name: Evaluate the unpublished-FQDN guard
+      set_fact:
+        _w_fires: >-
+          {{ (item.relay | bool) and (item.skip | bool) and (item.reg | bool)
+             and ((item.iface | default('')) | length == 0)
+             and ((item.addr | default('', true)) in ['', item.fqdn]) }}
+      loop: &w_cases
+        - { name: "relay, skip, registered, default (name-based) address", relay: true,  skip: true,  reg: true,  iface: "",           addr: "",          fqdn: "n.example", want: true  }
+        - { name: "explicit address equal to the FQDN",                    relay: true,  skip: true,  reg: true,  iface: "",           addr: "n.example", fqdn: "n.example", want: true  }
+        - { name: "interface set (overlay IP wins)",                       relay: true,  skip: true,  reg: true,  iface: "tailscale0", addr: "",          fqdn: "n.example", want: false }
+        - { name: "resolvable overlay name",                               relay: true,  skip: true,  reg: true,  iface: "",           addr: "node1",     fqdn: "n.example", want: false }
+        - { name: "skip off (record IS published)",                        relay: true,  skip: false, reg: true,  iface: "",           addr: "",          fqdn: "n.example", want: false }
+        - { name: "not registered (panel never called)",                   relay: true,  skip: true,  reg: false, iface: "",           addr: "",          fqdn: "n.example", want: false }
+        - { name: "not a relay node",                                      relay: false, skip: true,  reg: true,  iface: "",           addr: "",          fqdn: "n.example", want: false }
+      loop_control:
+        label: "{{ item.name }}"
+      register: _ws
+
+    - name: Assert the guard fires exactly when the panel would get an unpublished name
+      assert:
+        that:
+          - (item.0.ansible_facts._w_fires | bool) == (item.1.want | bool)
+        fail_msg: >-
+          {{ item.1.name }}: fires={{ item.0.ansible_facts._w_fires }}, expected
+          {{ item.1.want }}. Missing it registers a node the panel can never reach;
+          firing on an overlay address blocks a correct deploy.
+        success_msg: "{{ item.1.name }} -> {{ 'REFUSED' if item.1.want else 'allowed' }}"
+      loop: "{{ _ws.results | zip(_w_cases_ref) | list }}"
+      loop_control:
+        label: "{{ item.1.name }}"
+      vars:
+        _w_cases_ref: *w_cases
+
     - name: Summary
       debug:
         msg: >-
@@ -1332,4 +1604,5 @@
           relay-only inbound activation, the same-name cleanup guard, the
           choke-point anti-leak invariant, and reconcile-on-empty-profile all
           verified — plus the IP-aware anti-leak check, endpoint-drift replacement,
-          and migrate's contradictory-transport refusal.
+          migrate's contradictory-transport refusal, the no-own-DNS-record rule,
+          one-Host-per-SNI remark/stale derivation, and the domainless relay deploy.

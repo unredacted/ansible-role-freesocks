@@ -1,5 +1,16 @@
 # tasks/main.yml - Main task file that includes other task files
 
+- name: Reject removed Slipstream deployment options
+  assert:
+    that:
+      - not (slipstream_enabled | default(false) | bool)
+      - not (force_reinstall_slipstream | default(false) | bool)
+      - not (force_rebuild_slipstream | default(false) | bool)
+    fail_msg: >-
+      Slipstream support has been removed. Remove its options from inventory.
+      Existing services and DNS records must be decommissioned separately;
+      this role no longer installs, updates or manages them.
+
 # ============================================================================
 # VALIDATION: Vault Decryption Check
 # ============================================================================
@@ -102,21 +113,40 @@
 # ============================================================================
 # VALIDATION: Deploy Mode (New)
 # ============================================================================
+# A relay node that publishes no DNS record of its own (remnawave_relay_skip_dns)
+# has no use for a domain: nothing dials it by name, its Hosts advertise the edge,
+# and the panel dials an overlay address. So deploy_target_domain is OPTIONAL for
+# exactly that node kind — given, it namespaces the identity as before (still no
+# record); absent, the identity is the bare hostname and every provider-derived
+# fact resolves to 'none', so each DNS/CDN task skips on its own condition.
+# Every other node kind still requires it. Evaluated once, here, so the asserts
+# below and the provider set_facts share one answer.
+- name: Resolve whether this deploy is a domainless relay node
+  set_fact:
+    _deploy_domainless: >-
+      {{ (operation_mode | default('') == 'deploy')
+         and (remnawave_relay_enabled | default(false) | bool)
+         and (remnawave_relay_skip_dns | default(true) | bool)
+         and ((deploy_target_domain | default('')) | length == 0) }}
+
 - name: Fail if deploy_target_domain is not provided (Deploy Mode)
   fail:
     msg: |
       deploy_target_domain is required for deploy mode.
       Please provide the target domain via --extra-vars.
       Example: --extra-vars "deploy_target_domain=example.app"
-  when: 
+      (Only a relay node with remnawave_relay_skip_dns=true may omit it.)
+  when:
     - operation_mode == 'deploy'
+    - not (_deploy_domainless | bool)
     - deploy_target_domain is not defined or deploy_target_domain == ''
 
 - name: Fail if domain_providers is not configured (Deploy Mode)
   fail:
     msg: "domain_providers mapping is required for deploy mode."
-  when: 
+  when:
     - operation_mode == 'deploy'
+    - not (_deploy_domainless | bool)
     - (domain_providers is not defined or domain_providers | length == 0)
 
 - name: Fail if target domain not found in domain_providers (Deploy Mode)
@@ -126,6 +156,7 @@
       Available domains: {{ domain_providers.keys() | list | join(', ') }}
   when:
     - operation_mode == 'deploy'
+    - not (_deploy_domainless | bool)
     - deploy_target_domain not in domain_providers
 
 - name: Fail if the deploy target domain lacks dns_provider/zone_id
@@ -136,6 +167,7 @@
       error.
   when:
     - operation_mode == 'deploy'
+    - not (_deploy_domainless | bool)
     - deploy_target_domain in domain_providers
     - domain_providers[deploy_target_domain].dns_provider is not defined
       or domain_providers[deploy_target_domain].zone_id is not defined
@@ -148,6 +180,7 @@
       'cloudflare' is supported. A typo here would silently skip every DNS task.
   when:
     - operation_mode == 'deploy'
+    - not (_deploy_domainless | bool)
     - deploy_target_domain in domain_providers
     - domain_providers[deploy_target_domain].dns_provider is defined
     - domain_providers[deploy_target_domain].dns_provider != 'cloudflare'
@@ -167,7 +200,25 @@
     api_domain: "{{ deploy_target_domain }}"
     prom_domain: "{{ deploy_target_domain }}"
     cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
-  when: operation_mode == 'deploy'
+  when:
+    - operation_mode == 'deploy'
+    - not (_deploy_domainless | bool)
+
+# Domainless relay: no provider, no zone, no domain. Every DNS/CDN task downstream
+# keys on effective_dns_provider / effective_cdn_provider, so 'none' makes them
+# skip on their own conditions — nothing below has to know about this case.
+- name: Set provider configuration for a domainless relay deploy
+  set_fact:
+    target_domain_config: {}
+    effective_dns_provider: "none"
+    effective_cdn_provider: "none"
+    effective_fastly_domain_mode: "shared"
+    effective_zone_id: ""
+    base_domain: ""
+    api_domain: ""
+    prom_domain: ""
+    cloudflare_zone_id: ""
+  when: _deploy_domainless | default(false) | bool
 
 - name: Validate Fastly configuration (deploy)
   fail:
@@ -302,7 +353,7 @@
 # ============================================================================
 # DEPLOY MODE
 # ============================================================================
-# Component-based deployment: can deploy Outline, slipstream, or both
+# Component-based deployment: can deploy Outline or Remnawave
 - name: Deploy server with selected components
   block:
     # Validate component selection
@@ -310,11 +361,10 @@
       fail:
         msg: |
           No components selected for deployment!
-          Set at least one of: outline_enabled=true, remnawave_enabled=true, slipstream_enabled=true
+          Set at least one of: outline_enabled=true or remnawave_enabled=true
       when:
         - not (outline_enabled | default(true) | bool)
         - not (remnawave_enabled | default(false) | bool)
-        - not (slipstream_enabled | default(false) | bool)
 
     - name: Fail if both outline_enabled and remnawave_enabled are true
       fail:
@@ -325,18 +375,6 @@
         - outline_enabled | default(true) | bool
         - remnawave_enabled | default(false) | bool
 
-    - name: Validate slipstream configuration
-      fail:
-        msg: |
-          Invalid slipstream configuration: slipstream_mode=shadowsocks requires outline_enabled=true.
-          With remnawave_enabled=true, use slipstream_mode=raw (microsocks-backed) instead.
-          Either set outline_enabled=true or use slipstream_mode=raw.
-      when:
-        - slipstream_enabled | default(false) | bool
-        - slipstream_mode | default('shadowsocks') == 'shadowsocks'
-        - not (outline_enabled | default(true) | bool)
-
-    # Reality transport validation (VLESS+Vision+Reality — direct, no Caddy)
     - name: Validate Reality requires Remnawave + node registration
       fail:
         msg: |
@@ -389,12 +427,15 @@
             remnawave_relay_address       the EXTERNAL L4 proxy's edge (FQDN or IP)
                                           that clients dial — NOT this node
             remnawave_relay_sni           a serverName the relay inbound borrows
+                                          (or remnawave_relay_snis, a list of them —
+                                          one Host per entry)
       when:
         - remnawave_relay_enabled | default(false) | bool
         - >-
           (remnawave_relay_inbound_uuid | default('') | length == 0)
           or (remnawave_relay_address | default('') | length == 0)
-          or (remnawave_relay_sni | default('') | length == 0)
+          or (((remnawave_relay_snis | default([])) | length == 0)
+              and (remnawave_relay_sni | default('') | length == 0))
 
     - name: Validate relay, Caddy, direct Reality and Fastly are mutually exclusive
       fail:
@@ -540,9 +581,12 @@
         - random_hostname is not defined
         - custom_hostname is defined
 
+    # A domainless relay node's identity is the bare hostname (no trailing dot,
+    # no empty label) — change/update/migrate split .hostname on '.', so a bare
+    # name yields an empty base_domain there rather than a bogus one.
     - name: Set DNS hostname
       set_fact:
-        dns_hostname: "{{ random_hostname }}.{{ base_domain }}"
+        dns_hostname: "{{ random_hostname ~ (('.' ~ base_domain) if ((base_domain | default('')) | length > 0) else '') }}"
       when: dns_hostname is not defined
 
     - name: Set bare hostname (kv_hostname — legacy name, reused as the default FCP slug)
@@ -559,7 +603,6 @@
           - "Components:"
           - "  - Outline: {{ outline_enabled | default(true) | bool }}"
           - "  - Remnawave: {{ remnawave_enabled | default(false) | bool }}"
-          - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
           - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
 
     # Cannot live in the validation block above: dns_hostname is not derived until
@@ -589,6 +632,8 @@
     #   1. Caddy needs to resolve the hostname for Let's Encrypt certificate issuance
     #   2. API health checks need DNS resolution
     #   3. Fastly backends need to reach the origin server
+    # The ONE exception is a relay node with remnawave_relay_skip_dns (default
+    # on): nothing dials a relay node by name — see the gate on the include below.
     # When Fastly is the CDN, we disable Cloudflare proxy (orange cloud) to avoid
     # double-CDN and ensure Fastly talks directly to the origin.
     - name: Override dns_proxied for Fastly CDN (avoid double-CDN)
@@ -612,10 +657,37 @@
       when:
         - remnawave_relay_enabled | default(false) | bool
 
+    # With the record skipped, the FQDN resolves nowhere — so the panel must not
+    # be handed it as the node's management address. resolve_node_address.yml
+    # picks the interface IP when remnawave_node_address_interface is set, else
+    # remnawave_node_address, else dns_hostname; refuse that last case here,
+    # before anything is installed, rather than registering an unreachable node.
+    - name: Validate the panel node address is not an unpublished FQDN (relay, skip_dns)
+      fail:
+        msg: |
+          remnawave_relay_skip_dns=true means no DNS record is created for
+          {{ dns_hostname }}, but the panel would be registered with exactly that
+          name as the node address (remnawave_node_address_interface is empty and
+          remnawave_node_address is empty or equals dns_hostname). The panel could
+          never reach the node.
+
+          Either:
+            -e remnawave_node_address_interface=tailscale0     (overlay IP, recommended)
+            -e remnawave_node_address=<name or IP the panel can resolve>
+          or publish the record after all with -e remnawave_relay_skip_dns=false.
+      when:
+        - remnawave_relay_enabled | default(false) | bool
+        - remnawave_relay_skip_dns | default(true) | bool
+        - remnawave_panel_register_node | default(false) | bool
+        - (remnawave_node_address_interface | default('')) | length == 0
+        - (remnawave_node_address | default('', true)) in ['', dns_hostname]
+
     - name: Include DNS tasks (Cloudflare)
       include_tasks: providers/cloudflare/dns.yml
       when:
         - effective_dns_provider == 'cloudflare'
+        # A relay node publishes no record of its own (remnawave_relay_skip_dns).
+        - not ((remnawave_relay_enabled | default(false) | bool) and (remnawave_relay_skip_dns | default(true) | bool))
 
     # Base installation (common packages)
     - name: Include base installation tasks
@@ -652,8 +724,6 @@
     # Unified component-install gate. Set after either install path runs.
     # Outline path sets outline_install_success in setup/outline.yml.
     # Remnawave path sets component_install_success in setup/remnawave.yml.
-    # Slipstream-only deployments (no Outline, no Remnawave) need both facts
-    # set so downstream gates pass.
     - name: Set component_install_success after Outline path
       set_fact:
         component_install_success: true
@@ -661,17 +731,7 @@
         - outline_enabled | default(true) | bool
         - outline_install_success | default(false) | bool
 
-    - name: Set facts for slipstream-only deployments
-      set_fact:
-        outline_install_success: true
-        component_install_success: true
-      when:
-        - not (outline_enabled | default(true) | bool)
-        - not (remnawave_enabled | default(false) | bool)
-
-    # =========================================================================
-    # COMPONENT: WebSocket (requires Outline)
-    # =========================================================================
+    # WebSocket transport requires Outline.
     - name: Include WebSocket configuration tasks
       include_tasks: setup/websocket.yml
       when:
@@ -775,22 +835,7 @@
         - remnawave_relay_enabled | default(false) | bool
 
     # =========================================================================
-    # COMPONENT: slipstream DNS Tunnel
-    # =========================================================================
-    - name: Install slipstream DNS tunnel component
-      include_tasks: setup/slipstream.yml
-      when:
-        - component_install_success | bool
-        - slipstream_enabled | default(false) | bool
-
-    # =========================================================================
-    # CONTROL PLANE: Register server with FreeSocks Control Plane (FCP)
-    # =========================================================================
-    # FCP stores each server's management credential and dials out to it. For
-    # Outline, each server is one backendServers row (apiUrl). For Remnawave,
-    # FCP holds only the panel (baseUrl+apiToken); per-node config reaches users
-    # via the panel (register_node + Hosts), so node deploys don't register with
-    # FCP unless fcp_register_remnawave_panel is set for an additional panel.
+    # FCP registers each Outline server; Remnawave registration covers the panel.
     - name: Register Outline server with FCP
       include_tasks: providers/fcp/register_server.yml
       when:
@@ -866,15 +911,16 @@
           {% if outline_wss_enabled | default(false) | bool %}
             ✓ WebSocket transport (WSS)
           {% endif %}
-          {% if slipstream_enabled | default(false) | bool %}
-            ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
-          {% endif %}
           {% if remnawave_relay_enabled | default(false) | bool %}
+          {% set _relay_backend = (((envoy_mappings | default({}))[inventory_hostname] | default({}))['ipv4'] | default([]) | first | default(ansible_facts['default_ipv4']['address'] | default('<node public IP>'), true)) if (remnawave_relay_skip_dns | default(true) | bool) else dns_hostname %}
             ✓ relay transport (VLESS+REALITY via a manual external L4 proxy)
-                clients dial : {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }} (sni {{ remnawave_relay_sni }})
+                clients dial : {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }} (sni {{ (remnawave_relay_snis if ((remnawave_relay_snis | default([])) | length > 0) else [remnawave_relay_sni | default('')]) | join(' | ') }})
                 CONFIGURE BY HAND: point the proxy's backend at
-                  {{ dns_hostname }}:{{ remnawave_relay_node_listen_port | default(443) }}  (raw TCP, no TLS at the edge)
+                  {{ _relay_backend }}:{{ remnawave_relay_node_listen_port | default(443) }}  (raw TCP, no TLS at the edge)
                 The role cannot do this — it talks to no proxy provider.
+          {% if remnawave_relay_skip_dns | default(true) | bool %}
+                No DNS record was published for {{ dns_hostname }} (remnawave_relay_skip_dns).
+          {% endif %}
           {% endif %}
   when: operation_mode == 'deploy'
 
@@ -953,24 +999,26 @@
 # ============================================================================
 # UPDATE MODE
 # ============================================================================
-# Add components (slipstream, WSS) to an existing server
+# Add WSS or update Remnawave on an existing server
 # Does NOT reinstall Outline, only adds new components and re-registers with FCP
 
 # Set providers from domain_providers for update mode
-# Use slipstream_base_domain if slipstream is enabled, otherwise use base_domain
 - name: Set update mode base domain
   set_fact:
-    update_base_domain: "{{ (slipstream_base_domain | default('')) if (slipstream_enabled | default(false) | bool) else base_domain }}"
+    update_base_domain: "{{ base_domain | default('') }}"
   when: operation_mode == 'update'
 
 - name: Fail if the update mode domain is not configured
   fail:
     msg: |
       Update mode cannot resolve its domain: '{{ update_base_domain | default('(unset)') }}'
-      is not in domain_providers. Set base_domain (or slipstream_base_domain for
-      slipstream updates) via --extra-vars to a domain present in domain_providers.
+      is not in domain_providers. Set base_domain via --extra-vars to a domain present in domain_providers.
   when:
     - operation_mode == 'update'
+    # Remnawave updates (compose re-render, wipe, address reconcile) touch no DNS
+    # and a domainless relay node has no domain to resolve. Outline updates
+    # still need a domain for WSS/FCP re-registration.
+    - not (remnawave_enabled | default(false) | bool)
     - update_base_domain is not defined or update_base_domain not in domain_providers
 
 - name: Set providers from domain_providers (update mode)
@@ -1048,16 +1096,6 @@
         - update_component == 'outline'
         - remnawave_enabled | default(false) | bool
 
-    - name: Fail if slipstream shadowsocks mode requested on a Remnawave host
-      fail:
-        msg: |
-          Cannot add slipstream in shadowsocks mode on a Remnawave host:
-          shadowsocks mode requires Outline. Use slipstream_mode=raw instead.
-      when:
-        - slipstream_enabled | default(false) | bool
-        - slipstream_mode | default('shadowsocks') == 'shadowsocks'
-        - update_component != 'outline'
-
     - name: Read existing Outline API info
       slurp:
         src: /opt/outline/access.txt
@@ -1095,7 +1133,7 @@
       debug:
         msg: >-
           Outline apiUrl is IP-addressed — hostname facts not extracted.
-          DNS-dependent steps (slipstream) and FCP re-registration may not apply.
+          FCP re-registration may not apply.
       when:
         - outline_path.stat.exists
         - outline_api_info.apiUrl | regex_search('https://[0-9]+\.')
@@ -1124,15 +1162,6 @@
         wss_already_installed: false
       when: not shadowbox_config_path.stat.exists
 
-    - name: Check if slipstream is already installed
-      stat:
-        path: /usr/local/bin/slipstream-server
-      register: slipstream_installed
-
-    - name: Set slipstream already installed flag
-      set_fact:
-        slipstream_already_installed: "{{ slipstream_installed.stat.exists }}"
-
     - name: Debug update configuration
       debug:
         msg:
@@ -1140,16 +1169,12 @@
           - "Detected hostname: {{ random_hostname | default('N/A') }}"
           - "Existing components detected:"
           - "  - WebSocket: {{ wss_already_installed | default(false) }}"
-          - "  - slipstream: {{ slipstream_already_installed | default(false) }}"
           - "Components requested:"
-          - "  - slipstream: {{ slipstream_enabled | default(false) | bool }} (mode: {{ slipstream_mode | default('shadowsocks') }})"
           - "  - WebSocket: {{ outline_wss_enabled | default(false) | bool }}"
           - "Force reinstall flags:"
-          - "  - Force slipstream: {{ force_reinstall_slipstream | default(false) | bool }}"
           - "  - Force WebSocket: {{ force_reinstall_wss | default(false) | bool }}"
           - "Actions:"
           - "  - Install WebSocket: {{ (outline_wss_enabled | default(false) | bool) and (not (wss_already_installed | default(false)) or (force_reinstall_wss | default(false) | bool)) }}"
-          - "  - Install slipstream: {{ (slipstream_enabled | default(false) | bool) and (not (slipstream_already_installed | default(false)) or (force_reinstall_slipstream | default(false) | bool)) }}"
 
     # =========================================================================
     # Track what will be installed
@@ -1158,11 +1183,10 @@
     - name: Calculate what will be installed
       set_fact:
         will_install_wss: "{{ (outline_wss_enabled | default(false) | bool) and (not (wss_already_installed | default(false)) or (force_reinstall_wss | default(false) | bool)) }}"
-        will_install_slipstream: "{{ (slipstream_enabled | default(false) | bool) and (not (slipstream_already_installed | default(false)) or (force_reinstall_slipstream | default(false) | bool)) }}"
 
     - name: Check if anything needs to be installed
       set_fact:
-        will_install_anything: "{{ will_install_wss or will_install_slipstream }}"
+        will_install_anything: "{{ will_install_wss }}"
 
     # =========================================================================
     # Add WebSocket (if enabled AND not already installed)
@@ -1178,26 +1202,8 @@
         wss_newly_installed: true
       when: will_install_wss | bool
 
-    # =========================================================================
-    # Add slipstream DNS Tunnel (if enabled AND not already installed)
-    # =========================================================================
-    - name: Add slipstream DNS tunnel
-      include_tasks: setup/slipstream.yml
-      when:
-        - will_install_slipstream | bool
-
-    - name: Mark slipstream as newly installed
-      set_fact:
-        slipstream_newly_installed: true
-      when: will_install_slipstream | bool
-
-    # =========================================================================
-    # Re-register the server with FCP after adding components (Outline path)
-    # =========================================================================
-    # FCP stores the management apiUrl (+ WSS fields) and dials out. Re-register
-    # so a newly added WSS transport is reflected. Idempotent by slug (PUT by-slug).
-    # effective_cdn_provider isn't set in update mode — derive it from the
-    # detected host's domain so register_server.yml picks the right websocketDomain.
+    # Re-register Outline after a WSS change. Derive the CDN provider here
+    # because update mode does not run deploy's provider setup.
     - name: Derive WSS base domain (update mode)
       set_fact:
         _wss_base_domain: "{{ dns_hostname.split('.')[1:] | join('.') }}"
@@ -1228,9 +1234,6 @@
           {% if wss_newly_installed | default(false) | bool %}
             ✓ WebSocket transport (WSS)
           {% endif %}
-          {% if slipstream_newly_installed | default(false) | bool %}
-            ✓ slipstream DNS tunnel ({{ slipstream_mode | default('shadowsocks') }} mode)
-          {% endif %}
           {% if fcp_enabled | default(false) | bool %}
             ✓ FCP registration re-synced
           {% endif %}
@@ -1252,9 +1255,6 @@
           {% if wss_already_installed | default(false) %}
             ✓ WebSocket: already installed
           {% endif %}
-          {% if slipstream_already_installed | default(false) %}
-            ✓ slipstream: already installed
-          {% endif %}
 
           No changes were made.
       when:
@@ -1268,15 +1268,6 @@
       include_tasks: update/remnawave_update.yml
       when: update_component == 'remnawave'
 
-    # Optional slipstream-raw add-on for Remnawave hosts (must come AFTER the
-    # remnawave_update.yml include so dns_hostname / random_hostname are set).
-    - name: Add slipstream DNS tunnel (raw mode only on Remnawave hosts)
-      include_tasks: setup/slipstream.yml
-      when:
-        - update_component == 'remnawave'
-        - slipstream_enabled | default(false) | bool
-        - not (slipstream_already_installed | default(false))
-        - slipstream_mode | default('shadowsocks') == 'raw'
   when: operation_mode == 'update'
 
 # ============================================================================
@@ -1401,6 +1392,9 @@
           # order. Load this file SECOND (as the header above shows).
           remnawave_relay_inbound_uuid: "{{ remnawave_relay_inbound_uuid | default('') }}"
           remnawave_relay_sni: "{{ (remnawave_bootstrap_relay_server_names | default([])) | first | default('', true) }}"
+          # Every serverName the relay inbound borrows -> one Host per entry, so
+          # subscribers can fall over to another SNI. Same rule: set here only.
+          remnawave_relay_snis: {{ (remnawave_bootstrap_relay_server_names | default([])) | to_json }}
           remnawave_relay_node_listen_port: {{ remnawave_bootstrap_relay_listen_port | default(443) | int }}
           remnawave_cdn_transports:
             - name: ws
@@ -1480,7 +1474,7 @@
           {% if (remnawave_relay_inbound_uuid | default('')) | length > 0 %}
 
           Relay nodes: the inbound listens ON THE NODE at
-          0.0.0.0:{{ remnawave_bootstrap_relay_listen_port | default(443) }} — point your external L4 proxy's
+          {{ remnawave_xray_public_listen | default('::') }}:{{ remnawave_bootstrap_relay_listen_port | default(443) }} — point your external L4 proxy's
           backend at <node>:{{ remnawave_bootstrap_relay_listen_port | default(443) }} (raw TCP, no TLS at the edge).
           {% endif %}
           {% else %}
@@ -1489,4 +1483,3 @@
           and appends it to FCP's mode pools.
           {% endif %}
   when: operation_mode == 'bootstrap'
-

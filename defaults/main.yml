@@ -1,10 +1,10 @@
 # defaults/main.yml - Default variables for the role
 
 # Operation mode: 'deploy', 'migrate', 'change', 'update', or 'bootstrap'
-# - deploy: Install server with selected components (outline, slipstream, etc.)
+# - deploy: Install server with selected components (Outline or Remnawave)
 # - migrate: Migrate server and its components from source to destination host
 # - change: Rotate hostname on existing server (for DNS blocking bypass)
-# - update: Add components (slipstream, WSS) to an existing server
+# - update: Add WSS or update Remnawave to an existing server
 # - bootstrap: One-time Remnawave PANEL setup (config profile + shared squads
 #   + FCP mode-pool binding; host-agnostic, no host touched)
 # operation_mode: deploy
@@ -22,35 +22,18 @@ outline_enabled: true # Default: deploy Outline SS server
 # Remnawave Node (Xray-core, panel-driven; see Remnawave section below):
 # remnawave_enabled: false  # Mutually exclusive with outline_enabled
 
-# slipstream DNS tunnel (see slipstream section below):
-# slipstream_enabled: false  # Disabled by default, enable in playbook
-# slipstream_mode: "shadowsocks"  # or "raw" for standalone SOCKS5 proxy
-#
-# Example deployment combinations:
-#   1. Outline only: outline_enabled=true, slipstream_enabled=false (default)
-#   2. Outline + slipstream: outline_enabled=true, slipstream_enabled=true, slipstream_mode=shadowsocks
-#   3. slipstream only (raw): outline_enabled=false, slipstream_enabled=true, slipstream_mode=raw
-#   4. Both transports: outline_enabled=true, slipstream_enabled=true, slipstream_mode=raw
-#      (slipstream provides standalone proxy, Outline provides SS)
-#   5. Remnawave only: outline_enabled=false, remnawave_enabled=true
-#   6. Remnawave + slipstream (raw): outline_enabled=false, remnawave_enabled=true,
-#      slipstream_enabled=true, slipstream_mode=raw  (shadowsocks mode requires Outline)
+# Example deployments:
+#   Outline: outline_enabled=true, remnawave_enabled=false (default)
+#   Remnawave: outline_enabled=false, remnawave_enabled=true
 
 # ============================================================================
 # Force Reinstall Options (Update and Deploy modes)
 # ============================================================================
 # Force reinstall of components even if already detected as installed.
 # Useful for:
-#   - Recovery from partial installations (e.g., slipstream binary installed but its DNS/config incomplete)
 #   - Updating component configuration after changes
 #   - Regenerating certificates/configs
 #
-# Usage: --extra-vars "force_reinstall_slipstream=true"
-force_reinstall_slipstream: false
-# Force rebuild of slipstream-server binary from source (even if already installed)
-# Useful for updating to a new version with bug fixes (e.g., increased max connections)
-# Usage: --extra-vars "force_rebuild_slipstream=true"
-force_rebuild_slipstream: false
 force_reinstall_wss: false
 
 # Remnawave force flags:
@@ -484,6 +467,19 @@ remnawave_relay_port: ""
 # file; keep it out of your creds file so the two cannot disagree (both load as
 # extra-vars, where the later -e wins).
 remnawave_relay_sni: ""
+# Advertise MORE THAN ONE borrowed serverName off the same inbound: one Host per
+# entry, so every subscriber carries N configs that differ only in SNI and can
+# fall over to another name when one gets SNI-blocked (an edge-IP block still
+# takes all of them). Every entry MUST be one of
+# remnawave_bootstrap_relay_server_names — the inbound has ONE dest, which must
+# serve every name, so this cannot span sites. Bootstrap writes the full
+# serverNames list here (same generated-file-not-creds-file rule as
+# remnawave_relay_sni). Empty falls back to [remnawave_relay_sni].
+# Remarks: exactly one entry keeps the bare <hostname>-relay; with several, EVERY
+# entry gets a deterministic 6-hex sha256 suffix of its SNI (the multi-edge WS
+# Host convention), and this node's relay Hosts whose remark is no longer in the
+# desired set are deleted, so shrinking or reordering the list converges.
+remnawave_relay_snis: []
 # Empty means "chrome". Same reasoning as remnawave_relay_port above: with a concrete
 # default, change and migrate cannot tell an operator-supplied value from an untouched
 # one, so a relay deployed with a deliberate non-default fingerprint would silently be
@@ -499,73 +495,20 @@ remnawave_relay_node_listen_port: 443
 # ORIGIN the manual proxy dials, and only a human can update the proxy console.
 # See tasks/change/remnawave_change.yml + tasks/migrate/migrate.yml.
 remnawave_relay_repoint_ack: false
-
-# ============================================================================
-# slipstream DNS Tunnel Configuration
-# ============================================================================
-# Enable slipstream-rust DNS tunnel for extreme censorship resistance
-# Traffic is tunneled through DNS queries via recursive resolvers
-slipstream_enabled: false
-
-# slipstream mode:
-#   - "shadowsocks": Tunnel to local Shadowsocks server (default)
-#                    - slipstream → outline-ss-server (outline_keys_port, default 443)
-#                    - Client needs: slipstream-client + ss-local
-#   - "raw": Direct TCP tunnel via SOCKS5 proxy
-#            - slipstream → microsocks (SOCKS5) → internet
-#            - Client only needs: slipstream-client (as SOCKS proxy)
-slipstream_mode: "shadowsocks"
-
-# Note: slipstream_domain is auto-generated from slipstream_base_domain + slipstream_subdomain
-# e.g., slipstream_subdomain=dns1, slipstream_base_domain=your-dns.com → dns1.your-dns.com
-
-# DNS resolvers for clients
-# These should be public recursive resolvers accessible from censored regions
-# Common options:
-#   - Yandex DNS (Russia allowlist): 77.88.8.8:53, 77.88.8.1:53
-#   - Google DNS: 8.8.8.8:53, 8.8.4.4:53
-#   - Cloudflare DNS: 1.1.1.1:53, 1.0.0.1:53
-#   - Local ISP resolvers (check if they forward recursively)
-slipstream_resolver: "77.88.8.8:53"
-slipstream_resolver_backup: "77.88.8.1:53"
-
-# slipstream version/branch to build from
-slipstream_version: "main"
-slipstream_repo_url: "https://github.com/unredacted/slipstream-rust.git"
-
-# DNS port for slipstream server (default: 53)
-slipstream_dns_port: 53
-
-# Log level for slipstream server (debug, info, warn, error)
-slipstream_log_level: "info"
-
-# Raw mode SOCKS5 proxy configuration
-# When slipstream_mode is "raw", microsocks is installed and slipstream forwards to it
-slipstream_socks_port: 1080 # Local SOCKS5 port (microsocks)
-
-# ============================================================================
-# slipstream DNS Record Configuration (REQUIRED when slipstream_enabled=true)
-# ============================================================================
-# These variables MUST be set via --extra-vars when enabling slipstream.
-# No defaults are provided to force explicit configuration for each server.
-#
-# Example usage:
-#   ansible-playbook playbook.yml \
-#     --extra-vars "slipstream_enabled=true" \
-#     --extra-vars "slipstream_base_domain=your-dns.com" \
-#     --extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
-#
-# For multiple servers, use different subdomains:
-#   Server 1: slipstream_subdomain=dns1 slipstream_ns_hostname=ns1
-#   Server 2: slipstream_subdomain=dns2 slipstream_ns_hostname=ns2
-#   Server 3: slipstream_subdomain=mail1 slipstream_ns_hostname=ns3
-
-# slipstream_base_domain: ""      # REQUIRED - Base domain (must be in domain_providers)
-# slipstream_subdomain: ""        # REQUIRED - Tunnel subdomain (dns1, mail1, etc.)
-# slipstream_ns_hostname: ""      # REQUIRED - Nameserver hostname (ns1, ns2, etc.)
-
-# Whether to automatically create DNS records (NS + A/AAAA for nameserver)
-slipstream_create_dns_records: true
+# Do NOT publish the node's own A/AAAA record. A relay node has no client-visible
+# hostname and no certificate: clients dial the edge, the proxy backend dials the
+# node by IP, and the panel dials it over the overlay. The only thing a public
+# <hostname>.<domain> -> node-IP record does is tie the hidden node IP to a
+# FreeSocks domain in passive DNS — exactly the correlation relay exists to
+# prevent. Defaults ON. With it on, the panel-side node address must not be that
+# FQDN either: deploy/change/migrate refuse a registered relay run that would
+# hand the panel an unpublished name (set remnawave_node_address_interface, or a
+# remnawave_node_address the panel CAN resolve — an overlay name or IP).
+# Set false only when something outside the role needs the record (e.g. a proxy
+# console that insists on an FQDN backend). With it on, deploy_target_domain is
+# OPTIONAL: omit it and the node's identity is the bare hostname (no zone, no
+# provider); give it and it namespaces the identity as before, still no record.
+remnawave_relay_skip_dns: true
 
 # ============================================================================
 # Fastly CDN Configuration
@@ -723,7 +666,8 @@ remnawave_x25519_endpoint: "/api/system/tools/x25519/generate"
 # dest + serverNames are REQUIRED and deliberately have NO default: which site a
 # deployment borrows is operator-specific and belongs in PRIVATE inventory, not
 # in this repo. Set them alongside your panel credentials; bootstrap asserts they
-# are non-empty. shortIds [""] = accept-all.
+# are non-empty. shortIds [""] permits an empty client short ID; existing
+# values are preserved during reconciliation so copied client configs survive.
 #
 # Mechanical contract (all the guidance that belongs here):
 #   * dest must be a real, reachable TLS 1.3 host, and must serve EVERY name in
@@ -735,6 +679,8 @@ remnawave_x25519_endpoint: "/api/system/tools/x25519/generate"
 remnawave_bootstrap_reality_dest: ""
 remnawave_bootstrap_reality_server_names: []
 remnawave_bootstrap_reality_short_ids: [""]
+# Minimum client Xray version accepted by REALITY; also reconciled on bootstrap.
+remnawave_bootstrap_reality_min_client_ver: "1.8.1"
 # Reality stream network: v2.8 renamed the raw-TCP carrier "tcp" -> "raw". VERIFY
 # against your panel; flip to "tcp" on older panels.
 remnawave_bootstrap_reality_network: "raw"
@@ -751,6 +697,7 @@ remnawave_bootstrap_relay: true
 remnawave_bootstrap_relay_dest: ""
 remnawave_bootstrap_relay_server_names: []
 remnawave_bootstrap_relay_short_ids: [""]
+remnawave_bootstrap_relay_min_client_ver: "1.8.1"
 # v2.8 renamed the raw-TCP carrier "tcp" -> "raw"; flip on older panels.
 remnawave_bootstrap_relay_network: "raw"
 # The port the relay inbound listens on ON THE NODE — i.e. what you point the
@@ -767,9 +714,9 @@ remnawave_bootstrap_relay_accept_proxy_protocol: false
 # Reconcile missing BASE inbounds into an ALREADY-EXISTING Config Profile
 # (append-by-tag PATCH). Without this, a panel bootstrapped under an older role
 # version never gains newly-added base inbounds, because the create POST only
-# runs when the profile is absent. Existing inbounds are never rewritten, so a
-# re-run cannot rotate a live inbound's keys. Set false to hand-manage the
-# profile in the panel UI.
+# runs when the profile is absent. Existing inbounds receive selective merges
+# (including minClientVer for enabled REALITY transports), preserving their keys.
+# Set false to hand-manage the profile in the panel UI.
 remnawave_bootstrap_reconcile_inbounds: true
 
 # The WS inbound (raw Xray) the bootstrap POSTs into the Config Profile.

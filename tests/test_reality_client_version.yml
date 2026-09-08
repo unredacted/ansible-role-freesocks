@@ -1,0 +1,162 @@
+---
+# Execute the production assembly/merge tasks offline, with sentinel settings
+# that must survive reconciliation. The PATCH task keeps its production gates
+# but substitutes a local fact for the HTTP request.
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Load role defaults
+      include_vars: ../defaults/main.yml
+
+    - name: Load production tasks and live-profile fixtures
+      set_fact:
+        _profile_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_config_profile.yml') | from_yaml }}"
+        _rw_profile_exists: true
+        _rw_missing_inbounds: []
+        remnawave_reality_private_key: generated-direct
+        remnawave_relay_private_key: generated-relay
+        _patch_attempted: false
+        _rw_live_profile:
+          config:
+            outbounds: []
+            inbounds:
+              - tag: VLESS_REALITY
+                listen: '::'
+                port: 443
+                settings: {clients: [{id: existing-client}], decryption: none}
+                streamSettings: &reality_stream
+                  security: reality
+                  network: raw
+                  sockopt: {tcpFastOpen: true}
+                  realitySettings:
+                    privateKey: existing-key
+                    shortIds: ['0123456789abcdef']
+                    dest: decoy.example:443
+                    serverNames: [decoy.example]
+                    maxClientVer: '99.0.0'
+              - tag: VLESS_RELAY_REALITY
+                streamSettings: *reality_stream
+              - tag: VLESS_REALITY_LEGACY
+                streamSettings: *reality_stream
+              - tag: OPERATOR_REALITY
+                streamSettings: *reality_stream
+              - tag: VLESS_WS_CDN
+                streamSettings: {security: none, network: ws}
+
+    - name: Create temporary task file
+      tempfile:
+        state: file
+        suffix: .yml
+      register: _version_task_file
+
+    - block:
+        - name: Extract production tasks without network operations
+          copy:
+            dest: "{{ _version_task_file.path }}"
+            mode: '0600'
+            content: >-
+              {{ (_profile_tasks | selectattr('name', 'in', [
+                   'Build the Reality inbound (inject the generated x25519 private key)',
+                   'Build the relay Reality inbound (inject the generated relay x25519 key)',
+                   'Merge sniffing routeOnly, REALITY client versions and opt-in dual-stack listen into the live profile inbounds',
+                   'Determine whether the live-profile merges change anything'
+                 ]) | list
+                 + [((_profile_tasks | selectattr('name', 'equalto',
+                     'Reconcile the existing Config Profile (sniffing/listen/REALITY-version/outbound merges + missing base inbounds)') | first)
+                     | dict2items | rejectattr('key', 'in', ['uri', 'delegate_to']) | items2dict
+                     | combine({'set_fact': {'_patch_attempted': true}}))]) | to_nice_yaml }}
+
+        - name: Run production tasks with default versions
+          include_tasks: "{{ _version_task_file.path }}"
+
+        - name: Assert defaults, new-inbound assembly and existing-profile PATCH trigger
+          assert:
+            that:
+              - remnawave_bootstrap_reality_min_client_ver == '1.8.1'
+              - remnawave_bootstrap_relay_min_client_ver == '1.8.1'
+              - _rw_reality_inbound.streamSettings.realitySettings.minClientVer == '1.8.1'
+              - _rw_relay_inbound.streamSettings.realitySettings.minClientVer == '1.8.1'
+              - _rw_sniffing_changed
+              - _patch_attempted
+
+        - name: Assert only the intended field changes on managed inbounds
+          assert:
+            that:
+              - "_rw_live_inbounds_reconciled[item] == (_rw_live_profile.config.inbounds[item] | combine({'streamSettings': {'realitySettings': {'minClientVer': '1.8.1'}}}, recursive=true))"
+          loop: [0, 1, 2]
+
+        - name: Assert unrelated inbounds are preserved exactly
+          assert:
+            that:
+              - _rw_live_inbounds_reconciled[3:] == _rw_live_profile.config.inbounds[3:]
+
+        - name: Set independent inventory overrides and disable PATCH reconciliation
+          set_fact:
+            remnawave_bootstrap_reality_min_client_ver: '1.8.2'
+            remnawave_bootstrap_relay_min_client_ver: '26.3.27'
+            remnawave_bootstrap_reconcile_inbounds: false
+            _patch_attempted: false
+
+        - name: Run production tasks with overrides and reconciliation disabled
+          include_tasks: "{{ _version_task_file.path }}"
+
+        - name: Assert overrides reach new and desired existing inbounds while PATCH stays off
+          assert:
+            that:
+              - _rw_reality_inbound.streamSettings.realitySettings.minClientVer == '1.8.2'
+              - _rw_relay_inbound.streamSettings.realitySettings.minClientVer == '26.3.27'
+              - _rw_live_inbounds_reconciled[0].streamSettings.realitySettings.minClientVer == '1.8.2'
+              - _rw_live_inbounds_reconciled[1].streamSettings.realitySettings.minClientVer == '26.3.27'
+              - _rw_live_inbounds_reconciled[2].streamSettings.realitySettings.minClientVer == '1.8.2'
+              - not _patch_attempted
+
+        - name: Simulate an already-reconciled live profile
+          set_fact:
+            _rw_live_profile: "{{ _rw_live_profile | combine({'config': {'inbounds': _rw_live_inbounds_reconciled}}, recursive=true) }}"
+            remnawave_bootstrap_reconcile_inbounds: true
+            _patch_attempted: false
+
+        - name: Repeat production tasks on the converged profile
+          include_tasks: "{{ _version_task_file.path }}"
+
+        - name: Assert a second run needs no PATCH
+          assert:
+            that:
+              - not _rw_sniffing_changed
+              - not _patch_attempted
+
+        - name: Disable direct transport while changing both desired versions
+          set_fact:
+            remnawave_bootstrap_reality: false
+            remnawave_bootstrap_reality_min_client_ver: '1.8.3'
+            remnawave_bootstrap_relay_min_client_ver: '26.3.28'
+
+        - name: Run production tasks with only relay enabled
+          include_tasks: "{{ _version_task_file.path }}"
+
+        - name: Assert disabled direct transport and its clones remain unchanged
+          assert:
+            that:
+              - _rw_live_inbounds_reconciled[0] == _rw_live_profile.config.inbounds[0]
+              - _rw_live_inbounds_reconciled[2] == _rw_live_profile.config.inbounds[2]
+              - _rw_live_inbounds_reconciled[1].streamSettings.realitySettings.minClientVer == '26.3.28'
+
+        - name: Disable relay as well
+          set_fact:
+            remnawave_bootstrap_relay: false
+            _patch_attempted: false
+
+        - name: Run production tasks with both transports disabled
+          include_tasks: "{{ _version_task_file.path }}"
+
+        - name: Assert disabled transports preserve all live inbounds
+          assert:
+            that:
+              - _rw_live_inbounds_reconciled == _rw_live_profile.config.inbounds
+              - not _patch_attempted
+      always:
+        - name: Remove temporary task file
+          file:
+            path: "{{ _version_task_file.path }}"
+            state: absent

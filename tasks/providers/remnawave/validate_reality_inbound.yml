@@ -1,0 +1,38 @@
+---
+# Validate one server-side REALITY inbound before publishing a Config Profile.
+# Empty short IDs remain valid so existing manually copied configs keep working.
+- name: Validate REALITY short IDs
+  assert:
+    that:
+      - _reality_validation_inbound.streamSettings.realitySettings is mapping
+      - _reality_validation_inbound.streamSettings.realitySettings.shortIds is defined
+      - _reality_validation_inbound.streamSettings.realitySettings.shortIds is sequence
+      - _reality_validation_inbound.streamSettings.realitySettings.shortIds is not string
+      - _reality_validation_inbound.streamSettings.realitySettings.shortIds is not mapping
+      - _reality_validation_inbound.streamSettings.realitySettings.shortIds | length > 0
+      - _reality_validation_inbound.streamSettings.realitySettings.shortIds | reject('string') | list | length == 0
+      - >-
+        _reality_validation_inbound.streamSettings.realitySettings.shortIds
+        | reject('match', '^(?:[0-9a-fA-F]{2}){0,8}\Z') | list | length == 0
+    fail_msg: >-
+      REALITY shortIds must be a non-empty list of strings, each containing
+      0 to 16 hexadecimal characters in pairs. The empty string is supported
+      for existing clients. No Config Profile update was sent.
+  no_log: true
+
+- name: Validate REALITY client version bounds
+  assert:
+    that:
+      - >-
+        _reality_version is string and
+        (_reality_version == '' or
+         (_reality_version is match('^[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}\Z') and
+          (_reality_version.split('.') | map('int') | max) <= 255))
+    fail_msg: >-
+      REALITY minClientVer/maxClientVer must be quoted x.y.z strings with
+      each component between 0 and 255, or an empty string for Xray's default.
+      No Config Profile update was sent.
+  vars:
+    _reality_version: "{{ _reality_validation_inbound.streamSettings.realitySettings[item] | default('') }}"
+  loop: [minClientVer, maxClientVer]
+  no_log: true

@@ -51,6 +51,7 @@
           serverNames: "{{ remnawave_bootstrap_reality_server_names }}"
           privateKey: "{{ remnawave_reality_private_key | default('') }}"
           shortIds: "{{ remnawave_bootstrap_reality_short_ids }}"
+          minClientVer: "{{ remnawave_bootstrap_reality_min_client_ver }}"
       sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
   no_log: true
   when: remnawave_bootstrap_reality | default(true) | bool
@@ -75,6 +76,7 @@
           serverNames: "{{ remnawave_bootstrap_relay_server_names }}"
           privateKey: "{{ remnawave_relay_private_key | default('') }}"
           shortIds: "{{ remnawave_bootstrap_relay_short_ids }}"
+          minClientVer: "{{ remnawave_bootstrap_relay_min_client_ver }}"
       sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
   no_log: true
   when: remnawave_bootstrap_relay | default(true) | bool
@@ -138,6 +140,14 @@
          + ([_rw_reality_inbound] if (remnawave_bootstrap_reality | default(true) | bool) else [])
          + ([_rw_relay_inbound] if (remnawave_bootstrap_relay | default(true) | bool) else []) }}
   no_log: true
+
+- name: Validate desired REALITY inbounds before creating the Config Profile
+  include_tasks: providers/remnawave/validate_reality_inbound.yml
+  loop: "{{ _rw_bootstrap_inbounds }}"
+  loop_control:
+    loop_var: _reality_validation_inbound
+    label: "{{ _reality_validation_inbound.tag | default('(untagged)') }}"
+  when: (_reality_validation_inbound.streamSettings | default({})).security | default('') == 'reality'
 
 - name: Create the Config Profile (only when absent)
   uri:
@@ -227,13 +237,15 @@
 #
 # Reconcile by TAG: fetch the live profile, append only the desired inbounds
 # whose tag is absent, and full-replace PATCH (same contract as
-# create_node_placement.yml). Existing inbounds are NEVER rewritten — so a re-run
-# cannot rotate a live inbound's REALITY keys out from under connected clients —
-# with ONE additive exception: `sniffing.routeOnly: true` is merged into every
+# create_node_placement.yml). Existing inbounds receive selective merges that
+# preserve their REALITY keys. `sniffing.routeOnly: true` is merged into every
 # live inbound (base AND per-node clones) that has sniffing enabled, because a
 # profile bootstrapped before the routeOnly fix keeps rewriting destinations to
 # the sniffed SNI and Tor stays broken there (the very population the fix
-# targets). The merge preserves every other key on the inbound untouched.
+# targets). Enabled REALITY transports also reconcile minClientVer by role-owned
+# tag (including legacy VLESS_REALITY_<HOSTNAME> clones); unrelated tags and
+# disabled transports keep their version settings. All other REALITY fields
+# are preserved, including privateKey, shortIds, dest and serverNames.
 # Two IPv6 reconciles ride the same PATCH:
 #   - the DIRECT freedom outbound gains domainStrategy UseIPv4v6 when it has
 #     NONE (an operator-set strategy is never clobbered) — without it, AAAA-only
@@ -262,8 +274,9 @@
 
 # Merge `sniffing.routeOnly: true` into every live inbound that sniffs. Purely
 # additive per inbound: only the sniffing mapping gains a key; clients, stream
-# settings, and REALITY keys pass through byte-identical.
-- name: Merge sniffing routeOnly (+ opt-in dual-stack listen) into the live profile inbounds
+# settings, and REALITY keys are preserved. Only minClientVer changes inside
+# the REALITY settings of enabled role-owned inbounds.
+- name: Merge sniffing routeOnly, REALITY client versions and opt-in dual-stack listen into the live profile inbounds
   set_fact:
     _rw_live_inbounds_reconciled: >-
       {%- set out = [] -%}
@@ -274,6 +287,19 @@
         {%- endif -%}
         {%- if (remnawave_reconcile_public_listen | default(false)) and (ns.item.listen | default('')) == '0.0.0.0' -%}
           {%- set ns.item = ns.item | combine({'listen': remnawave_xray_public_listen}) -%}
+        {%- endif -%}
+        {%- set stream = ns.item.streamSettings | default({}) -%}
+        {%- set tag = ns.item.tag | default('') -%}
+        {%- set version = namespace(value=none) -%}
+        {%- if (stream.security | default('')) == 'reality' -%}
+          {%- if (remnawave_bootstrap_reality | default(true) | bool) and (tag == 'VLESS_REALITY' or tag.startswith('VLESS_REALITY_')) -%}
+            {%- set version.value = remnawave_bootstrap_reality_min_client_ver -%}
+          {%- elif (remnawave_bootstrap_relay | default(true) | bool) and tag == 'VLESS_RELAY_REALITY' -%}
+            {%- set version.value = remnawave_bootstrap_relay_min_client_ver -%}
+          {%- endif -%}
+        {%- endif -%}
+        {%- if version.value is not none -%}
+          {%- set ns.item = ns.item | combine({'streamSettings': (stream | combine({'realitySettings': ((stream.realitySettings | default({})) | combine({'minClientVer': version.value}))}))}) -%}
         {%- endif -%}
         {%- set _ = out.append(ns.item) -%}
       {%- endfor -%}
@@ -314,14 +340,25 @@
       Reconciling into the existing Config Profile:
       {{ _rw_missing_inbounds | length }} missing base inbound(s)
       ({{ _rw_missing_inbounds | map(attribute='tag') | list | join(', ') | default('none', true) }});
-      sniffing/listen merge {{ 'CHANGES live inbounds' if (_rw_sniffing_changed | default(false)) else 'already in place' }};
+      sniffing/listen/REALITY-version merge {{ 'CHANGES live inbounds' if (_rw_sniffing_changed | default(false)) else 'already in place' }};
       freedom domainStrategy merge {{ 'CHANGES live outbounds' if (_rw_outbounds_changed | default(false)) else 'already in place' }}.
   when:
     - _rw_profile_exists
     - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
     - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false)) or (_rw_outbounds_changed | default(false))
 
-- name: Reconcile the existing Config Profile (sniffing/listen/outbound merges + missing base inbounds)
+- name: Validate reconciled REALITY inbounds before updating the Config Profile
+  include_tasks: providers/remnawave/validate_reality_inbound.yml
+  loop: "{{ (_rw_live_inbounds_reconciled | default([])) + _rw_missing_inbounds }}"
+  loop_control:
+    loop_var: _reality_validation_inbound
+    label: "{{ _reality_validation_inbound.tag | default('(untagged)') }}"
+  when:
+    - _rw_profile_exists
+    - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
+    - (_reality_validation_inbound.streamSettings | default({})).security | default('') == 'reality'
+
+- name: Reconcile the existing Config Profile (sniffing/listen/REALITY-version/outbound merges + missing base inbounds)
   uri:
     url: "{{ remnawave_panel_url }}/api/config-profiles"
     method: PATCH

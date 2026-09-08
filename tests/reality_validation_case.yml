@@ -1,0 +1,23 @@
+---
+- name: Build the validation case
+  set_fact:
+    _reality_case_rejected: false
+    _reality_validation_inbound:
+      tag: VALIDATION_FIXTURE
+      streamSettings:
+        security: reality
+        realitySettings: "{{ {'shortIds': [''], 'minClientVer': '1.8.1'} | combine(validation_case.settings) }}"
+
+- name: Run the production validator
+  block:
+    - name: Validate the fixture
+      include_tasks: ../tasks/providers/remnawave/validate_reality_inbound.yml
+  rescue:
+    - name: Record validation rejection
+      set_fact:
+        _reality_case_rejected: true
+
+- name: Assert the expected validation result
+  assert:
+    that: _reality_case_rejected == (not validation_case.valid)
+    fail_msg: "Unexpected validation outcome for {{ validation_case.name }}"

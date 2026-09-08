@@ -1,0 +1,39 @@
+---
+# Check the host's actual ability to accept IPv6 and IPv4 on one IPv6 wildcard
+# socket, as required by remnawave_xray_public_listen="::". Ephemeral loopback
+# connections do not modify sysctls or contend with Xray's production port.
+# This tests local kernel support, not external IPv6 routing or firewall rules.
+- name: Probe Remnawave dual-stack socket support
+  command:
+    argv:
+      - "{{ ansible_facts.python.executable | default('/usr/bin/python3') }}"
+      - -c
+      - |
+        import socket
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
+            listener.settimeout(3)
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            listener.bind(('::', 0))
+            listener.listen(2)
+            port = listener.getsockname()[1]
+            for address in ('::1', '127.0.0.1'):
+                with socket.create_connection((address, port), timeout=3):
+                    peer, _ = listener.accept()
+                    peer.close()
+  register: _remnawave_ipv6_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: remnawave_xray_public_listen | default('::') == '::'
+
+- name: Require kernel support for the configured Remnawave dual-stack listener
+  assert:
+    that: _remnawave_ipv6_probe.rc | default(1) == 0
+    fail_msg: >-
+      This host cannot accept IPv6 and IPv4 on the configured :: listener.
+      Enable IPv6 (including loopback) and allow local loopback connections,
+      or set remnawave_xray_public_listen=0.0.0.0 AND configure the panel's
+      active Xray inbounds to use 0.0.0.0 before retrying. Changing this
+      inventory variable alone does not rewrite an existing panel listener.
+      Probe error: {{ _remnawave_ipv6_probe.stderr | default('probe could not run') }}
+  when: remnawave_xray_public_listen | default('::') == '::'

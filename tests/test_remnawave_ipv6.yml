@@ -1,0 +1,79 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Verify actual local dual-stack socket support
+      include_tasks: ../tasks/setup/remnawave_ipv6.yml
+      vars:
+        remnawave_xray_public_listen: '::'
+
+    - name: Assert the read-only socket probe succeeded
+      assert:
+        that:
+          - _remnawave_ipv6_probe.rc == 0
+          - not _remnawave_ipv6_probe.changed
+
+    - name: Load the production assertion
+      set_fact:
+        _ipv6_assert_task: "{{ (lookup('file', playbook_dir ~ '/../tasks/setup/remnawave_ipv6.yml') | from_yaml)[1] }}"
+
+    - name: Create temporary assertion task file
+      tempfile:
+        state: file
+        suffix: .yml
+      register: _ipv6_task_file
+
+    - block:
+        - name: Write the production assertion unchanged
+          copy:
+            dest: "{{ _ipv6_task_file.path }}"
+            mode: '0600'
+            content: "{{ [_ipv6_assert_task] | to_nice_yaml }}"
+
+        - name: Simulate a disabled or unsupported IPv6 kernel
+          set_fact:
+            _remnawave_ipv6_probe: {rc: 1, stderr: IPv6 unavailable}
+            _ipv6_rejected: false
+            remnawave_xray_public_listen: '::'
+
+        - name: Verify unavailable dual-stack support is rejected
+          block:
+            - include_tasks: "{{ _ipv6_task_file.path }}"
+          rescue:
+            - set_fact:
+                _ipv6_rejected: true
+
+        - name: Assert the unsupported kernel was rejected
+          assert:
+            that: _ipv6_rejected
+
+        - name: Select explicit IPv4-only configuration
+          set_fact:
+            remnawave_xray_public_listen: '0.0.0.0'
+
+        - name: Verify IPv4-only nodes skip the probe and assertion
+          include_tasks: ../tasks/setup/remnawave_ipv6.yml
+
+        - name: Assert the probe was skipped for IPv4-only configuration
+          assert:
+            that: _remnawave_ipv6_probe is skipped
+      always:
+        - name: Remove temporary assertion task file
+          file:
+            path: "{{ _ipv6_task_file.path }}"
+            state: absent
+
+    - name: Read deployment and lifecycle task ordering
+      set_fact:
+        _setup_names: "{{ lookup('file', playbook_dir ~ '/../tasks/setup/remnawave.yml') | from_yaml | map(attribute='name') | list }}"
+        _update_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/update/remnawave_update.yml') | from_yaml }}"
+        _migration_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/migrate/migrate.yml') | from_yaml }}"
+
+    - name: Assert probes run before installation, recreation and migration mutations
+      assert:
+        that:
+          - "_setup_names.index('Check Remnawave listener support before installation') < _setup_names.index('Create Remnawave install directory')"
+          - "(_update_tasks | map(attribute='name') | list).index('Check Remnawave listener support before recreating the container') < (_update_tasks | map(attribute='name') | list).index('Re-render docker-compose.yml')"
+          - "(_migration_tasks | map(attribute='name') | list).index('Check destination listener support before Remnawave migration') < (_migration_tasks | map(attribute='name') | list).index('Detect Caddy on source (Remnawave)')"
+          - "(_migration_tasks | selectattr('name', 'equalto', 'Check destination listener support before Remnawave migration') | first).any_errors_fatal"

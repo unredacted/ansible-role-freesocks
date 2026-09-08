@@ -1,0 +1,41 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Exercise valid and invalid REALITY inventory values
+      include_tasks: reality_validation_case.yml
+      loop:
+        - {name: existing empty short ID, settings: {}, valid: true}
+        - {name: overlapping old and new IDs, settings: {shortIds: ['', '0123456789abcdef']}, valid: true}
+        - {name: uppercase hex and short hex, settings: {shortIds: ['AB', 'AABBCCDDEEFF0011']}, valid: true}
+        - {name: empty version uses core default, settings: {minClientVer: '', maxClientVer: ''}, valid: true}
+        - {name: byte range boundary, settings: {minClientVer: '255.255.255'}, valid: true}
+        - {name: absent ID list contents, settings: {shortIds: []}, valid: false}
+        - {name: ID is scalar, settings: {shortIds: 'aa'}, valid: false}
+        - {name: ID is mapping, settings: {shortIds: {aa: bb}}, valid: false}
+        - {name: numeric ID, settings: {shortIds: [12]}, valid: false}
+        - {name: null ID, settings: {shortIds: [null]}, valid: false}
+        - {name: odd hex length, settings: {shortIds: ['abc']}, valid: false}
+        - {name: nonhex ID, settings: {shortIds: ['zz']}, valid: false}
+        - {name: oversized ID, settings: {shortIds: ['0123456789abcdef00']}, valid: false}
+        - {name: missing version segment, settings: {minClientVer: '1.8'}, valid: false}
+        - {name: out of range version, settings: {minClientVer: '256.1.1'}, valid: false}
+        - {name: negative version segment, settings: {minClientVer: '-1.8.1'}, valid: false}
+        - {name: prerelease suffix, settings: {minClientVer: '1.8.1-rc1'}, valid: false}
+        - {name: version is numeric, settings: {minClientVer: 1.8}, valid: false}
+        - {name: version is null, settings: {minClientVer: null}, valid: false}
+        - {name: invalid maximum version, settings: {maxClientVer: '1.2.999'}, valid: false}
+      loop_control:
+        loop_var: validation_case
+        label: "{{ validation_case.name }}"
+
+    - name: Read production Config Profile task ordering
+      set_fact:
+        _profile_task_names: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_config_profile.yml') | from_yaml | map(attribute='name') | list }}"
+
+    - name: Assert validation runs before either Config Profile write
+      assert:
+        that:
+          - "_profile_task_names.index('Validate desired REALITY inbounds before creating the Config Profile') < _profile_task_names.index('Create the Config Profile (only when absent)')"
+          - "_profile_task_names.index('Validate reconciled REALITY inbounds before updating the Config Profile') < _profile_task_names.index('Reconcile the existing Config Profile (sniffing/listen/REALITY-version/outbound merges + missing base inbounds)')"

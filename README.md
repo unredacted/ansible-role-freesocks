@@ -395,9 +395,13 @@ remnawave_relay_enabled: true
 remnawave_relay_inbound_uuid: "<configProfileInboundUuid of the relay inbound>"
 remnawave_relay_address: "<the EXTERNAL proxy edge — FQDN or IP>"
 remnawave_relay_sni: "<a serverName from the relay inbound>"
+# remnawave_relay_snis: []                # or SEVERAL serverNames -> one Host per entry (bootstrap emits the full list)
 # remnawave_relay_port: ""                # client-facing port ON THE EDGE (empty = 443)
 # remnawave_relay_fingerprint: ""         # empty = chrome
 remnawave_relay_repoint_ack: false        # required before change/migrate breaks the proxy origin
+# remnawave_relay_skip_dns: true          # default: publish NO A/AAAA record for the node itself
+remnawave_node_address_interface: "tailscale0"   # the panel dials the overlay IP, not the (unpublished) FQDN
+# deploy_target_domain may be OMITTED for this node kind (identity = bare custom_hostname)
 
 remnawave_panel_register_node: true
 ```
@@ -407,6 +411,10 @@ remnawave_panel_register_node: true
 > Bootstrap echoes the node-side port into its output file as `remnawave_relay_node_listen_port` (alongside `remnawave_relay_inbound_uuid` and `remnawave_relay_sni`, taken from the first `serverNames` entry) purely so node deploys can print that line — it configures nothing. Because that file loads as extra-vars, **do not also set `remnawave_relay_sni` in your own vars file**: the later `-e` would win and the effective value would depend on argument order.
 
 **`remnawave_relay_address` has no default, on purpose.** It is asserted, never defaulted to `dns_hostname`: a fallback would mean any run that forgot the variable silently publishes the node's real hostname to every subscriber and bypasses the proxy — worse than a failed run.
+
+**One Host per borrowed name** (`remnawave_relay_snis`). The relay inbound can borrow several `serverNames` from its one `dest`, and bootstrap writes that whole list into the generated vars file as `remnawave_relay_snis`. The role then creates one Host per entry, so every subscriber carries N configs that differ only in SNI and can switch to another name when one is SNI-blocked (an edge-IP block still takes all of them, and names on a *different* dest need a second inbound). Exactly one entry keeps the bare `<hostname>-relay` remark; with several, every entry gets a deterministic 6-hex `sha256(sni)` suffix — the same convention as multi-edge WS Hosts — and this node's relay Hosts whose remark is no longer desired are deleted, so growing, shrinking or reordering the list converges on the next run. Empty falls back to the single `remnawave_relay_sni`.
+
+**The node publishes no DNS record of its own** (`remnawave_relay_skip_dns`, default `true`). Nothing dials a relay node by name — clients dial the edge, the proxy backend dials the node by IP, the panel dials it over the overlay — so a public `<hostname>.<domain> → node IP` record would only tie the hidden node IP to a FreeSocks domain in passive DNS. Deploy, `change` and `migrate` all skip the node's own A/AAAA records (the deploy summary prints the node's IP as the proxy backend target instead). The corollary is that the panel must not be handed that FQDN as the node address either: a registered relay run with `remnawave_node_address_interface` empty and `remnawave_node_address` empty or equal to `dns_hostname` is refused before anything is installed — set the interface (`tailscale0`) or a name/IP the panel can resolve. Set the flag `false` only if something outside the role needs the record (a proxy console that insists on an FQDN backend). With it on, **`deploy_target_domain` is optional**: omit it and the node's identity is the bare `custom_hostname` (no zone, no DNS provider, `effective_cdn_provider: none`); give it and it namespaces the identity as before, still without a record. `change` and `migrate` keep their domain arguments (`change_target_domain` / `base_domain`), so a domainless node acquires a domain if you rotate or move it. `update` mode no longer needs a domain for any Remnawave node.
 
 **The edge is checked against the node, not just its hostname.** One file, `tasks/providers/remnawave/assert_relay_edge.yml`, owns the invariant. Deploy, `change` and `migrate` each include it as an early pre-flight so a bad edge fails before anything is mutated, and `create_relay_host.yml` includes it again — which makes it unavoidable, since every path that publishes a relay Host goes through there. It refuses an edge that is, or resolves to, this node: `dns_hostname`, **both** FQDNs of a rotation, `default_ipv4`/`default_ipv6`, every entry of `all_ipv4_addresses`/`all_ipv6_addresses`, this host's `envoy_mappings` addresses, and a best-effort `getent` resolution compared against all of the above. The resolution pass fails **only on a positive match** — an edge you can't resolve from the control host isn't an error, since your resolver isn't the client's. Documented limit: equivalent IPv6 *spellings* are not canonicalized (`2001:db8::1` vs `2001:0db8:0:0:0:0:0:1` compare as different strings), so give the edge in the form the node's facts report; `tests/test_relay.yml` `(t3)` pins that gap so it can't regress unnoticed.
 
@@ -430,6 +438,7 @@ remnawave_bootstrap_reality: true                  # false to skip the inbound e
 remnawave_bootstrap_reality_dest: ""               # REQUIRED — "<decoy host>:443"
 remnawave_bootstrap_reality_server_names: []       # REQUIRED — names that dest serves
 remnawave_bootstrap_reality_short_ids: [""]
+remnawave_bootstrap_reality_min_client_ver: "1.8.1"
 remnawave_bootstrap_reality_network: "raw"
 remnawave_bootstrap_reality_squad_name: "FreeSocks-Reality"
 
@@ -439,6 +448,7 @@ remnawave_bootstrap_relay: true
 remnawave_bootstrap_relay_dest: ""                 # REQUIRED when relay is on
 remnawave_bootstrap_relay_server_names: []         # REQUIRED when relay is on
 remnawave_bootstrap_relay_short_ids: [""]
+remnawave_bootstrap_relay_min_client_ver: "1.8.1"
 remnawave_bootstrap_relay_network: "raw"
 remnawave_bootstrap_relay_listen_port: 443         # port the inbound binds ON THE NODE
 remnawave_bootstrap_relay_accept_proxy_protocol: false
@@ -448,7 +458,15 @@ remnawave_bootstrap_relay_squad_name: "FreeSocks-Relay"
 remnawave_bootstrap_reconcile_inbounds: true
 ```
 
-**Adding relay to a panel that is already bootstrapped.** Reconciliation is **by tag**: re-running bootstrap against an existing `FreeSocks-Config` adds any missing base inbound via a full-replace `PATCH /api/config-profiles`. Existing inbounds are copied through **byte-for-byte and never rewritten**, so a re-run cannot rotate a live inbound's keys out from under connected clients. The corollary: editing `dest`/`serverNames` on an inbound that already exists is *not* reconciled — change it in the panel, or delete the inbound and re-run.
+**Adding relay to a panel that is already bootstrapped.** Reconciliation is **by tag**: re-running bootstrap against an existing `FreeSocks-Config` adds any missing base inbound via a full-replace `PATCH /api/config-profiles`. Existing inbounds receive selective merges for sniffing, opt-in listen addresses, and REALITY client versions while preserving their keys. Editing `dest`/`serverNames` on an inbound that already exists is *not* reconciled — change it in the panel, or delete the inbound and re-run.
+
+**Minimum REALITY client version.** Both `_min_client_ver` variables default to `"1.8.1"` and populate `streamSettings.realitySettings.minClientVer` in the panel's Xray config. Override them independently in inventory using quoted `x.y.z` strings. Re-run `operation_mode=bootstrap` with your usual bootstrap inventory to apply them to existing `VLESS_REALITY` / `VLESS_RELAY_REALITY` inbounds and legacy `VLESS_REALITY_<HOSTNAME>` clones. Only enabled bootstrap transports are updated; other REALITY settings and unrelated inbounds are preserved. Set `remnawave_bootstrap_reconcile_inbounds: false` to leave existing profiles untouched. Node deploy/update alone does not apply these settings.
+
+Before creating or updating a Config Profile, bootstrap validates REALITY `minClientVer`/`maxClientVer` (quoted `x.y.z`, components 0–255, or empty for Xray's default) and `shortIds` (a non-empty list of strings, each 0–16 hexadecimal characters in pairs). Invalid values fail before the profile write.
+
+**Existing client configs remain valid.** Bootstrap preserves existing REALITY keys and short IDs, including the empty ID. A manually copied config never refreshes itself; using a FreeSocks subscription URL only updates clients when they fetch it again. A future short-ID rotation would need to accept old and new IDs together during transition, and manually configured clients would need replacement configs before the old ID could be retired. This role does not perform that rotation.
+
+**Dual-stack preflight.** With `remnawave_xray_public_listen: "::"`, the role verifies local IPv6 and IPv4 connections to a temporary IPv6 wildcard socket before installing or forcibly recreating Remnawave. Migration checks the destination before transferring state or stopping the source. This checks local kernel/loopback support, not public routing or firewall reachability. For an IPv4-only host, set `remnawave_xray_public_listen: "0.0.0.0"` and configure its active panel inbounds to match; changing inventory alone does not change an existing panel listener. The check does not change sysctls.
 
 ### Caddy + Xray port coordination
 
@@ -458,7 +476,6 @@ If Caddy is disabled, use Reality or relay (no public cert needed) or mount your
 
 ### Notes
 
-- **slipstream coexistence:** `slipstream_mode=raw` (microsocks-backed) works alongside Remnawave; `slipstream_mode=shadowsocks` requires Outline.
 - **FCP registers the panel, not the node** — see the FCP section above.
 
 ## Outline: WebSocket (WSS) support
@@ -487,37 +504,6 @@ prom_hostname_suffix: ""
 
 > **FCP forces `/tcp` + `/udp`:** FCP issues Outline WSS keys with fixed client paths and no per-server path field. When both `fcp_enabled` and `outline_wss_enabled` are true, the role overrides the WSS paths to `/tcp` + `/udp` and disables randomization (logged) — otherwise issued keys would point at random paths Caddy isn't serving. Path randomization only applies on a non-FCP Outline deploy.
 
-## Outline: slipstream DNS tunnel
-
-`slipstream_enabled: true` tunnels traffic through DNS queries via recursive resolvers for extreme censorship resistance. slipstream **builds from source** (Rust on the target; can take several minutes).
-
-```yaml
-slipstream_enabled: true
-slipstream_mode: "shadowsocks"        # or "raw"
-slipstream_resolver: "77.88.8.8:53"   # Yandex DNS (on Russia's allowlist)
-slipstream_resolver_backup: "77.88.8.1:53"
-slipstream_version: "main"
-slipstream_dns_port: 53
-slipstream_socks_port: 1080           # raw mode
-
-# Required (via --extra-vars):
-slipstream_base_domain: "your-dns.example"  # must be in domain_providers
-slipstream_subdomain: "dns1"                # tunnel subdomain
-slipstream_ns_hostname: "ns1"               # nameserver hostname
-slipstream_create_dns_records: true         # auto-create NS + A/AAAA (default true)
-```
-
-| | `shadowsocks` mode | `raw` mode |
-|---|---|---|
-| Server target | outline-ss-server:443 | microsocks (SOCKS5):1080 |
-| Client needs | slipstream-client + ss-local | slipstream-client only |
-| Encryption | QUIC + Shadowsocks | QUIC only |
-| Coexists with | Outline | Outline **or** Remnawave |
-
-When `slipstream_create_dns_records: true`, the role delegates the tunnel subdomain to the server (`dns1 IN NS ns1`, plus `ns1` A/AAAA). Use different `slipstream_subdomain`/`slipstream_ns_hostname` per server (`dns1`/`ns1`, `dns2`/`ns2`, …); infrastructure-looking names (`dns`, `mail`, `ns`, `api`, `cdn`) draw less attention. Client build/usage is documented in the slipstream-rust repo.
-
-> slipstream artifacts (cert, resolver config) are generated on the server; they are **not** published to FCP today. Delivering them to clients is out of scope for control-plane registration.
-
 ## Component flags reference
 
 | Flag | Default | Description |
@@ -530,18 +516,21 @@ When `slipstream_create_dns_records: true`, the role delegates the tunnel subdom
 | `remnawave_reality_enabled` | `false` | VLESS+Vision+Reality direct node (needs `_inbound_uuid` + `_sni`) |
 | `remnawave_relay_enabled` | `false` | VLESS+REALITY behind an external L4 proxy — DEDICATED node (asserts Caddy / direct Reality / Fastly / per-node placement all off; needs `_inbound_uuid` + `_address` + `_sni`) |
 | `remnawave_relay_repoint_ack` | `false` | Acknowledge you'll re-point the proxy backend before a relay `change`/`migrate` breaks it |
+| `remnawave_relay_snis` | `[]` | Several borrowed serverNames → one relay Host per entry (all must be on the inbound's one `dest`); bootstrap emits the full list; empty = `[remnawave_relay_sni]` |
+| `remnawave_relay_skip_dns` | `true` | Publish NO A/AAAA record for a relay node itself (nothing dials it by name); the panel address must then be an overlay interface/name, which the role asserts |
 | `remnawave_node_reconcile_address` | `false` | PATCH a reused panel node whose address/port drifted |
 | `remnawave_per_node_placement` | `false` | Legacy per-node inbound clones + squads (default = shared squads) |
 | `force_reinstall_remnawave` | `false` | Re-template compose + recreate the node container |
 | `force_wipe_remnawave` | `false` | **Destructive**: tear down placement, delete panel node + install dir |
 | `fcp_enabled` | `false` | Register server (Outline) / panel (Remnawave, opt-in) with FCP |
-| `slipstream_enabled` | `false` | Deploy slipstream DNS tunnel |
-| `slipstream_mode` | `shadowsocks` | `shadowsocks` (tunnel to SS) or `raw` (direct SOCKS5) |
-| `force_reinstall_slipstream` | `false` | Reinstall slipstream even if present |
-| `force_rebuild_slipstream` | `false` | Rebuild the slipstream binary from source |
 | `force_reinstall_wss` | `false` | Regenerate WSS config |
 
 ## Mode examples
+
+Slipstream support has been removed, including its installer, DNS management,
+service template and deploy/update options. Requests to enable or rebuild it
+fail early. Existing Slipstream services, certificates and DNS records are not
+automatically deleted; decommission those separately before retiring the tunnel.
 
 ```bash
 # Deploy: Outline only (default backend)
@@ -551,11 +540,6 @@ ansible-playbook playbook.yml \
 # Deploy: Outline + WSS (CDN fronting)
 ansible-playbook playbook.yml \
   --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com outline_wss_enabled=true"
-
-# Deploy: slipstream only (raw mode, no Outline)
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=deploy environment_mode=prod deploy_target_domain=example.com" \
-  --extra-vars "outline_enabled=false slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.example"
 
 # Deploy: Remnawave node (Panel API workflow — role fetches SECRET_KEY + registers node)
 ansible-playbook playbook.yml --ask-vault-pass \
@@ -575,12 +559,6 @@ ansible-playbook playbook.yml \
   --extra-vars "operation_mode=migrate environment_mode=prod dns_provider=cloudflare" \
   --extra-vars "source_hostname=old-server source_kv_hostname=apple-banana" \
   --extra-vars "destination_hostname=new-server destination_kv_hostname=apple-banana"
-
-# Update: add slipstream (raw) to an existing Outline server
-ansible-playbook playbook.yml \
-  --extra-vars "operation_mode=update environment_mode=prod" \
-  --extra-vars "slipstream_enabled=true slipstream_mode=raw slipstream_base_domain=your-dns.example" \
-  --extra-vars "slipstream_subdomain=dns1 slipstream_ns_hostname=ns1"
 
 # Update: re-pull and recreate a Remnawave node (new image tag)
 ansible-playbook playbook.yml --ask-vault-pass \
@@ -602,12 +580,12 @@ ansible-playbook playbook.yml --ask-vault-pass \
 tasks/
 ├── main.yml                    # Orchestrator + provider routing
 ├── setup/                      # install, outline, outline_api_proxy, websocket,
-│                               #   wss_paths, docker, remnawave, caddy, decoy, slipstream
+│                               #   wss_paths, docker, remnawave, remnawave_ipv6, caddy, decoy
 ├── change/                     # change (dispatcher), outline_change, remnawave_change
 ├── migrate/                    # migrate, transfer_config, transfer_remnawave, containers
 ├── update/                     # remnawave_update
 └── providers/
-    ├── cloudflare/             # dns, slipstream_dns, migrate/
+    ├── cloudflare/             # dns, migrate/
     ├── fastly/                 # origin_identity, service, tls, tls_domain, dns, dns_edge, cleanup
     ├── remnawave/              # keygen, resolve_node_address, register_node, update_node,
     │                           #   delete_node, create_hosts, create_reality_host,
@@ -632,6 +610,9 @@ ansible-playbook tests/test_bootstrap.yml # or one at a time
 | Test | Covers |
 |---|---|
 | `test_bootstrap.yml` | the three base inbounds + tag→UUID mapping, FCP mode-placement bodies (full-replace + per-node `addSquadUuids`), the legacy per-node inbound plan/clone logic incl. re-run idempotency, x25519 shape tolerance |
+| `test_reality_client_version.yml` | production inbound assembly and reconciliation, independent version overrides, key/short-ID preservation and idempotency |
+| `test_reality_validation.yml` | valid legacy short IDs and version bounds, malformed inputs, validation before profile writes |
+| `test_remnawave_ipv6.yml` | actual dual-stack socket probe, unsupported-kernel rejection, IPv4-only skip and lifecycle ordering |
 | `test_relay.yml` | the relay transport and the lifecycle gates it shares with the other direct transports: `.relay_address` parsing/precedence, the `cleanup_hosts.yml` remark regex, the migrate source-capability truth table, change/migrate repoint gates, relay-only inbound activation, Host drift, the anti-leak invariant, plus **structural** guards pinning task ORDERING (destination gates before the first mutation, Host GET before the idempotency decision, gates keyed on resolved `*_effective` facts rather than raw flags) |
 | `test_node_address.yml` | interface-vs-name precedence, IPv6 global-scope selection, sanitized fact keys, both platform fact shapes, and every fail-closed path |
 | `test_caddyfile_render.yml` | the Remnawave Caddyfile structure (transport routes + decoy fallback) |

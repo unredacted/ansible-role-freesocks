@@ -2,6 +2,9 @@
 # tasks/setup/remnawave.yml - Remnawave Node container deployment
 
 # === Validation ===
+- name: Check Remnawave listener support before installation
+  include_tasks: setup/remnawave_ipv6.yml
+
 - name: Validate Remnawave required variables
   assert:
     that:

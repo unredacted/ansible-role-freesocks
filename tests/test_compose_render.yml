@@ -1,0 +1,73 @@
+---
+# tests/test_compose_render.yml
+#
+# Renders templates/remnanode-docker-compose.yml.j2 and asserts the contract the
+# node container depends on:
+#   (a) the image tag is the role default (paired with the panel major);
+#   (b) NFTABLES_LOGGING is rendered and OFF by default — the 3.x node logs client
+#       IPs from its nftables plugins otherwise, which the no-log posture forbids.
+#       This is the regression the fleet hit: nodes updated by hand carried the
+#       variable, a fresh role deploy did not;
+#   (c) SECRET_KEY stays UNQUOTED (compose list-env keeps quotes literally, which
+#       would corrupt the base64 payload);
+#   (d) the opt-in flips the value to "true" (so the variable is a real switch).
+#
+# Run: ansible-playbook tests/test_compose_render.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    remnawave_node_install_dir: /opt/remnanode
+    remnawave_node_port: 2222
+    remnawave_panel_secret_key: "eyJhbGciOiJIUzI1NiJ9.fixture.payload=="
+    remnawave_log_dir: /var/log/remnanode
+  tasks:
+    - name: Load role defaults (image tag + logging default)
+      include_vars:
+        file: ../defaults/main.yml
+
+    # include_vars outranks play vars, so the fixture secret has to be re-set as a
+    # fact; and the opt-in toggle is materialized via set_fact rather than task
+    # vars — a task-level var is not reliably seen by lookup('template') under the
+    # 2.19 lazy-templating rules (see CLAUDE.md HARD RULE).
+    - name: Pin the fixture secret and the DEFAULT logging value as facts
+      set_fact:
+        remnawave_panel_secret_key: "eyJhbGciOiJIUzI1NiJ9.fixture.payload=="
+        remnawave_node_nftables_logging: "{{ remnawave_node_nftables_logging }}"
+
+    - name: Render the compose template with defaults
+      set_fact:
+        _compose: "{{ lookup('template', playbook_dir ~ '/../templates/remnanode-docker-compose.yml.j2') }}"
+
+    - name: Opt IN to nftables logging
+      set_fact:
+        remnawave_node_nftables_logging: true
+
+    - name: Render again with nftables logging opted IN
+      set_fact:
+        _compose_on: "{{ lookup('template', playbook_dir ~ '/../templates/remnanode-docker-compose.yml.j2') }}"
+
+    - name: Parse the rendered compose
+      set_fact:
+        _svc: "{{ (_compose | from_yaml).services.remnanode }}"
+        _svc_on: "{{ (_compose_on | from_yaml).services.remnanode }}"
+
+    - name: Assert the compose contract
+      assert:
+        that:
+          - _svc.image == remnawave_node_image
+          - remnawave_node_image is match('^remnawave/node:3\.')
+          - "'NFTABLES_LOGGING=false' in _svc.environment"
+          - "'NFTABLES_LOGGING=true' in _svc_on.environment"
+          - "('SECRET_KEY=' ~ remnawave_panel_secret_key) in _svc.environment"
+          - "('NODE_PORT=' ~ remnawave_node_port) in _svc.environment"
+          - _svc.network_mode == 'host'
+          - "'NET_ADMIN' in _svc.cap_add"
+        fail_msg: >-
+          compose contract broken. image={{ _svc.image }} env={{ _svc.environment }}
+          env(opt-in)={{ _svc_on.environment }}
+        success_msg: "compose: image {{ _svc.image }}, NFTABLES_LOGGING off by default (on when opted in), SECRET_KEY unquoted."
+
+    - name: All compose render tests passed
+      debug:
+        msg: OK

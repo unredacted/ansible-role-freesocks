@@ -1,0 +1,107 @@
+---
+# tasks/providers/remnawave/create_relay_host_one.yml
+#
+# ONE relay Host: included per SNI by create_relay_host.yml (the driver), which
+# has already validated the inputs, run the anti-leak assert, fetched the live
+# Hosts into _remnawave_relay_hosts and retired stale remarks. Input is
+# _relay_target = [sni, remark]. Do not include this file directly.
+#
+# Idempotency is by remark, but the remark does not encode the endpoint — and the
+# relay endpoint is the MANUAL proxy edge, the one field an operator changes
+# independently of the hostname. On a same-name rotation or migration the remark
+# already exists, so a plain skip would keep advertising the OLD edge while
+# .relay_address is rewritten with the new one: subscriptions and the marker would
+# disagree, and every later lifecycle run would trust the marker.
+#
+# So: detect drift and replace. Delete-then-POST rather than PATCH /api/hosts —
+# both endpoints used here are already exercised by this role, whereas the Host
+# PATCH contract is not, and this is not the place to take that risk.
+- name: Identify an existing relay Host with this remark
+  set_fact:
+    _relay_existing: >-
+      {{ (_remnawave_relay_hosts | selectattr('remark', 'equalto', _relay_target.1)
+          | list | first) | default({}, true) }}
+
+# The Host's inbound binding drifts independently of its endpoint: deleting and
+# reconciling the relay inbound mints a NEW configProfileInboundUuid (a workflow
+# this role documents, since editing dest/serverNames on an existing tag is not
+# reconciled). The node would then activate the new inbound while the Host still
+# referenced the old one, so subscriptions point at a stale binding.
+#
+# GET /api/hosts exposes it as inbound.{configProfileUuid,configProfileInboundUuid}
+# (verified against the panel OpenAPI). The comparison only claims drift when the
+# response ACTUALLY carries a value — an absent field must not read as a mismatch,
+# or the Host would be deleted and re-created on every single run.
+- name: Materialize the existing relay Host's inbound binding
+  set_fact:
+    _relay_existing_inbound: "{{ (_relay_existing.inbound | default({}, true)) if (_relay_existing.inbound is defined) else {} }}"
+
+- name: Detect drift on the existing relay Host (endpoint, SNI or inbound binding)
+  set_fact:
+    _relay_drift: >-
+      {{ ((_relay_existing.uuid | default('')) | length > 0)
+         and (((_relay_existing.address | default('')) != (remnawave_relay_address | default('')))
+              or ((_relay_existing.port | default(0) | int) != (remnawave_relay_port | default(443, true) | int))
+              or ((_relay_existing.sni | default('')) != _relay_target.0)
+              or ((_relay_existing.fingerprint | default('chrome')) != (remnawave_relay_fingerprint | default('chrome', true)))
+              or (((_relay_existing_inbound.configProfileInboundUuid | default('')) | length > 0)
+                  and ((_relay_existing_inbound.configProfileInboundUuid | default('')) != (remnawave_relay_inbound_uuid | default(''))))
+              or (((_relay_existing_inbound.configProfileUuid | default('')) | length > 0)
+                  and ((_relay_existing_inbound.configProfileUuid | default('')) != (remnawave_panel_config_profile_uuid | default(''))))) }}
+
+- name: Delete the stale relay Host before re-creating it (drift)
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts/{{ _relay_existing.uuid }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Accept: "application/json"
+    status_code: [200, 204, 404]
+  delegate_to: localhost
+  no_log: true
+  when: _relay_drift | bool
+
+- name: Note that the relay Host is being re-pointed
+  debug:
+    msg: >-
+      Relay Host {{ _relay_target.1 }} is being re-created: its endpoint
+      changed from {{ _relay_existing.address | default('?') }}:{{ _relay_existing.port | default('?') }}
+      (sni {{ _relay_existing.sni | default('?') }}, inbound
+      {{ _relay_existing_inbound.configProfileInboundUuid | default('?') }}) to
+      {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
+      (sni {{ _relay_target.0 }}).
+  when: _relay_drift | bool
+
+- name: Create the relay Host
+  uri:
+    url: "{{ remnawave_panel_url }}/api/hosts"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ remnawave_panel_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body:
+      inbound:
+        configProfileUuid: "{{ remnawave_panel_config_profile_uuid }}"
+        configProfileInboundUuid: "{{ remnawave_relay_inbound_uuid }}"
+      remark: "{{ _relay_target.1 }}"
+      # The PROXY EDGE plus the edge port mapped to THIS node — one edge can
+      # front several nodes on different ports.
+      address: "{{ remnawave_relay_address }}"
+      port: "{{ remnawave_relay_port | default(443, true) | int }}"
+      sni: "{{ _relay_target.0 }}"
+      fingerprint: "{{ remnawave_relay_fingerprint | default('chrome', true) }}"
+      securityLayer: "DEFAULT"
+      # address is the edge, sni is the borrowed site — they intentionally differ,
+      # so the panel must not overwrite one from the other. No path/host/alpn:
+      # this is raw TCP, not WebSocket.
+      overrideSniFromAddress: false
+    status_code: [200, 201, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: remnawave_relay_host_result
+  when: >-
+    ((_relay_existing.uuid | default('')) | length == 0)
+    or (_relay_drift | bool)
