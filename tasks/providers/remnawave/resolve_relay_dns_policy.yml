@@ -1,0 +1,25 @@
+---
+# Empty inventory value means automatic: use the persisted policy; a legacy
+# marker without skip_dns published DNS. Only brand-new relays default to skip.
+- name: Validate the relay DNS policy override
+  assert:
+    that:
+      - (remnawave_relay_skip_dns | default('') | string | lower) in ['', 'true', 'false']
+    fail_msg: "remnawave_relay_skip_dns must be true, false, or empty for the persisted/default policy."
+
+- name: Read the persisted relay DNS policy
+  set_fact:
+    _relay_dns_saved: "{{ (_relay_dns_marker_text | default('') | regex_search('^skip_dns=.*', multiline=true) | default('', true)) | regex_replace('^skip_dns=', '') | trim }}"
+
+- name: Validate the persisted relay DNS policy
+  assert:
+    that: _relay_dns_saved in ['', 'true', 'false']
+    fail_msg: "The relay marker has an invalid skip_dns value; repair it before changing DNS."
+
+- name: Resolve the effective relay DNS policy
+  set_fact:
+    remnawave_relay_skip_dns_effective: >-
+      {{ (remnawave_relay_skip_dns | bool)
+         if ((remnawave_relay_skip_dns | default('') | string) | length > 0)
+         else ((_relay_dns_saved | bool) if (_relay_dns_saved | length > 0)
+               else not (_relay_dns_marker_exists | default(false) | bool)) }}

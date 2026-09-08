@@ -491,8 +491,8 @@ remnawave_relay_fingerprint: ""
 # output file so the deploy summary can print the exact "point your proxy backend
 # here" line. Configures nothing.
 remnawave_relay_node_listen_port: 443
-# change/migrate acknowledgement: rotating or moving a relay node changes the
-# ORIGIN the manual proxy dials, and only a human can update the proxy console.
+# Migration always needs acknowledgement because the origin machine changes.
+# Rotation requires it only for publish-DNS relays deleting their old FQDN.
 # See tasks/change/remnawave_change.yml + tasks/migrate/migrate.yml.
 remnawave_relay_repoint_ack: false
 # Do NOT publish the node's own A/AAAA record. A relay node has no client-visible
@@ -508,7 +508,10 @@ remnawave_relay_repoint_ack: false
 # console that insists on an FQDN backend). With it on, deploy_target_domain is
 # OPTIONAL: omit it and the node's identity is the bare hostname (no zone, no
 # provider); give it and it namespaces the identity as before, still no record.
-remnawave_relay_skip_dns: true
+# Empty = auto: new relay deploys skip DNS; change/migrate recover the saved
+# policy. Legacy markers without a policy retain publish-DNS behavior.
+# An explicit true/false overrides the saved policy and is persisted.
+remnawave_relay_skip_dns: ""
 
 # ============================================================================
 # Fastly CDN Configuration

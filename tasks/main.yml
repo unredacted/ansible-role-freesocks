@@ -121,12 +121,23 @@
 # fact resolves to 'none', so each DNS/CDN task skips on its own condition.
 # Every other node kind still requires it. Evaluated once, here, so the asserts
 # below and the provider set_facts share one answer.
+- name: Resolve the relay DNS policy for a new deployment
+  include_tasks: providers/remnawave/resolve_relay_dns_policy.yml
+  when: operation_mode | default('') == 'deploy'
+
+- name: Resolve whether this deployment needs DNS providers
+  set_fact:
+    _deploy_skip_dns: >-
+      {{ (operation_mode | default('') == 'deploy')
+         and (remnawave_relay_enabled | default(false) | bool)
+         and (remnawave_relay_skip_dns_effective | default(false) | bool) }}
+
 - name: Resolve whether this deploy is a domainless relay node
   set_fact:
     _deploy_domainless: >-
       {{ (operation_mode | default('') == 'deploy')
          and (remnawave_relay_enabled | default(false) | bool)
-         and (remnawave_relay_skip_dns | default(true) | bool)
+         and (remnawave_relay_skip_dns_effective | default(true) | bool)
          and ((deploy_target_domain | default('')) | length == 0) }}
 
 - name: Fail if deploy_target_domain is not provided (Deploy Mode)
@@ -146,7 +157,7 @@
     msg: "domain_providers mapping is required for deploy mode."
   when:
     - operation_mode == 'deploy'
-    - not (_deploy_domainless | bool)
+    - not (_deploy_skip_dns | bool)
     - (domain_providers is not defined or domain_providers | length == 0)
 
 - name: Fail if target domain not found in domain_providers (Deploy Mode)
@@ -156,7 +167,7 @@
       Available domains: {{ domain_providers.keys() | list | join(', ') }}
   when:
     - operation_mode == 'deploy'
-    - not (_deploy_domainless | bool)
+    - not (_deploy_skip_dns | bool)
     - deploy_target_domain not in domain_providers
 
 - name: Fail if the deploy target domain lacks dns_provider/zone_id
@@ -167,7 +178,7 @@
       error.
   when:
     - operation_mode == 'deploy'
-    - not (_deploy_domainless | bool)
+    - not (_deploy_skip_dns | bool)
     - deploy_target_domain in domain_providers
     - domain_providers[deploy_target_domain].dns_provider is not defined
       or domain_providers[deploy_target_domain].zone_id is not defined
@@ -180,7 +191,7 @@
       'cloudflare' is supported. A typo here would silently skip every DNS task.
   when:
     - operation_mode == 'deploy'
-    - not (_deploy_domainless | bool)
+    - not (_deploy_skip_dns | bool)
     - deploy_target_domain in domain_providers
     - domain_providers[deploy_target_domain].dns_provider is defined
     - domain_providers[deploy_target_domain].dns_provider != 'cloudflare'
@@ -202,23 +213,24 @@
     cloudflare_zone_id: "{{ domain_providers[deploy_target_domain].zone_id }}"
   when:
     - operation_mode == 'deploy'
-    - not (_deploy_domainless | bool)
+    - not (_deploy_skip_dns | bool)
 
-# Domainless relay: no provider, no zone, no domain. Every DNS/CDN task downstream
+# Unpublished relay: no provider or zone; an optional domain only names the node.
+# Every DNS/CDN task downstream
 # keys on effective_dns_provider / effective_cdn_provider, so 'none' makes them
 # skip on their own conditions — nothing below has to know about this case.
-- name: Set provider configuration for a domainless relay deploy
+- name: Set provider configuration for an unpublished relay deploy
   set_fact:
     target_domain_config: {}
     effective_dns_provider: "none"
     effective_cdn_provider: "none"
     effective_fastly_domain_mode: "shared"
     effective_zone_id: ""
-    base_domain: ""
-    api_domain: ""
-    prom_domain: ""
+    base_domain: "{{ deploy_target_domain | default('') }}"
+    api_domain: "{{ deploy_target_domain | default('') }}"
+    prom_domain: "{{ deploy_target_domain | default('') }}"
     cloudflare_zone_id: ""
-  when: _deploy_domainless | default(false) | bool
+  when: _deploy_skip_dns | default(false) | bool
 
 - name: Validate Fastly configuration (deploy)
   fail:
@@ -677,7 +689,7 @@
           or publish the record after all with -e remnawave_relay_skip_dns=false.
       when:
         - remnawave_relay_enabled | default(false) | bool
-        - remnawave_relay_skip_dns | default(true) | bool
+        - remnawave_relay_skip_dns_effective | default(true) | bool
         - remnawave_panel_register_node | default(false) | bool
         - (remnawave_node_address_interface | default('')) | length == 0
         - (remnawave_node_address | default('', true)) in ['', dns_hostname]
@@ -687,7 +699,7 @@
       when:
         - effective_dns_provider == 'cloudflare'
         # A relay node publishes no record of its own (remnawave_relay_skip_dns).
-        - not ((remnawave_relay_enabled | default(false) | bool) and (remnawave_relay_skip_dns | default(true) | bool))
+        - not ((remnawave_relay_enabled | default(false) | bool) and (remnawave_relay_skip_dns_effective | default(true) | bool))
 
     # Base installation (common packages)
     - name: Include base installation tasks
@@ -912,13 +924,13 @@
             ✓ WebSocket transport (WSS)
           {% endif %}
           {% if remnawave_relay_enabled | default(false) | bool %}
-          {% set _relay_backend = (((envoy_mappings | default({}))[inventory_hostname] | default({}))['ipv4'] | default([]) | first | default(ansible_facts['default_ipv4']['address'] | default('<node public IP>'), true)) if (remnawave_relay_skip_dns | default(true) | bool) else dns_hostname %}
+          {% set _relay_backend = (((envoy_mappings | default({}))[inventory_hostname] | default({}))['ipv4'] | default([]) | first | default(ansible_facts['default_ipv4']['address'] | default('<node public IP>'), true)) if (remnawave_relay_skip_dns_effective | default(true) | bool) else dns_hostname %}
             ✓ relay transport (VLESS+REALITY via a manual external L4 proxy)
                 clients dial : {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }} (sni {{ (remnawave_relay_snis if ((remnawave_relay_snis | default([])) | length > 0) else [remnawave_relay_sni | default('')]) | join(' | ') }})
                 CONFIGURE BY HAND: point the proxy's backend at
                   {{ _relay_backend }}:{{ remnawave_relay_node_listen_port | default(443) }}  (raw TCP, no TLS at the edge)
                 The role cannot do this — it talks to no proxy provider.
-          {% if remnawave_relay_skip_dns | default(true) | bool %}
+          {% if remnawave_relay_skip_dns_effective | default(true) | bool %}
                 No DNS record was published for {{ dns_hostname }} (remnawave_relay_skip_dns).
           {% endif %}
           {% endif %}

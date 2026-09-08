@@ -2,6 +2,9 @@
 # tasks/setup/remnawave.yml - Remnawave Node container deployment
 
 # === Validation ===
+- name: Resolve the relay DNS policy before persisting a new deployment
+  include_tasks: providers/remnawave/resolve_relay_dns_policy.yml
+
 - name: Check Remnawave listener support before installation
   include_tasks: setup/remnawave_ipv6.yml
 
@@ -197,6 +200,7 @@
     content: |
       address={{ remnawave_relay_address }}
       port={{ remnawave_relay_port | default(443, true) | int }}
+      skip_dns={{ 'true' if remnawave_relay_skip_dns_effective else 'false' }}
       fingerprint={{ remnawave_relay_fingerprint | default('chrome', true) }}
     dest: "{{ remnawave_node_install_dir }}/.relay_address"
     mode: '0640'

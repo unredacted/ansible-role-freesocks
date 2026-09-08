@@ -25,6 +25,10 @@
         - {name: prerelease suffix, settings: {minClientVer: '1.8.1-rc1'}, valid: false}
         - {name: version is numeric, settings: {minClientVer: 1.8}, valid: false}
         - {name: version is null, settings: {minClientVer: null}, valid: false}
+        - {name: inverted interval, settings: {maxClientVer: '1.8.0'}, valid: false}
+        - {name: equal bounds, settings: {maxClientVer: '1.8.1'}, valid: true}
+        - {name: numeric version ordering, settings: {minClientVer: '1.9.0', maxClientVer: '1.10.0'}, valid: true}
+        - {name: inverted numeric ordering, settings: {minClientVer: '1.10.0', maxClientVer: '1.9.0'}, valid: false}
         - {name: invalid maximum version, settings: {maxClientVer: '1.2.999'}, valid: false}
       loop_control:
         loop_var: validation_case

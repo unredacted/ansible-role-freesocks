@@ -136,6 +136,16 @@
 # The non-group regex_search form also returns None rather than raising when
 # nothing matches, so a missing/empty/garbage marker yields '' instead of a
 # traceback (the group form raises 'NoneType has no attribute group').
+- name: Require a readable source relay marker before migration
+  assert:
+    that: source_relay_raw.content is defined
+    fail_msg: "The source relay marker exists but could not be read. Restore access before migration; its DNS policy must be preserved."
+  any_errors_fatal: true
+  when:
+    - inventory_hostname == source_hostname
+    - migrate_component == 'remnawave'
+    - source_relay_marker.stat.exists | default(false) | bool
+
 - name: Materialize the source relay endpoint
   set_fact:
     migrate_source_relay_address: >-
@@ -323,9 +333,18 @@
 
 # Derived separately: a set_fact cannot read a key it defines in the same task
 # (2.19). A relay destination publishes no record of its own by default.
+- name: Recover the source relay DNS policy on the destination
+  include_tasks: providers/remnawave/resolve_relay_dns_policy.yml
+  vars:
+    _relay_dns_marker_text: "{{ (hostvars[source_hostname].source_relay_raw.content | b64decode) if hostvars[source_hostname].source_relay_raw.content is defined else '' }}"
+    _relay_dns_marker_exists: "{{ hostvars[source_hostname].source_relay_marker.stat.exists | default(false) }}"
+  when:
+    - inventory_hostname == destination_hostname
+    - migrate_component == 'remnawave'
+
 - name: Resolve whether the destination publishes its own DNS record
   set_fact:
-    _migrate_relay_skip_dns_effective: "{{ (_migrate_relay_effective | bool) and (remnawave_relay_skip_dns | default(true) | bool) }}"
+    _migrate_relay_skip_dns_effective: "{{ (_migrate_relay_effective | bool) and (remnawave_relay_skip_dns_effective | bool) }}"
   when:
     - inventory_hostname == destination_hostname
     - migrate_component == 'remnawave'
@@ -487,7 +506,7 @@
       origin until you update its console — the role cannot do that for you.
 
         source origin  : {{ source_kv_hostname | default('(unknown)') }}
-        dest origin    : {{ dns_hostname | default('(unknown)') }}
+        dest origin    : {{ (ansible_facts['default_ipv4']['address'] | default('<destination node IP>')) if _migrate_relay_skip_dns_effective else (dns_hostname | default('(unknown)')) }}
         dest IP        : {{ ansible_facts['default_ipv4']['address'] | default('(unknown)') }}
         node-side port : {{ remnawave_relay_node_listen_port | default(443) }}
         proxy edge     : {{ _migrate_relay_address_effective }}:{{ _migrate_relay_port_effective }}
@@ -1019,6 +1038,7 @@
       address={{ _migrate_relay_address_effective }}
       port={{ _migrate_relay_port_effective | int }}
       fingerprint={{ _migrate_relay_fingerprint_effective }}
+      skip_dns={{ 'true' if _migrate_relay_skip_dns_effective else 'false' }}
     dest: "{{ remnawave_node_install_dir }}/.relay_address"
     mode: '0640'
   become: "{{ remnawave_persist_become | default(true) }}"

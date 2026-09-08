@@ -1406,13 +1406,13 @@
         - 'Fail if target domain not found in domain_providers (Deploy Mode)'
         - 'Fail if the deploy target domain lacks dns_provider/zone_id'
         - 'Set provider configuration for deploy target domain'
-        - 'Set provider configuration for a domainless relay deploy'
+        - 'Set provider configuration for an unpublished relay deploy'
 
     - name: Assert each of those tasks is gated on _deploy_domainless
       assert:
         that:
           - (item.start | int) > 0
-          - "'_deploy_domainless' in item.body"
+          - "('_deploy_domainless' in item.body) or ('_deploy_skip_dns' in item.body)"
         fail_msg: >-
           tasks/main.yml :: '{{ item.task }}' (at {{ item.start }}) is not gated on
           _deploy_domainless — a domainless relay deploy would fail here. -1 means the
@@ -1522,12 +1522,12 @@
       set_fact:
         _w_defaults: "{{ lookup('file', playbook_dir ~ '/../defaults/main.yml') }}"
 
-    - name: Assert the skip is the shipped default
+    - name: Assert the automatic DNS policy is the shipped default
       assert:
         that:
-          - "'remnawave_relay_skip_dns: true' in _w_defaults"
-        fail_msg: "remnawave_relay_skip_dns must default to true — a relay node must not publish its own address."
-        success_msg: "(w) remnawave_relay_skip_dns defaults on."
+          - "(_w_defaults | from_yaml).remnawave_relay_skip_dns == ''"
+        fail_msg: "The relay DNS policy must remain configurable; automatic-policy behavior is exercised by test_relay_review.yml."
+        success_msg: "(w) remnawave_relay_skip_dns defaults to automatic policy."
 
     - name: Slice every task that would publish the node's own record
       set_fact:

@@ -1,0 +1,37 @@
+---
+- name: Set the resolved policy used by each lifecycle writer
+  set_fact:
+    remnawave_relay_skip_dns_effective: "{{ marker_case.skip }}"
+    _change_relay_skip_dns: "{{ marker_case.skip }}"
+    _migrate_relay_skip_dns_effective: "{{ marker_case.skip }}"
+
+- name: Load the production relay marker writer
+  set_fact:
+    _marker_writer: >-
+      {{ (lookup('file', playbook_dir ~ '/../' ~ marker_case.file) | from_yaml
+          | selectattr('name', 'equalto', marker_case.writer) | first)['copy'] }}
+
+- name: Execute the production copy content with only its destination redirected
+  block:
+    - copy:
+        dest: "{{ _review_tasks_file.path }}.{{ marker_case.mode }}.{{ marker_case.skip }}.yml"
+        mode: '0600'
+        content: "{{ [{'copy': (_marker_writer | combine({'dest': _review_tasks_file.path ~ '.marker'}))}] | to_nice_yaml }}"
+    - include_tasks: "{{ _review_tasks_file.path }}.{{ marker_case.mode }}.{{ marker_case.skip }}.yml"
+    - slurp:
+        src: "{{ _review_tasks_file.path }}.marker"
+      register: _marker_roundtrip
+    - include_tasks: ../tasks/providers/remnawave/resolve_relay_dns_policy.yml
+      vars:
+        remnawave_relay_skip_dns: ''
+        _relay_dns_marker_exists: true
+        _relay_dns_marker_text: "{{ _marker_roundtrip.content | b64decode }}"
+    - assert:
+        that: remnawave_relay_skip_dns_effective == marker_case.skip
+  always:
+    - file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _review_tasks_file.path }}.{{ marker_case.mode }}.{{ marker_case.skip }}.yml"
+        - "{{ _review_tasks_file.path }}.marker"

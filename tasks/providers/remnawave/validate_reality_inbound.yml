@@ -36,3 +36,15 @@
     _reality_version: "{{ _reality_validation_inbound.streamSettings.realitySettings[item] | default('') }}"
   loop: [minClientVer, maxClientVer]
   no_log: true
+
+- name: Validate REALITY minimum does not exceed maximum
+  assert:
+    that:
+      - >-
+        (_reality_validation_inbound.streamSettings.realitySettings.minClientVer.split('.') | map('int') | list)
+        <= (_reality_validation_inbound.streamSettings.realitySettings.maxClientVer.split('.') | map('int') | list)
+    fail_msg: "REALITY minClientVer must not exceed maxClientVer. No Config Profile update was sent."
+  when:
+    - _reality_validation_inbound.streamSettings.realitySettings.minClientVer | default('') | length > 0
+    - _reality_validation_inbound.streamSettings.realitySettings.maxClientVer | default('') | length > 0
+  no_log: true

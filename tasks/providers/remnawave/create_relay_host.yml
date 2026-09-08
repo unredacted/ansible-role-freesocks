@@ -34,6 +34,15 @@
 
 # The list wins over the single value; both come from the bootstrap output file.
 # Blank entries are dropped so a stray "" cannot mint a Host with an empty SNI.
+- name: Validate the relay SNI list type
+  assert:
+    that:
+      - remnawave_relay_snis | default([]) is sequence
+      - remnawave_relay_snis | default([]) is not string
+      - remnawave_relay_snis | default([]) is not mapping
+      - remnawave_relay_snis | default([]) | reject('string') | list | length == 0
+    fail_msg: "remnawave_relay_snis must be a list of SNI strings, e.g. ['decoy.example'], not a scalar or mapping."
+
 - name: Resolve the relay SNI set (remnawave_relay_snis, else [remnawave_relay_sni])
   set_fact:
     _relay_snis: >-

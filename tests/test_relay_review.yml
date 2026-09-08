@@ -1,0 +1,143 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Exercise persisted and legacy DNS policy precedence
+      include_tasks: relay_dns_policy_case.yml
+      loop:
+        - {override: '', marker: '', exists: false, want: true}
+        - {override: '', marker: 'address=edge.example', exists: true, want: false}
+        - {override: '', marker: 'skip_dns=false', exists: true, want: false}
+        - {override: '', marker: 'skip_dns=true', exists: true, want: true}
+        - {override: false, marker: 'skip_dns=true', exists: true, want: false}
+        - {override: true, marker: 'skip_dns=false', exists: true, want: true}
+        - {override: false, marker: '', exists: false, want: false}
+      loop_control:
+        loop_var: policy_case
+
+    - name: Load production deploy and relay tasks
+      set_fact:
+        _deploy_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/main.yml') | from_yaml }}"
+        _relay_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/create_relay_host.yml') | from_yaml }}"
+        _change_tasks: "{{ lookup('file', playbook_dir ~ '/../tasks/change/remnawave_change.yml') | from_yaml }}"
+
+    - name: Create temporary extracted task file
+      tempfile:
+        state: file
+        suffix: .yml
+      register: _review_tasks_file
+
+    - block:
+        - name: Extract real DNS/provider preflight tasks
+          copy:
+            dest: "{{ _review_tasks_file.path }}"
+            mode: '0600'
+            content: >-
+              {{ (_deploy_tasks | selectattr('name', 'in', [
+                'Resolve whether this deployment needs DNS providers',
+                'Resolve whether this deploy is a domainless relay node',
+                'Fail if deploy_target_domain is not provided (Deploy Mode)',
+                'Fail if domain_providers is not configured (Deploy Mode)',
+                'Fail if target domain not found in domain_providers (Deploy Mode)',
+                'Fail if the deploy target domain lacks dns_provider/zone_id',
+                'Fail if the deploy target domain has an unsupported dns_provider',
+                'Set provider configuration for deploy target domain',
+                'Set provider configuration for an unpublished relay deploy',
+                'Validate Cloudflare credentials (deploy)']) | list) | to_nice_yaml }}
+
+        - name: Configure a namespaced relay without any DNS credentials
+          set_fact:
+            operation_mode: deploy
+            remnawave_relay_enabled: true
+            remnawave_relay_skip_dns_effective: true
+            deploy_target_domain: identity.example
+            domain_providers: {}
+
+        - name: Run actual provider preflight
+          include_tasks: "{{ _review_tasks_file.path }}"
+
+        - name: Assert namespaced relay needs no provider
+          assert:
+            that:
+              - effective_dns_provider == 'none'
+              - effective_cdn_provider == 'none'
+              - base_domain == 'identity.example'
+              - not _deploy_domainless
+
+        - name: Extract real relay SNI type validation
+          copy:
+            dest: "{{ _review_tasks_file.path }}.sni.yml"
+            mode: '0600'
+            content: "{{ (_relay_tasks | selectattr('name', 'equalto', 'Validate the relay SNI list type') | list) | to_nice_yaml }}"
+
+        - name: Set a scalar SNI mistake
+          set_fact:
+            remnawave_relay_snis: decoy.example
+            _scalar_rejected: false
+
+        - name: Run SNI validation on the scalar
+          block:
+            - include_tasks: "{{ _review_tasks_file.path }}.sni.yml"
+          rescue:
+            - set_fact:
+                _scalar_rejected: true
+
+        - name: Assert scalar SNI was rejected before any Host operation
+          assert:
+            that: _scalar_rejected
+
+        - name: Set valid SNI list
+          set_fact:
+            remnawave_relay_snis: [decoy.example]
+        - include_tasks: "{{ _review_tasks_file.path }}.sni.yml"
+
+        - name: Extract the real FQDN acknowledgement gates
+          copy:
+            dest: "{{ _review_tasks_file.path }}.gates.yml"
+            mode: '0600'
+            content: >-
+              {{ (_change_tasks | selectattr('name', 'in', [
+                'Require acknowledgement before deleting the old DNS name of a relay node',
+                'Require an explicit hostname when acknowledging a relay rotation']) | list) | to_nice_yaml }}
+
+        - name: Configure skip-DNS rotation with no acknowledgement or custom hostname
+          set_fact:
+            _change_relay_effective: true
+            _change_relay_skip_dns: true
+            change_delete_old_dns: true
+            remnawave_relay_repoint_ack: false
+        - include_tasks: "{{ _review_tasks_file.path }}.gates.yml"
+        - name: Also allow acknowledged IP-based rotation without a custom hostname
+          set_fact:
+            remnawave_relay_repoint_ack: true
+        - include_tasks: "{{ _review_tasks_file.path }}.gates.yml"
+        - name: Set endpoint fixtures for production marker writers
+          set_fact:
+            remnawave_relay_address: edge.example
+            _change_relay_address: edge.example
+            _change_relay_port: 443
+            _change_relay_fingerprint: chrome
+            _migrate_relay_address_effective: edge.example
+            _migrate_relay_port_effective: 443
+            _migrate_relay_fingerprint_effective: chrome
+
+        - name: Round-trip both DNS policies through every lifecycle marker writer
+          include_tasks: relay_marker_roundtrip_case.yml
+          loop:
+            - {mode: deploy, writer: "Persist the relay endpoint (relay marker)", file: tasks/setup/remnawave.yml, skip: false}
+            - {mode: deploy, writer: "Persist the relay endpoint (relay marker)", file: tasks/setup/remnawave.yml, skip: true}
+            - {mode: change, writer: "Re-persist the relay endpoint (relay marker)", file: tasks/change/remnawave_change.yml, skip: false}
+            - {mode: change, writer: "Re-persist the relay endpoint (relay marker)", file: tasks/change/remnawave_change.yml, skip: true}
+            - {mode: migrate, writer: "Persist the destination's relay endpoint (relay marker)", file: tasks/migrate/migrate.yml, skip: false}
+            - {mode: migrate, writer: "Persist the destination's relay endpoint (relay marker)", file: tasks/migrate/migrate.yml, skip: true}
+          loop_control:
+            loop_var: marker_case
+      always:
+        - file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ _review_tasks_file.path }}"
+            - "{{ _review_tasks_file.path }}.sni.yml"
+            - "{{ _review_tasks_file.path }}.gates.yml"

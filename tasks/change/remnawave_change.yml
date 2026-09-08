@@ -115,6 +115,12 @@
 # relay marker closes that hole for relay: disk evidence OR the caller's var
 # counts. Two set_facts — the parse reads the materialized text, and chaining
 # them in one task mis-evaluates under 2.19 lazy templating.
+- name: Require a readable existing relay marker before rotation
+  assert:
+    that: change_relay_raw.content is defined
+    fail_msg: "The relay marker exists but could not be read. Restore access before rotating; its DNS policy must be preserved."
+  when: change_relay_marker.stat.exists | default(false) | bool
+
 - name: Materialize the persisted relay endpoint text
   set_fact:
     _change_relay_text: >-
@@ -156,9 +162,15 @@
 # Derived in its own task: a set_fact cannot read a key it defines in the same
 # task under 2.19. A relay node publishes no record of its own by default; every
 # DNS task for the NEW name below is gated on this.
+- name: Recover the relay DNS policy for this rotation
+  include_tasks: providers/remnawave/resolve_relay_dns_policy.yml
+  vars:
+    _relay_dns_marker_text: "{{ _change_relay_text }}"
+    _relay_dns_marker_exists: "{{ change_relay_marker.stat.exists | default(false) }}"
+
 - name: Derive whether this rotation publishes the node's own DNS record
   set_fact:
-    _change_relay_skip_dns: "{{ (_change_relay_effective | bool) and (remnawave_relay_skip_dns | default(true) | bool) }}"
+    _change_relay_skip_dns: "{{ (_change_relay_effective | bool) and (remnawave_relay_skip_dns_effective | bool) }}"
 
 # Mirror migrate's "caller flag OR detected on disk" derivation. Without this, a
 # rotation that omits remnawave_panel_register_node skips Host create, cleanup AND
@@ -381,6 +393,7 @@
   when:
     - _change_relay_effective | bool
     - change_delete_old_dns | default(false) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - not (remnawave_relay_repoint_ack | default(false) | bool)
 
 # The other half of the same hazard. Acknowledging says "I have repointed the proxy at
@@ -413,6 +426,7 @@
   when:
     - _change_relay_effective | bool
     - change_delete_old_dns | default(false) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - remnawave_relay_repoint_ack | default(false) | bool
     - custom_hostname is not defined
 
@@ -433,6 +447,7 @@
   when:
     - _change_relay_effective | bool
     - not (change_delete_old_dns | default(false) | bool)
+    - not (_change_relay_skip_dns | default(false) | bool)
 
 # Fresh per-rotation origin identity (new suffix → new origin FQDN). In shared
 # + fronting modes this RESHAPES dns_hostname before the DNS pre-delete below,
@@ -535,6 +550,7 @@
       address={{ _change_relay_address }}
       port={{ _change_relay_port | int }}
       fingerprint={{ _change_relay_fingerprint }}
+      skip_dns={{ 'true' if _change_relay_skip_dns else 'false' }}
     dest: "{{ remnawave_node_install_dir }}/.relay_address"
     mode: '0640'
   become: "{{ remnawave_persist_become | default(true) }}"
@@ -803,6 +819,7 @@
       domain_providers or delete the records manually.
   when:
     - change_delete_old_dns | default(true) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - old_base_domain not in domain_providers
     - old_dns_hostname != dns_hostname
 
@@ -818,6 +835,7 @@
   register: old_dns_records
   when:
     - change_delete_old_dns | default(true) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - old_base_domain in domain_providers
     - old_dns_hostname != dns_hostname
 
@@ -835,6 +853,7 @@
     label: "{{ item.name }} ({{ item.type }})"
   when:
     - change_delete_old_dns | default(true) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - old_base_domain in domain_providers
     - old_dns_records is defined
     - old_dns_records.json is defined
@@ -853,6 +872,7 @@
          | reject('equalto', old_dns_hostname) | list }}
   when:
     - change_delete_old_dns | default(true) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - old_base_domain in domain_providers
 
 - name: Get OLD origin DNS records
@@ -870,6 +890,7 @@
     label: "{{ item }}"
   when:
     - change_delete_old_dns | default(true) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - old_base_domain in domain_providers
     - _old_origin_candidates | default([]) | length > 0
 
@@ -887,6 +908,7 @@
     label: "{{ item.1.name }} ({{ item.1.type }})"
   when:
     - change_delete_old_dns | default(true) | bool
+    - not (_change_relay_skip_dns | default(false) | bool)
     - old_base_domain in domain_providers
     - old_dns_hostname != dns_hostname
 
@@ -899,14 +921,18 @@
       New: {{ dns_hostname }}
       {% if _change_relay_effective | default(false) | bool %}
 
-      RELAY NODE — the client-facing edge did NOT change:
+      RELAY NODE:
         clients still dial : {{ _change_relay_address }}:{{ _change_relay_port }}
+      {% if _change_relay_skip_dns %}
+        Proxy backend stays on the node IP; hostname rotation does not move it:
+          {{ (((envoy_mappings | default({}))[inventory_hostname] | default({})).ipv4 | default([]) | first | default(ansible_facts['default_ipv4']['address'] | default('<node IP>'), true) }}:{{ remnawave_relay_node_listen_port | default(443) }}
+        {{ dns_hostname }} is an identity only; no DNS record was published.
+        Any old DNS records are retained; retire them separately after moving
+        any FQDN-based proxy backend to the node IP.
+      {% else %}
         proxy backend must now point at:
-          {{ dns_hostname }}:{{ remnawave_relay_node_listen_port | default(443) }}   (raw TCP)
+          {{ dns_hostname }}:{{ remnawave_relay_node_listen_port | default(443) }} (raw TCP)
         old origin : {{ old_dns_hostname }}{{ ' (DELETED in this run)' if (change_delete_old_dns | default(false) | bool) else ' (retained)' }}
-        node IP    : {{ ansible_facts['default_ipv4']['address'] | default('(unknown)') }}
-
-      If the proxy console's origin is the node IP, nothing needs doing. If it
-      holds the old FQDN, update it now — the role cannot reach your proxy
-      provider.
+        If the proxy already uses the node IP, no repoint is needed.
+      {% endif %}
       {% endif %}
