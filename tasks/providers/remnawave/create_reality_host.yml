@@ -42,6 +42,21 @@
   set_fact:
     _remnawave_hosts: "{{ remnawave_reality_hosts_list.json.response['hosts'] if (remnawave_reality_hosts_list.json.response is mapping and 'hosts' in remnawave_reality_hosts_list.json.response) else (remnawave_reality_hosts_list.json.response | default([])) }}"
 
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create the Reality Host"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "host-{{ random_hostname }}-reality"
+    _fcp_res_kind: "host"
+    _fcp_res_host:
+      remark: "{{ random_hostname }}-reality"
+      inboundUuid: "{{ remnawave_reality_inbound_uuid }}"
+      address: "{{ remnawave_reality_address | default(dns_hostname, true) }}"
+      port: "{{ remnawave_reality_port | default(443) | int }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - (random_hostname ~ '-reality') not in (_remnawave_hosts | map(attribute='remark') | list)
+
 - name: Create the Reality Host
   uri:
     url: "{{ remnawave_panel_url }}/api/hosts"
@@ -68,6 +83,17 @@
   no_log: true
   register: remnawave_reality_host_result
   when: (random_hostname ~ '-reality') not in (_remnawave_hosts | map(attribute='remark') | list)
+
+- name: "Settle in FCP after: Create the Reality Host"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "host-{{ random_hostname }}-reality"
+    _fcp_res_created: "{{ remnawave_reality_host_result.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ remnawave_reality_host_result.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - remnawave_reality_host_result is defined
+    - not (remnawave_reality_host_result.skipped | default(false))
 
 - name: Summarize Reality Host creation
   debug:

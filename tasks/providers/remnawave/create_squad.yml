@@ -55,6 +55,17 @@
       - _rw_fronted_inbounds | length > 0
     fail_msg: "No CDN inbound UUIDs available for the fronted squad — run create_config_profile.yml first."
 
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create the fronted squad (WS) when absent"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "squad-fronted"
+    _fcp_res_kind: "squad"
+    _fcp_res_identity: "{{ remnawave_bootstrap_fronted_squad_name }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - remnawave_bootstrap_fronted_squad_name not in _rw_squad_names
+
 - name: Create the fronted squad (WS) when absent
   uri:
     url: "{{ remnawave_panel_url }}/api/internal-squads"
@@ -73,6 +84,30 @@
   no_log: true
   register: _rw_fronted_create
   when: remnawave_bootstrap_fronted_squad_name not in _rw_squad_names
+
+- name: "Settle in FCP after: Create the fronted squad (WS) when absent"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "squad-fronted"
+    _fcp_res_created: "{{ _rw_fronted_create.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ _rw_fronted_create.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - _rw_fronted_create is defined
+    - not (_rw_fronted_create.skipped | default(false))
+
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create the Reality squad when absent"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "squad-reality"
+    _fcp_res_kind: "squad"
+    _fcp_res_identity: "{{ remnawave_bootstrap_reality_squad_name }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - remnawave_bootstrap_reality | default(true) | bool
+    - (remnawave_reality_inbound_uuid | default('')) | length > 0
+    - remnawave_bootstrap_reality_squad_name not in _rw_squad_names
 
 - name: Create the Reality squad when absent
   uri:
@@ -96,6 +131,30 @@
     - (remnawave_reality_inbound_uuid | default('')) | length > 0
     - remnawave_bootstrap_reality_squad_name not in _rw_squad_names
 
+- name: "Settle in FCP after: Create the Reality squad when absent"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "squad-reality"
+    _fcp_res_created: "{{ _rw_reality_create.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ _rw_reality_create.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - _rw_reality_create is defined
+    - not (_rw_reality_create.skipped | default(false))
+
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create the relay squad when absent"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "squad-relay"
+    _fcp_res_kind: "squad"
+    _fcp_res_identity: "{{ remnawave_bootstrap_relay_squad_name }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - remnawave_bootstrap_relay | default(true) | bool
+    - (remnawave_relay_inbound_uuid | default('')) | length > 0
+    - remnawave_bootstrap_relay_squad_name not in _rw_squad_names
+
 - name: Create the relay squad when absent
   uri:
     url: "{{ remnawave_panel_url }}/api/internal-squads"
@@ -117,6 +176,17 @@
     - remnawave_bootstrap_relay | default(true) | bool
     - (remnawave_relay_inbound_uuid | default('')) | length > 0
     - remnawave_bootstrap_relay_squad_name not in _rw_squad_names
+
+- name: "Settle in FCP after: Create the relay squad when absent"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "squad-relay"
+    _fcp_res_created: "{{ _rw_relay_create.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ _rw_relay_create.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - _rw_relay_create is defined
+    - not (_rw_relay_create.skipped | default(false))
 
 - name: Re-list internal squads (resolve UUIDs uniformly)
   uri:
@@ -241,6 +311,9 @@
   loop: "{{ _rw_squad_reconcile | default([]) }}"
   loop_control:
     label: "{{ item.name }}"
+  # fcp_managed: an existing squad's inbounds are changed from FCP's admin
+  # (Servers), which knows who is issued into it. The note above still prints.
+  when: not (fcp_managed | default(false) | bool)
 
 - name: Summarize squad creation
   debug:

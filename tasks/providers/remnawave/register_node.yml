@@ -101,6 +101,17 @@
     - _rn_node_addr_drift | default(false) | bool
     - not (remnawave_node_reconcile_address | default(false) | bool)
 
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Register node with Panel"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "node-{{ random_hostname }}"
+    _fcp_res_kind: "node"
+    _fcp_res_identity: "{{ random_hostname }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - (_rn_existing_node.uuid | default('')) | length == 0
+
 - name: Register node with Panel
   uri:
     url: "{{ remnawave_panel_url }}/api/nodes"
@@ -132,6 +143,17 @@
   delegate_to: localhost
   no_log: true   # request carries the panel API bearer token
   when: (_rn_existing_node.uuid | default('')) | length == 0
+
+- name: "Settle in FCP after: Register node with Panel"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "node-{{ random_hostname }}"
+    _fcp_res_created: "{{ remnawave_register_response.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ remnawave_register_response.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - remnawave_register_response is defined
+    - not (remnawave_register_response.skipped | default(false))
 
 - name: Warn that node already exists on Panel (409)
   debug:

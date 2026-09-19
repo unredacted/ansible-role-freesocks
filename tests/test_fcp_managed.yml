@@ -1,0 +1,138 @@
+---
+# tests/test_fcp_managed.yml
+#
+# The fcp_managed ownership contract (contract version 1), against the mock FCP
+# this playbook starts itself (no panel needed):
+#   * the first reservation of a run reports the handoff by itself;
+#   * a reservation is made once and settled with the panel uuid;
+#   * a create the panel refused (409) is settled as refused, and an uncertain
+#     one (5xx) is NOT settled at all;
+#   * what FCP removed on purpose is refused, and the run stops;
+#   * an unreachable FCP stops the run (fail closed);
+#   * the task files keep their fcp_managed gates (a static check, so a future
+#     edit cannot quietly drop one).
+#
+# Run: ANSIBLE_ROLES_PATH="$(dirname "$PWD")" ansible-playbook tests/test_fcp_managed.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _role: "{{ playbook_dir | dirname | basename }}"
+    _port: 8827
+    fcp_managed: true
+    fcp_api_url: "http://127.0.0.1:{{ _port }}"
+    fcp_api_token: "fsv1_test"
+    fcp_remnawave_panel_slug: "panel-a"
+    fcp_role_contract_version: 1
+    fcp_managed_retries: 1
+    fcp_managed_delay: 1
+  tasks:
+    - name: Start the mock FCP
+      command: "python3 {{ playbook_dir }}/mock_fcp.py {{ _port }}"
+      async: 600
+      poll: 0
+      changed_when: false
+
+    - block:
+        - name: Wait for the mock
+          uri: { url: "{{ fcp_api_url }}/__state" }
+          register: _up
+          retries: 20
+          delay: 1
+          until: _up.status | default(0) == 200
+
+        - name: Reserve a squad (reports the handoff first, by itself)
+          include_role: { name: "{{ _role }}", tasks_from: providers/fcp/reserve }
+          vars: { _fcp_res_key: "squad-reality", _fcp_res_kind: "squad", _fcp_res_identity: "pool-a" }
+
+        - name: Settle it as created
+          include_role: { name: "{{ _role }}", tasks_from: providers/fcp/settle }
+          vars: { _fcp_res_key: "squad-reality", _fcp_res_created: "s-1", _fcp_res_status: 201 }
+
+        - name: Reserve a Host by its parts, then settle a panel refusal (409)
+          include_role: { name: "{{ _role }}", tasks_from: providers/fcp/reserve }
+          vars:
+            _fcp_res_key: "host-a"
+            _fcp_res_kind: "host"
+            _fcp_res_host: { remark: "node-a-reality", inboundUuid: "i-1", address: "192.0.2.10", port: "443" }
+        - include_role: { name: "{{ _role }}", tasks_from: providers/fcp/settle }
+          vars: { _fcp_res_key: "host-a", _fcp_res_created: "", _fcp_res_status: 409 }
+
+        - name: Reserve a node, then an UNCERTAIN create (502) is not settled
+          include_role: { name: "{{ _role }}", tasks_from: providers/fcp/reserve }
+          vars: { _fcp_res_key: "node-a", _fcp_res_kind: "node", _fcp_res_identity: "node-a" }
+        - include_role: { name: "{{ _role }}", tasks_from: providers/fcp/settle }
+          vars: { _fcp_res_key: "node-a", _fcp_res_created: "", _fcp_res_status: 502 }
+
+        - name: Read the mock's state
+          uri: { url: "{{ fcp_api_url }}/__state", return_content: yes }
+          register: _st
+
+        - name: Assert handoff, settlement and the open reservation
+          vars:
+            _res: "{{ _st.json.reservations }}"
+            _by: "{{ dict(_res.values() | map(attribute='identity') | zip(_res.values() | map(attribute='state'))) }}"
+          assert:
+            that:
+              - _st.json.handoff['panel-a'] == 1
+              - _st.json.requests | selectattr('path', 'search', '/handoff$') | list | length == 1
+              - _by['pool-a'] == 'owned'
+              - _by['node-a'] == 'reserved'
+              - (_res.values() | selectattr('kind', 'equalto', 'host') | first).state == 'released'
+              - (_res.values() | selectattr('kind', 'equalto', 'host') | first).identity is search('"192.0.2.10", 443')
+            success_msg: "handoff once; created -> owned; 409 -> released; 502 -> left open."
+
+        - name: Seed a tombstone (FCP removed this squad on purpose)
+          uri:
+            url: "{{ fcp_api_url }}/__tombstone"
+            method: POST
+            body_format: json
+            body: { slug: "panel-a", kind: "squad", identity: "pool-gone" }
+
+        - name: A tombstoned identity stops the run
+          block:
+            - include_role: { name: "{{ _role }}", tasks_from: providers/fcp/reserve }
+              vars: { _fcp_res_key: "squad-gone", _fcp_res_kind: "squad", _fcp_res_identity: "pool-gone" }
+            - set_fact: { _tomb_passed: true }
+          rescue:
+            - set_fact: { _tomb_code: "{{ _fcp_reserve.json.error.code | default('') }}" }
+        - assert:
+            that:
+              - _tomb_passed is not defined
+              - _tomb_code == 'servers.tombstoned'
+            success_msg: "A tombstone refuses the role, and the run stops."
+      always:
+        - name: Stop the mock FCP
+          # [m]ock: the pattern must not match this shell's own command line.
+          shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"
+          changed_when: false
+
+    - name: FCP unreachable fails closed (nothing listens now)
+      block:
+        - include_role: { name: "{{ _role }}", tasks_from: providers/fcp/managed_preflight }
+        - set_fact: { _closed_passed: true }
+      rescue:
+        - set_fact: { _closed: true }
+    - assert:
+        that: [ _closed | default(false), _closed_passed is not defined ]
+        success_msg: "Unreachable FCP stops the run before any panel call."
+
+    # Static gates: each create is preceded by a reservation, and the writes the
+    # contract forbids are gated on fcp_managed.
+    - name: Read the task files
+      set_fact:
+        _f: "{{ _f | default({}) | combine({item: lookup('file', playbook_dir ~ '/../tasks/providers/remnawave/' ~ item ~ '.yml')}) }}"
+      loop: [create_config_profile, create_squad, create_hosts, create_reality_host, create_relay_host, register_node]
+    - assert:
+        that:
+          - "_f.create_config_profile.count('include_tasks: providers/fcp/reserve.yml') == 1"
+          - "_f.create_squad.count('include_tasks: providers/fcp/reserve.yml') == 3"
+          - "_f.create_hosts.count('include_tasks: providers/fcp/reserve.yml') == 1"
+          - "_f.create_reality_host.count('include_tasks: providers/fcp/reserve.yml') == 1"
+          - "_f.create_relay_host.count('include_tasks: providers/fcp/reserve.yml') == 1"
+          - "_f.register_node.count('include_tasks: providers/fcp/reserve.yml') == 1"
+          # the profile PATCH + its note, the squad repair, the relay Host delete + create + note
+          - "_f.create_config_profile.count('not (fcp_managed | default(false) | bool)') == 2"
+          - "_f.create_squad.count('not (fcp_managed | default(false) | bool)') == 1"
+          - "_f.create_relay_host.count('not (fcp_managed | default(false) | bool)') == 3"
+        success_msg: "Every create reserves first; the forbidden rewrites are gated."

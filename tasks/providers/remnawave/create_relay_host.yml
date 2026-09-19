@@ -136,7 +136,22 @@
     status_code: [200, 204, 404]
   delegate_to: localhost
   no_log: true
-  when: _relay_drift | bool
+  # fcp_managed: an existing relay Host belongs to FCP's edges machinery (its
+  # address, port and name are what FCP publishes and verifies). The role
+  # reports the drift below and leaves the Host alone.
+  when:
+    - _relay_drift | bool
+    - not (fcp_managed | default(false) | bool)
+
+- name: Note relay Host drift that FCP owns (fcp_managed)
+  debug:
+    msg: >-
+      Relay Host {{ random_hostname }}-relay differs from this run's vars, and
+      fcp_managed is set: it is NOT re-created here. Change it from FCP's admin
+      (Edges), which owns that Host.
+  when:
+    - _relay_drift | bool
+    - fcp_managed | default(false) | bool
 
 - name: Note that the relay Host is being re-pointed
   debug:
@@ -147,7 +162,24 @@
       {{ _relay_existing_inbound.configProfileInboundUuid | default('?') }}) to
       {{ remnawave_relay_address }}:{{ remnawave_relay_port | default(443, true) }}
       (sni {{ remnawave_relay_sni }}).
-  when: _relay_drift | bool
+  when:
+    - _relay_drift | bool
+    - not (fcp_managed | default(false) | bool)
+
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create the relay Host"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "host-{{ random_hostname }}-relay"
+    _fcp_res_kind: "host"
+    _fcp_res_host:
+      remark: "{{ random_hostname }}-relay"
+      inboundUuid: "{{ remnawave_relay_inbound_uuid }}"
+      address: "{{ remnawave_relay_address }}"
+      port: "{{ remnawave_relay_port | default(443, true) | int }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - (_relay_existing.uuid | default('')) | length == 0
 
 - name: Create the relay Host
   uri:
@@ -181,7 +213,18 @@
   register: remnawave_relay_host_result
   when: >-
     ((_relay_existing.uuid | default('')) | length == 0)
-    or (_relay_drift | bool)
+    or ((_relay_drift | bool) and not (fcp_managed | default(false) | bool))
+
+- name: "Settle in FCP after: Create the relay Host"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "host-{{ random_hostname }}-relay"
+    _fcp_res_created: "{{ remnawave_relay_host_result.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ remnawave_relay_host_result.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - remnawave_relay_host_result is defined
+    - not (remnawave_relay_host_result.skipped | default(false))
 
 - name: Summarize relay Host creation
   debug:

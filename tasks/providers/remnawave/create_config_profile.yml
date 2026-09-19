@@ -139,6 +139,17 @@
          + ([_rw_relay_inbound] if (remnawave_bootstrap_relay | default(true) | bool) else []) }}
   no_log: true
 
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create the Config Profile"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "profile"
+    _fcp_res_kind: "profile"
+    _fcp_res_identity: "{{ remnawave_bootstrap_config_profile_name }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - not _rw_profile_exists
+
 - name: Create the Config Profile (only when absent)
   uri:
     url: "{{ remnawave_panel_url }}/api/config-profiles"
@@ -181,6 +192,17 @@
   no_log: true
   register: _rw_profile_create
   when: not _rw_profile_exists
+
+- name: "Settle in FCP after: Create the Config Profile"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "profile"
+    _fcp_res_created: "{{ _rw_profile_create.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ _rw_profile_create.status | default(0) }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - _rw_profile_create is defined
+    - not (_rw_profile_create.skipped | default(false))
 
 # Re-list so we resolve the UUID uniformly whether we just created it or it
 # pre-existed (create responses vary; the list is the stable source of truth).
@@ -308,6 +330,20 @@
       {{ _rw_profile_exists
          and (_rw_live_outbounds_reconciled | default([])) != (_rw_live_profile.config.outbounds | default([])) }}
 
+- name: Note what is NOT reconciled because FCP manages this panel (fcp_managed)
+  debug:
+    msg: >-
+      fcp_managed is set: the existing Config Profile is left exactly as it is.
+      Pending here: {{ _rw_missing_inbounds | length }} missing base inbound(s)
+      ({{ _rw_missing_inbounds | map(attribute='tag') | list | join(', ') | default('none', true) }});
+      sniffing/listen merge {{ 'would change' if (_rw_sniffing_changed | default(false)) else 'in place' }};
+      outbound merge {{ 'would change' if (_rw_outbounds_changed | default(false)) else 'in place' }}.
+      Apply what is still wanted from FCP's admin (Servers).
+  when:
+    - _rw_profile_exists
+    - fcp_managed | default(false) | bool
+    - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false)) or (_rw_outbounds_changed | default(false))
+
 - name: Note what is being reconciled into the existing Config Profile
   debug:
     msg: >-
@@ -319,6 +355,10 @@
   when:
     - _rw_profile_exists
     - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
+    # fcp_managed: an EXISTING profile is never rewritten by the role. A full-
+    # config PATCH here would silently undo a typed edit made from FCP (server
+    # names, target) and there is no conditional update on the panel to stop it.
+    - not (fcp_managed | default(false) | bool)
     - (_rw_missing_inbounds | length > 0) or (_rw_sniffing_changed | default(false)) or (_rw_outbounds_changed | default(false))
 
 - name: Reconcile the existing Config Profile (sniffing/listen/outbound merges + missing base inbounds)
@@ -342,6 +382,10 @@
   when:
     - _rw_profile_exists
     - remnawave_bootstrap_reconcile_inbounds | default(true) | bool
+    # fcp_managed: an EXISTING profile is never rewritten by the role. A full-
+    # config PATCH here would silently undo a typed edit made from FCP (server
+    # names, target) and there is no conditional update on the panel to stop it.
+    - not (fcp_managed | default(false) | bool)
     - _rw_live_profile.config is defined
     # Deliberately NOT gated on the live inbound list being non-empty: a profile
     # pre-created by hand (or emptied) has config but no inbounds, which is exactly
