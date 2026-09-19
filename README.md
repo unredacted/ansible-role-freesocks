@@ -58,12 +58,12 @@ ansible-playbook playbook.yml -e target=node2 -e operation_mode=deploy -e node_p
 
 # a relay node on a tailnet: the panel dials the overlay address, edges dial the public one
 ansible-playbook playbook.yml -e target=node3 -e operation_mode=deploy -e node_purpose=relay \
-  -e node_address_interface=tailscale0 -e node_origin_address=203.0.113.7
+  -e node_address_interface=tailscale0 -e node_public_address=203.0.113.7
 ```
 
-The run enrolls the node, fetches its machine configuration and secret, starts the container (and Caddy on a front node), reports the applied revision, and waits for FCP to find the machine ready. Then, in FCP: **Edges -> Protect a node** for a front or relay node, and **Servers -> the node -> Approve and activate**.
+The run persists the node's name and purpose on the machine first, enrolls the node, fetches its machine configuration and secret, starts the container (and Caddy on a front node), reports the applied revision, and waits for FCP to find the machine ready. Then, in FCP: **Edges -> Protect a node** for a front or relay node, and **Servers -> the node -> Approve and activate**.
 
-Running `deploy` again is how a machine change FCP made (a route, a port) is applied: the role reports only what it observes; FCP owns the settings.
+Running `deploy` again is how a machine change FCP made (a route, a port) is applied: the role reports only what it observes; FCP owns the settings. A run that stopped halfway resumes against the same node: the name and purpose are read back from the machine, so later runs need neither.
 
 ### 3. Update, wipe
 
@@ -79,13 +79,12 @@ ansible-playbook playbook.yml -e target=node1 -e operation_mode=wipe     # retir
 | Variable                              | Default                | What                                                                      |
 | ------------------------------------- | ---------------------- | ------------------------------------------------------------------------- |
 | `operation_mode`                      |                        | `deploy`, `update` or `wipe`                                              |
-| `node_purpose`                        |                        | `direct`, `front` or `relay`                                              |
+| `node_purpose`                        | persisted              | `direct`, `front` or `relay`; taken at the first deploy, then read back   |
 | `node_name`                           | generated              | The panel node name (3 to 30 plain characters); persisted in `.node_name` |
 | `node_label`                          | from the name          | The DNS label of a managed origin name (front)                            |
-| `node_country_code`                   | `XX`                   | The enrollment default; FCP owns it after                                 |
 | `node_address_interface`              |                        | The interface whose address the panel dials (e.g. `tailscale0`)           |
 | `node_management_address`             |                        | Or the name the panel dials                                               |
-| `node_origin_address`                 | detected v4            | What an edge dials (relay)                                                |
+| `node_public_address`                 | default route          | The public IPv4 (members, the origin record, edges); set it behind NAT    |
 | `node_publish_ipv6`                   | `false`                | Report the v6 for the origin record (front)                               |
 | `node_origin_hostname`                |                        | The origin name when FCP does not manage the zone (front)                 |
 | `fcp_api_url`, `fcp_api_token`        |                        | FCP and its token (vault)                                                 |
@@ -99,7 +98,7 @@ ansible-playbook playbook.yml -e target=node1 -e operation_mode=wipe     # retir
 
 ## What the role writes on the machine
 
-`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name`, `.applied_revision`; `/etc/logrotate.d/remnanode`; on a front node `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`.
+`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` and `.node_purpose` (written before the first FCP call), `.applied_revision`; `/etc/logrotate.d/remnanode`; on a front node `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`. The node's country lives in FCP (the node's Settings), not here.
 
 ## Testing
 

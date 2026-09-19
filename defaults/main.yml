@@ -40,22 +40,27 @@ fcp_status_gate_delay: 20
 # direct  REALITY, members connect straight to it
 # front   WebSocket behind Caddy, fronted by an L7 edge (Cloudflare, Fastly) from FCP
 # relay   REALITY behind an L4 edge from FCP
+# Taken at the first deploy and persisted on the machine (.node_purpose); a
+# later run may omit it. A node keeps its purpose (FCP refuses a change).
 node_purpose: ""
 # The node's name on the panel and in FCP. Empty = three dictionary words are
-# generated on first deploy and persisted on the machine (.node_name).
+# generated at the first deploy. Persisted on the machine (.node_name) BEFORE
+# the first FCP call, so a run that stops halfway resumes against the same node.
 node_name: ""
 node_name_word_count: 3
 # The DNS label of a managed origin name (front nodes). Empty = derived from the name.
 node_label: ""
-# Two letters, or XX for none. FCP owns the panel's value; this is the enrollment default.
-node_country_code: "XX"
+# The country is FCP's (the node's Settings in Admin -> Servers), not reported here.
 # The MANAGEMENT address the panel dials (port 2222 by default): an interface's
 # address (e.g. tailscale0 on a relay) or the machine's public name.
 node_address_interface: ""
 node_address_family: "ipv4"
 node_management_address: ""
-# What an edge dials for a relay node. Empty = the detected public IPv4.
-node_origin_address: ""
+# The machine's PUBLIC IPv4 as seen from the Internet: what members dial on a
+# direct node, what the origin record says on a front node, what an edge dials
+# on a relay. Empty = the default route's address, which behind NAT (a cloud
+# private interface, a tailnet) is not it: set this then.
+node_public_address: ""
 # Publish the machine's IPv6 in the origin record (front nodes). Only when it is
 # globally reachable.
 node_publish_ipv6: false

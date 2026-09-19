@@ -104,14 +104,18 @@
       profile does; look at the profile in Admin -> Servers.
   when: caddy_port_owner.stdout | default('') | length > 0
 
-# Whether the certificate is there yet is reported to FCP with the applied
-# revision; FCP checks it from outside either way.
-- name: Check for the origin certificate
-  stat:
-    path: "/var/lib/caddy/.local/share/caddy/certificates"
+# Whether a certificate for THIS origin hostname is there yet is reported to
+# FCP with the applied revision (an older hostname's certificate does not
+# count); FCP checks the served certificate from outside either way.
+- name: Look for the origin hostname's certificate
+  find:
+    paths: /var/lib/caddy/.local/share/caddy/certificates
+    patterns: "{{ origin_hostname }}.crt"
+    recurse: yes
   register: _caddy_certs
+  failed_when: false
   become: yes
 
 - name: Note certificate readiness
   set_fact:
-    _caddy_cert_ready: "{{ _caddy_certs.stat.exists | default(false) }}"
+    _caddy_cert_ready: "{{ (_caddy_certs.files | default([])) | selectattr('path', 'search', '/' ~ (origin_hostname | regex_escape) ~ '/') | list | length > 0 }}"

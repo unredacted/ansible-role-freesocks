@@ -23,12 +23,6 @@
       - operation_mode in ['deploy', 'update', 'wipe']
     fail_msg: "operation_mode must be one of: deploy, update, wipe (got '{{ operation_mode }}')"
 
-- name: Validate node_purpose
-  assert:
-    that:
-      - node_purpose in ['direct', 'front', 'relay']
-    fail_msg: "node_purpose must be one of: direct, front, relay (got '{{ node_purpose }}')"
-
 - name: Validate FCP settings
   assert:
     that:
@@ -50,22 +44,73 @@
     fail_msg: "remnawave_caddy_email is required on a front node (ACME registration)"
   when: node_purpose == 'front'
 
-# --- the node's name (generated once, persisted on the machine) ------------------
+# --- the node's identity: name and purpose, taken once, persisted on the machine ---
+#
+# Both are persisted BEFORE the first FCP call, so a run that stops halfway
+# (a lost bootstrap answer, an origin name that never resolves) resumes
+# against the same node instead of enrolling a second one. A later run may
+# omit both: they are read back. A purpose is immutable at FCP; a different
+# one passed later is refused here rather than sent.
 
-- name: Read the persisted node name
+- name: Read the persisted node name and purpose
   slurp:
-    src: "{{ remnawave_node_install_dir }}/.node_name"
-  register: _node_name_file
+    src: "{{ remnawave_node_install_dir }}/{{ item }}"
+  loop: [".node_name", ".node_purpose"]
+  register: _identity_files
   failed_when: false
   become: yes
 
 - name: Use the persisted node name
   set_fact:
-    node_name: "{{ (_node_name_file.content | b64decode | trim) }}"
+    node_name: "{{ _identity_files.results[0].content | b64decode | trim }}"
   when:
-    - node_name | length == 0
-    - _node_name_file is succeeded
-    - _node_name_file.content is defined
+    - node_name | trim | length == 0
+    - _identity_files.results[0].content is defined
+
+- name: Use the persisted purpose
+  set_fact:
+    _persisted_purpose: "{{ _identity_files.results[1].content | b64decode | trim }}"
+  when: _identity_files.results[1].content is defined
+
+- name: Refuse a purpose that differs from the persisted one
+  assert:
+    that:
+      - node_purpose | trim | length == 0 or node_purpose | trim == _persisted_purpose
+    fail_msg: >-
+      This machine was enrolled as a {{ _persisted_purpose }} node; a node keeps its
+      purpose (got '{{ node_purpose }}'). An admin changes it from Servers.
+  when: _persisted_purpose is defined
+
+- name: Take the persisted purpose
+  set_fact:
+    node_purpose: "{{ _persisted_purpose }}"
+  when:
+    - node_purpose | trim | length == 0
+    - _persisted_purpose is defined
+
+- name: Validate node_purpose
+  assert:
+    that:
+      - node_purpose | trim in ['direct', 'front', 'relay']
+    fail_msg: >-
+      node_purpose must be one of: direct, front, relay (got '{{ node_purpose }}').
+      A machine that was deployed before carries it in
+      {{ remnawave_node_install_dir }}/.node_purpose.
+  when: operation_mode != 'wipe'
+
+- name: Normalize the given node name
+  set_fact:
+    node_name: "{{ node_name | trim }}"
+    node_purpose: "{{ node_purpose | trim }}"
+
+- name: Refuse to invent a name for a machine that was never deployed
+  assert:
+    that:
+      - node_name | length > 0
+    fail_msg: >-
+      No node name was given and none is persisted on this machine
+      ({{ remnawave_node_install_dir }}/.node_name): nothing to {{ operation_mode }}.
+  when: operation_mode != 'deploy'
 
 - name: Generate a node name
   include_tasks: setup/node_name.yml
@@ -75,7 +120,29 @@
   assert:
     that:
       - node_name is match('^[A-Za-z0-9 ._-]{3,30}$')
+      - node_name == node_name | trim
     fail_msg: "node_name must be 3 to 30 plain characters (got '{{ node_name }}')"
+
+- name: Persist the node's identity before the first FCP call
+  when: operation_mode != 'wipe'
+  become: yes
+  block:
+    - name: Create the install directory
+      file:
+        path: "{{ remnawave_node_install_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Persist the node name and purpose
+      copy:
+        content: "{{ item.value }}\n"
+        dest: "{{ remnawave_node_install_dir }}/{{ item.file }}"
+        mode: '0640'
+      loop:
+        - { file: ".node_name", value: "{{ node_name }}" }
+        - { file: ".node_purpose", value: "{{ node_purpose }}" }
+      loop_control:
+        label: "{{ item.file }}"
 
 # --- wipe --------------------------------------------------------------------
 
@@ -108,20 +175,6 @@
 
     - name: Enroll with FCP and fetch the machine configuration
       include_tasks: providers/fcp/register_node.yml
-
-    - name: Create the install directory
-      file:
-        path: "{{ remnawave_node_install_dir }}"
-        state: directory
-        mode: '0755'
-      become: yes
-
-    - name: Persist the node name
-      copy:
-        content: "{{ node_name }}\n"
-        dest: "{{ remnawave_node_install_dir }}/.node_name"
-        mode: '0640'
-      become: yes
 
     - name: Set up Caddy and the decoy site (front nodes)
       include_tasks: setup/caddy.yml

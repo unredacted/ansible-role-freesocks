@@ -55,10 +55,19 @@
   delay: "{{ fcp_registration_delay | int }}"
   when: fcp_wait_machine_ready | bool
 
+- name: Fail closed when FCP blocked the node while verifying the machine
+  fail:
+    msg: >-
+      FCP could not verify {{ node_name }}:
+      {{ _fcp_view.json.registration.code | default('unknown') }}.
+      Look at the node in Admin -> Servers.
+  when:
+    - fcp_wait_machine_ready | bool
+    - _fcp_view.json.registration.state == 'blocked'
+
 - name: Note what FCP found
   debug:
     msg: >-
       {{ node_name }}: stage {{ _fcp_view.json.stage }},
-      registration {{ _fcp_view.json.registration.state }}
-      {{ ('(' ~ _fcp_view.json.registration.code ~ ')') if _fcp_view.json.registration.code else '' }}.
+      registration {{ _fcp_view.json.registration.state }}.
   when: fcp_wait_machine_ready | bool

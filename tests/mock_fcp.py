@@ -21,7 +21,9 @@ a secret, applied leads to machine_ready), `blocked` (registration blocked
 with a code), `not_set_up` (PUT refused), `stale_revision` (applied refused),
 `needs_admin` (DELETE answers a retirement that needs a decision),
 `ready_to_wipe` (DELETE answers ready_to_wipe), `unreachable_bootstrap`
-(bootstrap answers 502). The secret is only ever in the bootstrap answer.
+(bootstrap answers 502), `blocked_later` (the node's view turns blocked, as
+when FCP cannot verify the applied machine). The secret is only ever in the
+bootstrap answer.
 
 Run:  python3 tests/mock_fcp.py [port]     (default 8811)
 """
@@ -143,6 +145,9 @@ class Handler(BaseHTTPRequestHandler):
             i = STATE["nodes"].get(_key(m.group("slug"), m.group("name")))
             if not i:
                 return self._error(404, "not_found", "Not found")
+            if STATE["scenario"] == "blocked_later":
+                # FCP blocked the node while verifying the applied machine.
+                i["registration"] = {**i["registration"], "state": "blocked", "code": "servers.node_offline"}
             return self._send(200, _view(i))
         self._error(404, "not_found", self.path)
 

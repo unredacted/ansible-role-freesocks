@@ -66,13 +66,36 @@
     - _fcp_retire.status == 200
     - _fcp_view.json.retirement.stage == 'needs_admin'
 
+# The machine is taken down only where something is demonstrably there; a
+# failure to stop what IS there stops the play before FCP is told anything.
+- name: Look for the compose file
+  stat:
+    path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+  register: _compose_file
+  become: yes
+
 - name: Stop the node container
   community.docker.docker_compose_v2:
     project_src: "{{ remnawave_node_install_dir }}"
     state: absent
     remove_volumes: true
   become: yes
+  when: _compose_file.stat.exists
+
+- name: Assert no node container is left
+  shell: "docker ps -q --filter name=^remnanode$"
+  register: _remnanode_left
+  changed_when: false
+  failed_when: _remnanode_left.rc != 0 or (_remnanode_left.stdout | trim | length > 0)
+  become: yes
+  when: _compose_file.stat.exists
+
+- name: Look for the Caddy unit
+  command: systemctl list-unit-files caddy.service --no-legend
+  register: _caddy_unit
+  changed_when: false
   failed_when: false
+  become: yes
 
 - name: Stop Caddy
   systemd:
@@ -80,7 +103,7 @@
     state: stopped
     enabled: no
   become: yes
-  failed_when: false
+  when: "'caddy.service' in (_caddy_unit.stdout | default(''))"
 
 - name: Remove the machine's node files
   file:
@@ -110,9 +133,10 @@
   no_log: true
   when: _fcp_retire.status == 200
 
-- name: Remove the node name last (a stopped wipe resumes from it)
+- name: Remove the node's identity last (a stopped wipe resumes from it)
   file:
-    path: "{{ remnawave_node_install_dir }}/.node_name"
+    path: "{{ remnawave_node_install_dir }}/{{ item }}"
     state: absent
+  loop: [".node_name", ".node_purpose"]
   become: yes
   when: _fcp_retire.status == 404 or (_fcp_wiped.status | default(0)) == 200
