@@ -103,7 +103,8 @@
             success_msg: "A tombstone refuses the role, and the run stops."
       always:
         - name: Stop the mock FCP
-          shell: "pkill -f 'mock_fcp.py {{ _port }}' || true"
+          # [m]ock: the pattern must not match this shell's own command line.
+          shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"
           changed_when: false
 
     - name: FCP unreachable fails closed (nothing listens now)
