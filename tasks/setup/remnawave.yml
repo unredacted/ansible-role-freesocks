@@ -1,239 +1,56 @@
 ---
-# tasks/setup/remnawave.yml - Remnawave Node container deployment
+# tasks/setup/remnawave.yml - the remnanode container. The compose file carries
+# the panel's node secret FCP served (register_node.yml); it is rendered
+# no_log with restrictive permissions and never printed.
 
-# === Validation ===
-- name: Validate Remnawave required variables
-  assert:
-    that:
-      - remnawave_panel_url is defined
-      - remnawave_panel_url | length > 0
-    fail_msg: "remnawave_panel_url must be set when remnawave_enabled=true"
-
-- name: Validate secret_key_source
-  assert:
-    that: remnawave_secret_key_source in ['vault', 'panel_api']
-    fail_msg: "remnawave_secret_key_source must be 'vault' or 'panel_api', got: {{ remnawave_secret_key_source }}"
-
-- name: Validate vault SECRET_KEY is supplied
-  assert:
-    that:
-      - remnawave_panel_secret_key is defined
-      - remnawave_panel_secret_key | length > 0
-    fail_msg: |
-      remnawave_panel_secret_key must be set (vault-encrypted) when
-      remnawave_secret_key_source='vault'. Get the value from the Panel UI
-      when adding a node, or switch to remnawave_secret_key_source='panel_api'.
-  when: remnawave_secret_key_source == 'vault'
-
-- name: Validate Panel API token when needed
-  assert:
-    that:
-      - remnawave_panel_api_token is defined
-      - remnawave_panel_api_token | length > 0
-    fail_msg: |
-      remnawave_panel_api_token (vault-encrypted) is required when:
-        - remnawave_secret_key_source='panel_api', or
-        - remnawave_panel_register_node=true
-  when: >-
-    remnawave_secret_key_source == 'panel_api'
-    or (remnawave_panel_register_node | default(false) | bool)
-
-# === Directories (must exist before register_node persists .node_uuid) ===
-- name: Create Remnawave install directory
+- name: Create the install directory
   file:
     path: "{{ remnawave_node_install_dir }}"
     state: directory
     mode: '0755'
   become: yes
 
-- name: Create Remnawave log directory
+- name: Create the log directory
   file:
     path: "{{ remnawave_log_dir }}"
     state: directory
     mode: '0755'
   become: yes
 
-# === Panel API: fetch SECRET_KEY ===
-- name: Fetch SECRET_KEY from Panel keygen endpoint
-  include_tasks: ../providers/remnawave/keygen.yml
-  when: remnawave_secret_key_source == 'panel_api'
-
-# === Panel API: per-node placement (LEGACY — inbound clones + per-node squads)
-# Default OFF (shared-squad model): nodes activate the shared base inbounds and
-# bootstrap's panel-wide squads span the fleet. When opted in, this gives the
-# node its own config-profile inbound(s) + internal squad(s) and REPOINTS
-# remnawave_cdn_transports[].inbound_uuid / the Reality inbound fact at them,
-# so registration + Host creation below reference the node's own inbounds.
-# Must run BEFORE the derive/register steps. The FCP pool add happens later in
-# main.yml's control-plane section.
-- name: Create per-node placement objects (inbounds + squads)
-  include_tasks: ../providers/remnawave/create_node_placement.yml
-  when:
-    - remnawave_per_node_placement | default(false) | bool
-    - remnawave_panel_register_node | default(false) | bool
-
-# Derive the panel's active inbounds from the enabled CDN transports (+ the
-# Reality inbound and/or the relay inbound when enabled) so node registration and
-# Host creation can't drift. Falls back to an explicitly-set
-# remnawave_panel_active_inbounds when no transport carries an inbound_uuid yet.
-# Materialized in two set_facts — chained task-level vars mis-evaluate under
-# ansible-core 2.19+ lazy templating.
-#
-# The `when:` below MUST list every transport: a relay-only node whose disjunct is
-# missing skips this task entirely, falls through to the empty
-# remnawave_panel_active_inbounds default, and dies in register_node.yml's assert.
-# A relay node is DEDICATED, and that has to be enforced in CODE rather than by
-# documentation: the bootstrap output file carries an ENABLED ws transport, and it
-# is loaded with `-e @file`, i.e. extra-vars — which outrank an inventory-level
-# `remnawave_cdn_transports: []`. So an operator cannot reliably turn it off from
-# inventory, and a relay node would otherwise also activate the WS inbound. That
-# inbound cannot work here anyway (it needs Caddy to terminate TLS and proxy to
-# it, and Caddy is asserted off on relay nodes), so activating it is never right —
-# it just occupies a loopback port and muddies the node's inbound set.
-#
-# Two independent keys in ONE set_fact (no cross-reference, so 2.19-safe): the
-# declared set is kept only to tell the operator what was ignored.
-- name: Collect enabled CDN-transport inbound UUIDs
-  set_fact:
-    _cdn_transport_inbounds_declared: >-
-      {{ remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
-         | select('string') | reject('equalto', '') | list }}
-    _cdn_transport_inbounds: >-
-      {{ []
-         if (remnawave_relay_enabled | default(false) | bool)
-         else (remnawave_cdn_transports | default([]) | rejectattr('enabled', 'equalto', false) | map(attribute='inbound_uuid')
-               | select('string') | reject('equalto', '') | list) }}
-
-- name: Note that CDN transports are ignored on a relay node
-  debug:
-    msg: >-
-      Relay node — ignoring {{ _cdn_transport_inbounds_declared | length }} enabled
-      CDN transport(s) from remnawave_cdn_transports. A relay node is dedicated:
-      the WS inbound needs Caddy to terminate TLS in front of it, and Caddy is
-      asserted off here, so it would never carry traffic. This node activates only
-      its relay inbound. (The entry usually arrives from the bootstrap output vars
-      file, which is loaded as extra-vars and cannot be overridden from inventory.)
-  when:
-    - remnawave_relay_enabled | default(false) | bool
-    - _cdn_transport_inbounds_declared | length > 0
-
-- name: Derive active inbounds from enabled CDN transports (+ Reality, + relay)
-  set_fact:
-    remnawave_panel_active_inbounds: >-
-      {{ _cdn_transport_inbounds
-         + ([remnawave_reality_inbound_uuid]
-            if (remnawave_reality_enabled | default(false) | bool
-                 and (remnawave_reality_inbound_uuid | default('') | length > 0))
-            else [])
-         + ([remnawave_relay_inbound_uuid]
-            if (remnawave_relay_enabled | default(false) | bool
-                 and (remnawave_relay_inbound_uuid | default('') | length > 0))
-            else []) }}
-  when: >-
-    (_cdn_transport_inbounds | length > 0) or
-    (remnawave_reality_enabled | default(false) | bool
-     and (remnawave_reality_inbound_uuid | default('') | length > 0)) or
-    (remnawave_relay_enabled | default(false) | bool
-     and (remnawave_relay_inbound_uuid | default('') | length > 0))
-
-# === Panel API: register node ===
-# Hostname/DNS must already be set (main.yml generates them earlier in deploy
-# mode). Registration happens before the container starts so the node has a
-# UUID we can persist locally for change/migrate flows.
-- name: Register node with Panel
-  include_tasks: ../providers/remnawave/register_node.yml
-  when: remnawave_panel_register_node | default(false) | bool
-
-# === Render config ===
 - name: Render docker-compose.yml
   template:
     src: remnanode-docker-compose.yml.j2
     dest: "{{ remnawave_node_install_dir }}/docker-compose.yml"
     mode: '0640'
+  vars:
+    remnawave_node_port: "{{ _fcp_bootstrap.nodePort | int }}"
   become: yes
   register: compose_template
-  no_log: true   # rendered file contains the panel-wide SECRET_KEY
+  no_log: true # the rendered file carries the panel-wide node secret
 
-- name: Render logrotate config
+- name: Render the logrotate config
   template:
     src: remnanode-logrotate.j2
     dest: /etc/logrotate.d/remnanode
     mode: '0644'
   become: yes
 
-# Persist the deployed hostname so change/migrate flows can reconstruct
-# the "old" hostname when rotating. The compose file doesn't carry this.
-# .node_name holds the CLEAN hostname (used for Host remarks, squad names, FCP
-# slugs) — it differs from .hostname whenever dns_hostname is the suffixed
-# Fastly origin FQDN.
-- name: Persist deployed hostname
-  copy:
-    content: "{{ dns_hostname }}\n"
-    dest: "{{ remnawave_node_install_dir }}/.hostname"
-    mode: '0640'
-  become: yes
-
-- name: Persist the clean node name
-  copy:
-    content: "{{ random_hostname }}\n"
-    dest: "{{ remnawave_node_install_dir }}/.node_name"
-    mode: '0640'
-  become: yes
-
-# .relay_address is the AUTHORITATIVE "this is a relay node" marker: relay nodes
-# run no Caddy, so migrate's capability detection cannot tell them apart from a
-# direct Reality node by absence alone (see tasks/migrate/migrate.yml). Its
-# EXISTENCE is the signal; the contents let change/migrate/wipe re-create the
-# Host and warn about the manual proxy.
-#
-# key=value lines rather than a bare "host:port" — the latter is ambiguous for
-# IPv6 literals. `become` follows the remnawave_persist_become hook used by
-# register_node.yml so the integration harness can write to an unprivileged dir.
-- name: Persist the relay endpoint (relay marker)
-  copy:
-    content: |
-      address={{ remnawave_relay_address }}
-      port={{ remnawave_relay_port | default(443, true) | int }}
-      fingerprint={{ remnawave_relay_fingerprint | default('chrome', true) }}
-    dest: "{{ remnawave_node_install_dir }}/.relay_address"
-    mode: '0640'
-  become: "{{ remnawave_persist_become | default(true) }}"
-  when: remnawave_relay_enabled | default(false) | bool
-
-# Keep the marker trustworthy: if a node is re-deployed WITHOUT relay, a stale
-# marker would make migrate detect it as a relay node forever.
-- name: Remove a stale relay marker when relay is disabled
-  file:
-    path: "{{ remnawave_node_install_dir }}/.relay_address"
-    state: absent
-  become: "{{ remnawave_persist_become | default(true) }}"
-  when: not (remnawave_relay_enabled | default(false) | bool)
-
-# === Container lifecycle ===
-- name: Pull image (force when force_reinstall_remnawave is set)
+- name: Pull the node image
   community.docker.docker_image:
     name: "{{ remnawave_node_image }}"
     source: pull
-    force_source: "{{ force_reinstall_remnawave | default(false) | bool }}"
+    force_source: "{{ (force_reinstall_remnawave | bool) or (operation_mode == 'update') }}"
   become: yes
 
-- name: Bring up Remnawave node container
+- name: Bring up the node container
   community.docker.docker_compose_v2:
     project_src: "{{ remnawave_node_install_dir }}"
     state: present
-    recreate: "{{ 'always' if (compose_template.changed or (force_reinstall_remnawave | default(false) | bool)) else 'auto' }}"
+    recreate: "{{ 'always' if (compose_template.changed or (force_reinstall_remnawave | bool) or (operation_mode == 'update')) else 'auto' }}"
   become: yes
 
-# === Health check ===
-- name: Wait for Remnawave NODE_PORT to be open
+- name: Wait for the node port to open
   wait_for:
     host: 127.0.0.1
-    port: "{{ remnawave_node_port }}"
+    port: "{{ _fcp_bootstrap.nodePort | int }}"
     timeout: 60
-    delay: 2
-
-# === Success fact ===
-- name: Set Remnawave install success fact
-  set_fact:
-    remnawave_install_success: true
-    component_install_success: true

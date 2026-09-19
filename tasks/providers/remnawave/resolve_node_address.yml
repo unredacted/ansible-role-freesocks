@@ -2,7 +2,7 @@
 # tasks/providers/remnawave/resolve_node_address.yml
 # Resolve remnawave_node_address_effective — the MANAGEMENT address the panel
 # dials for this node on remnawave_node_port (default 2222). The data plane
-# (Fastly origin / Reality address / client Hosts) is untouched by this file.
+# (what an edge dials, what members receive) is FCP's and untouched here.
 #
 # Precedence:
 #   1. remnawave_node_address_interface (non-empty) — the IP this node carries
@@ -10,11 +10,12 @@
 #      reaches nodes over an overlay: the panel makes its node API calls from
 #      inside a Docker container, where Tailscale MagicDNS resolution is
 #      unreliable, so a MagicDNS name in the address field is a latent outage.
-#   2. remnawave_node_address — a name (defaults to the node's origin FQDN),
-#      falling back to dns_hostname when explicitly blanked.
+#   2. remnawave_node_address — a name or address, falling back to
+#      remnawave_node_address_fallback (the machine's public address) when
+#      explicitly blanked.
 #
-# Included by register_node.yml and update_node.yml so deploy / change / migrate
-# all resolve identically. Idempotent: every include re-derives the fact, so a
+# Included by tasks/main.yml before the enrollment, so what FCP receives is
+# always the resolved fact. Idempotent: every include re-derives the fact, so a
 # later include can't inherit a stale value from an earlier one.
 
 - name: Validate the node-address interface selector
@@ -138,7 +139,7 @@
 
 - name: Use the configured name as the panel-side node address
   set_fact:
-    remnawave_node_address_effective: "{{ remnawave_node_address | default(dns_hostname, true) }}"
+    remnawave_node_address_effective: "{{ remnawave_node_address | default(remnawave_node_address_fallback, true) }}"
   when: remnawave_node_address_interface | default('') | length == 0
 
 - name: Log the resolved panel-side node address

@@ -1,0 +1,142 @@
+---
+# tasks/providers/fcp/wipe.yml - retire the node (FCP docs/servers.md
+# "Retirement and migration"). The role only ASKS: FCP decides whether an
+# admin has to choose a disposition (a node that was ever live, or anything
+# of it still out there), tears down what it made, removes the panel row and
+# answers ready_to_wipe. Only then is the machine cleaned up, and FCP told.
+# Resumable: a run stopped halfway picks up from the node's view.
+
+- name: Set the FCP node URL
+  set_fact:
+    _fcp_node_url: "{{ fcp_api_url }}/api/v1/admin/servers/{{ fcp_remnawave_panel_slug }}/nodes/by-name/{{ node_name | urlencode }}"
+    _fcp_headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+  no_log: true
+
+- name: Ask FCP to retire the node
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: DELETE
+    headers: "{{ _fcp_headers }}"
+    status_code: [200, 404]
+    return_content: yes
+    timeout: 30
+  register: _fcp_retire
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+
+- name: Fail closed when FCP could not be reached
+  fail:
+    msg: "FCP could not be reached to retire {{ node_name }} (HTTP {{ _fcp_retire.status | default('unreachable') }})."
+  when: _fcp_retire.status | default(0) not in [200, 404]
+
+- name: Note a node FCP does not know
+  debug:
+    msg: "FCP has no node named {{ node_name }}; only the machine is cleaned up."
+  when: _fcp_retire.status == 404
+
+- name: Wait for FCP to make the node ready to wipe
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_view
+  delegate_to: localhost
+  no_log: true
+  until: >-
+    _fcp_view.status == 200 and _fcp_view.json.retirement is not none and
+    (_fcp_view.json.retirement.stage in ['needs_admin', 'ready_to_wipe', 'wiped', 'retired'])
+  retries: "{{ fcp_registration_retries | int }}"
+  delay: "{{ fcp_registration_delay | int }}"
+  when: _fcp_retire.status == 200
+
+- name: Stop when the retirement needs an admin's decision
+  fail:
+    msg: >-
+      {{ node_name }} was live, or something of it is still out there. Decide its
+      retirement in Admin -> Servers (keep its members dark, or move them), then
+      run wipe again. The machine was left untouched.
+  when:
+    - _fcp_retire.status == 200
+    - _fcp_view.json.retirement.stage == 'needs_admin'
+
+# The machine is taken down only where something is demonstrably there; a
+# failure to stop what IS there stops the play before FCP is told anything.
+- name: Look for the compose file
+  stat:
+    path: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+  register: _compose_file
+  become: yes
+
+- name: Stop the node container
+  community.docker.docker_compose_v2:
+    project_src: "{{ remnawave_node_install_dir }}"
+    state: absent
+    remove_volumes: true
+  become: yes
+  when: _compose_file.stat.exists
+
+- name: Assert no node container is left
+  shell: "docker ps -q --filter name=^remnanode$"
+  register: _remnanode_left
+  changed_when: false
+  failed_when: _remnanode_left.rc != 0 or (_remnanode_left.stdout | trim | length > 0)
+  become: yes
+  when: _compose_file.stat.exists
+
+- name: Look for the Caddy unit
+  command: systemctl list-unit-files caddy.service --no-legend
+  register: _caddy_unit
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Stop Caddy
+  systemd:
+    name: caddy
+    state: stopped
+    enabled: no
+  become: yes
+  when: "'caddy.service' in (_caddy_unit.stdout | default(''))"
+
+- name: Remove the machine's node files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ remnawave_node_install_dir }}/docker-compose.yml"
+    - "{{ remnawave_node_install_dir }}/.applied_revision"
+    - "{{ remnawave_log_dir }}"
+    - /etc/logrotate.d/remnanode
+    - /etc/caddy/Caddyfile
+    - "{{ remnawave_decoy_root }}"
+  become: yes
+
+- name: Tell FCP the machine is wiped
+  uri:
+    url: "{{ _fcp_node_url }}/wiped"
+    method: POST
+    headers: "{{ _fcp_headers }}"
+    body_format: json
+    body: {}
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_wiped
+  delegate_to: localhost
+  no_log: true
+  when: _fcp_retire.status == 200
+
+- name: Remove the node's identity last (a stopped wipe resumes from it)
+  file:
+    path: "{{ remnawave_node_install_dir }}/{{ item }}"
+    state: absent
+  loop: [".node_name", ".node_purpose"]
+  become: yes
+  when: _fcp_retire.status == 404 or (_fcp_wiped.status | default(0)) == 200

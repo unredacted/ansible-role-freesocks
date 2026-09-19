@@ -3,8 +3,8 @@
 #
 # Used by:
 #   - Remnawave Node component (always)
-#   - As a no-op safety net before Outline (Outline's installer also handles Docker,
-#     but running this first makes the dependency explicit and idempotent)
+#   - As a no-op safety net on a machine that already has Docker (the check
+#     below keeps the install it has)
 #
 # Installs Docker CE + the Compose v2 plugin + the python3-docker library so
 # Ansible's community.docker modules can talk to the local daemon.

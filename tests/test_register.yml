@@ -1,0 +1,251 @@
+---
+# tests/test_register.yml
+#
+# Offline test of the bootstrap contract v2 against tests/mock_fcp.py:
+#   (a) a direct node enrolls, gets its configuration and secret, reports
+#       applied and reaches machine_ready; the secret is in no fact FCP could
+#       read back and only the bootstrap answer carried it;
+#   (b) a second run is observations only (the mock's generation moves, the
+#       purpose stays);
+#   (c) a blocked registration fails the play closed;
+#   (d) an FCP that is not set up fails the play closed;
+#   (e) a stale revision fails the play closed;
+#   (f) a register-only token outside its boundary is refused;
+#   (g) a front node gets the ingress routes and the origin hostname;
+#   (h) a node FCP blocks while verifying the applied machine fails the play
+#       closed after the applied report.
+#
+# Run: ansible-playbook tests/test_register.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _port: 8827
+    fcp_api_url: "http://127.0.0.1:8827"
+    fcp_api_token: "fsv1_test_token_for_the_mock"
+    fcp_remnawave_panel_slug: "panel-a"
+    fcp_role_contract_version: 2
+    fcp_registration_retries: 3
+    fcp_registration_delay: 0
+    fcp_wait_machine_ready: true
+    node_purpose: direct
+    node_name: "quiet-falcon-nest"
+    node_label: ""
+    node_origin_hostname: ""
+    node_publish_ipv6: false
+    remnawave_node_install_dir: "{{ playbook_dir }}/.reg"
+    _fcp_become: false
+    remnawave_node_address_effective: "100.100.64.7"
+    _public_v4: "203.0.113.10"
+    _public_v6: ""
+    _tasks: "{{ playbook_dir | dirname }}/tasks/providers/fcp"
+  tasks:
+    - name: Start the mock FCP
+      command: python3 {{ playbook_dir }}/mock_fcp.py {{ _port }}
+      async: 600
+      poll: 0
+
+    - name: Wait for the mock
+      uri:
+        url: "http://127.0.0.1:{{ _port }}/__state"
+        status_code: 200
+      register: _up
+      until: _up.status == 200
+      retries: 20
+      delay: 1
+
+    - block:
+        - name: Create the install dir for the persisted revision
+          file:
+            path: "{{ remnawave_node_install_dir }}"
+            state: directory
+
+        # (a) the happy path
+        - name: Enroll, bootstrap
+          include_tasks: "{{ _tasks }}/register_node.yml"
+
+        - name: Assert the bootstrap answer
+          assert:
+            that:
+              - _fcp_bootstrap.machineRevision | int == 1
+              - _fcp_bootstrap.nodePort | int == 2222
+              - _fcp_bootstrap.ingress is none
+              - remnawave_panel_secret_key == 'mock-panel-node-secret'
+            success_msg: "enrolled, bootstrapped."
+          no_log: true
+
+        - name: Report applied
+          include_tasks: "{{ _tasks }}/applied.yml"
+
+        - name: Read the mock's state
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__state"
+            return_content: yes
+          register: _state
+
+        - name: Assert the stage and that the secret travelled once
+          assert:
+            that:
+              - _fcp_view.json.stage == 'machine_ready'
+              - _state.json.secrets_served == 1
+              - "(_state.json.requests | selectattr('method', 'equalto', 'PUT') | list | length) == 1"
+              - lookup('file', remnawave_node_install_dir ~ '/.applied_revision') | trim == '1'
+            success_msg: "machine_ready; one PUT, one secret."
+
+        # (b) observations only on a rerun
+        - name: Enroll again (observations)
+          include_tasks: "{{ _tasks }}/register_node.yml"
+        - name: Read the mock's state
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the rerun changed only the observations
+          assert:
+            that:
+              - _fcp_view.json.registration.generation == 2
+              - _fcp_view.json.purpose == 'direct'
+              - _state.json.secrets_served == 2
+            success_msg: "rerun is observations only."
+
+        # (c) blocked
+        - name: Scenario blocked
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: blocked }
+        - name: A blocked registration must stop the play
+          block:
+            - name: Enroll a node FCP blocks
+              include_tasks: "{{ _tasks }}/register_node.yml"
+              vars:
+                node_name: "blocked-node-one"
+            - name: (c) Unreached
+              assert:
+                that: [false]
+                fail_msg: "A blocked registration went on to the bootstrap."
+          rescue:
+            - name: Assert the play failed closed on the code
+              assert:
+                that:
+                  - _fcp_view.json.registration.state == 'blocked'
+                  - _fcp_view.json.registration.code == 'servers.origin_name_taken'
+                  - "'servers.origin_name_taken' in (ansible_failed_result.msg | default(''))"
+                success_msg: "blocked registration stops the play with its code."
+
+        # (d) not set up
+        - name: Scenario not_set_up
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: not_set_up }
+        - name: Enroll against a panel that is not set up
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/api/v1/admin/servers/panel-a/nodes/by-name/another-node-x"
+            method: PUT
+            headers: { Authorization: "Bearer {{ fcp_api_token }}" }
+            body_format: json
+            body:
+              roleContractVersion: 2
+              purpose: direct
+              observed: { management: { address: "192.0.2.1", port: 2222 }, publicIps: {}, capabilities: { caddy: false, ipv6: false } }
+            status_code: [409]
+            return_content: yes
+          register: _nsu
+        - name: Assert the refusal code
+          assert:
+            that:
+              - _nsu.json.error.code == 'servers.panel_not_set_up'
+        - name: Scenario plain
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: plain }
+
+        # (e) stale revision
+        - name: Report a stale revision
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/api/v1/admin/servers/panel-a/nodes/by-name/quiet-falcon-nest/applied"
+            method: POST
+            headers: { Authorization: "Bearer {{ fcp_api_token }}" }
+            body_format: json
+            body: { appliedRevision: 0, nodeStarted: true }
+            status_code: [409]
+            return_content: yes
+          register: _stale
+        - name: Assert servers.revision_stale
+          assert:
+            that:
+              - _stale.json.error.code == 'servers.revision_stale'
+
+        # (f) boundary
+        - name: Mint a register-only token bound to another panel
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__mint"
+            method: POST
+            body_format: json
+            body:
+              token: "fsv1_bound_elsewhere"
+              scopes: ["admin:edges:register"]
+              boundary: { backendSlugs: ["panel-b"] }
+        - name: Read with the bound token
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/api/v1/admin/servers/panel-a/nodes/by-name/quiet-falcon-nest"
+            headers: { Authorization: "Bearer fsv1_bound_elsewhere" }
+            status_code: [403]
+            return_content: yes
+          register: _bound
+        - name: Assert the boundary refusal
+          assert:
+            that:
+              - _bound.json.error.code == 'servers.registration_boundary'
+
+        # (g) a front node
+        - name: Enroll a front node
+          include_tasks: "{{ _tasks }}/register_node.yml"
+          vars:
+            node_purpose: front
+            node_name: "bright-harbor-lane"
+        - name: Assert the front node's ingress
+          assert:
+            that:
+              - origin_hostname == 'bright-harbor-lane.origin.example'
+              - _fcp_bootstrap.ingress.routes | length == 1
+              - _fcp_bootstrap.ingress.routes[0].path == '/ws'
+              - _fcp_bootstrap.ingress.routes[0].port == 8443
+            success_msg: "front node: origin hostname and routes from FCP."
+
+        # (h) blocked while verifying the machine
+        - name: Scenario blocked_later
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: blocked_later }
+        - name: A node blocked after the applied report must stop the play
+          block:
+            - name: Report applied for the front node
+              include_tasks: "{{ _tasks }}/applied.yml"
+              vars:
+                node_purpose: front
+                node_name: "bright-harbor-lane"
+            - name: (h) Unreached
+              assert:
+                that: [false]
+                fail_msg: "A blocked node was reported as a successful deploy."
+          rescue:
+            - name: Assert the play failed closed on the code
+              assert:
+                that:
+                  - "'servers.node_offline' in (ansible_failed_result.msg | default(''))"
+                success_msg: "blocked while verifying: the play stops with FCP's code."
+      always:
+        - name: Stop the mock
+          shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"
+        - name: Remove the test dir
+          file:
+            path: "{{ remnawave_node_install_dir }}"
+            state: absent

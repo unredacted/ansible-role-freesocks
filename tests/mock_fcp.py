@@ -1,45 +1,29 @@
 #!/usr/bin/env python3
-"""Mock FreeSocks Control Plane (FCP) admin API for the role's CI integration test.
+"""Mock FreeSocks Control Plane (FCP) for the role's offline tests.
 
-Implements ONLY the admin surface the role calls, with the same strictness the
-real FCP applies, so a contract regression in the role fails here instead of in
-production:
+Implements ONLY the bootstrap contract v2 the role calls, with the same
+refusals the real FCP applies (FCP docs/servers.md "Node registration"):
 
-  PUT    /api/v1/admin/backend-servers/by-slug/{slug}   (keep-secret-on-blank upsert)
-  DELETE /api/v1/admin/backend-servers/by-slug/{slug}   (idempotent)
-  POST   /api/v1/admin/backend-servers/test-connection  (STRICT: rejects undeclared
-                                                         fields like name/maxKeys/priority,
-                                                         mirroring Convex arg validators)
-  PATCH  /api/v1/admin/backends/remnawave/mode-placements
-                                                        (the generic per-backend
-                                                         placement route, 2026-07-28:
-                                                         squadUuids replace +
-                                                         addSquadUuids/removeSquadUuids;
-                                                         UUID-validated; UNKNOWN mode
-                                                         slugs skipped like FCP)
-  PATCH  /api/v1/admin/remnawave/mode-placements        (byte-compatible legacy ALIAS:
-                                                         also maps the pre-rename ids
-                                                         evade/privacy onto the current
-                                                         slugs, exactly like FCP)
-  PATCH  /api/v1/admin/connection-modes/{slug}          (per-mode catalog PATCH; the
-                                                         mock honors {makeDefault};
-                                                         404 unknown slug, 400
-                                                         makeDefault-on-disabled. The
-                                                         old BULK PATCH /connection-modes
-                                                         is GONE, mirroring FCP)
-  GET    /api/v1/admin/status                           (registered slugs, healthy)
-  GET    /__state                                       (test hook: full mock state)
-  POST   /__mint {token, scopes}                        (test hook: register a
-                                                         restricted token)
+  PUT    /api/v1/admin/servers/{slug}/nodes/by-name/{name}            enroll / observe
+  GET    /api/v1/admin/servers/{slug}/nodes/by-name/{name}            the node's view
+  POST   /api/v1/admin/servers/{slug}/nodes/by-name/{name}/bootstrap  machine config + secret
+  POST   /api/v1/admin/servers/{slug}/nodes/by-name/{name}/applied    applied report
+  POST   /api/v1/admin/servers/{slug}/nodes/by-name/{name}/wiped      the wipe ack
+  DELETE /api/v1/admin/servers/{slug}/nodes/by-name/{name}            retirement request
+  GET    /api/v1/admin/status                                          the status gate
+  GET    /__state                                                      test hook
+  POST   /__mint {token, scopes, boundary?}                            test hook
+  POST   /__scenario {name: ...}                                       test hook: what
+                                                                       the next calls answer
 
-Every request must carry `Authorization: Bearer fsv1_...` or it 401s, mirroring
-resolveAdmin. Each route also enforces its real FCP scope (403 auth.forbidden):
-by-slug PUT/DELETE + mode-placements need admin:servers:write; test-connection
-and node-stats need admin:servers:read; connection-modes needs
-admin:settings:write; status needs admin:status:read. Tokens registered via
-/__mint carry only their listed scopes; unregistered fsv1_ tokens get all
-scopes (backward compatible). Errors use FCP's {"error": {"code", "message"}}
-envelope.
+Scenarios: `plain` (default: a fresh node reconciles at once, bootstrap serves
+a secret, applied leads to machine_ready), `blocked` (registration blocked
+with a code), `not_set_up` (PUT refused), `stale_revision` (applied refused),
+`needs_admin` (DELETE answers a retirement that needs a decision),
+`ready_to_wipe` (DELETE answers ready_to_wipe), `unreachable_bootstrap`
+(bootstrap answers 502), `blocked_later` (the node's view turns blocked, as
+when FCP cannot verify the applied machine). The secret is only ever in the
+bootstrap answer.
 
 Run:  python3 tests/mock_fcp.py [port]     (default 8811)
 """
@@ -49,43 +33,59 @@ import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-# The compiled default catalog (slug -> enabled), mirroring FCP's built-ins:
-# freedom-reality ships dark until an operator lights it up.
-MODES = {"freedom-ws": True, "freedom-reality": False, "privacy-reality": True}
-MODE_IDS = tuple(MODES)
-COMPILED_DEFAULT_MODE = "freedom-ws"
-# Pre-rename ids, accepted ONLY by the legacy alias route (like FCP).
-LEGACY_ALIAS = {"evade": "freedom-ws", "privacy": "privacy-reality"}
-TESTCONN_FIELDS = {"backend", "id", "baseUrl", "apiToken", "apiUrl", "websocketEnabled", "websocketDomain"}
-ALL_SCOPES = {"admin:servers:read", "admin:servers:write", "admin:settings:write", "admin:status:read"}
+ALL_SCOPES = {
+    "admin:servers:read",
+    "admin:servers:write",
+    "admin:servers:manage",
+    "admin:edges:register",
+    "admin:status:read",
+}
+BY_NAME = re.compile(
+    r"^/api/v1/admin/servers/(?P<slug>[^/]+)/nodes/by-name/(?P<name>[^/]+)(?:/(?P<verb>bootstrap|applied|wiped))?$"
+)
+NODE_NAME = re.compile(r"^[A-Za-z0-9 ._-]{3,30}$")
+SECRET = "mock-panel-node-secret"
 
 STATE = {
-    "servers": {},        # slug -> row
-    "pools": {},          # modeId -> [squadUuid]
-    "defaultMode": None,
-    "requests": [],       # [{method, path}] audit trail for assertions
-    "tokens": {},         # token -> [scopes] (only /__mint-registered; others get ALL_SCOPES)
-    # The Servers ownership contract (fcp_managed): mirrors FCP's
-    # convex/panelReservations.ts closely enough to catch a role regression.
-    "handoff": {},        # slug -> roleContractVersion
-    "reservations": {},   # roleOpId -> {slug, kind, identity, state, panelUuid}
-    "tombstones": [],     # [[slug, kind, identity]] seeded via /__tombstone
+    "scenario": "plain",
+    "nodes": {},  # "slug/name" -> intent
+    "requests": [],  # [{method, path}]
+    "tokens": {},  # token -> {"scopes": [...], "boundary": {...} | None}
+    "secrets_served": 0,
 }
 
-REQUIRED_ROLE_CONTRACT = 1
+
+def _key(slug, name):
+    return f"{slug}/{name}"
 
 
-def _identity(body):
-    if body.get("kind") == "host":
-        h = body.get("host") or {}
-        return json.dumps([h.get("remark"), h.get("inboundUuid"),
-                           str(h.get("address", "")).lower(), int(h.get("port") or 0)])
-    return body.get("identity") or ""
+def _intent(slug, name, body):
+    return {
+        "name": name,
+        "purpose": body.get("purpose"),
+        "registration": {"state": "ready", "code": None, "generation": 1},
+        "stage": "registered",
+        "delivery": "staged",
+        "machineRevision": 1,
+        "appliedRevision": None,
+        "node": {"uuid": "00000001-0000-4000-8000-000000000000", "port": 2222},
+        "origin": {
+            "hostname": (f"{name}.origin.example" if body.get("purpose") == "front" else None),
+            "dns": ("resolves" if body.get("purpose") == "front" else "none"),
+        },
+        "retirement": None,
+        "updatedAt": "2026-09-19T00:00:00.000Z",
+        "_observed": body.get("observed"),
+        "_label": body.get("label"),
+    }
+
+
+def _view(i):
+    return {k: v for k, v in i.items() if not k.startswith("_")}
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):  # quiet
+    def log_message(self, fmt, *args):
         sys.stderr.write("[mock-fcp] %s\n" % (fmt % args))
 
     def _send(self, status, body):
@@ -103,269 +103,175 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("content-length") or 0)
         return json.loads(self.rfile.read(n).decode() or "{}") if n else {}
 
-    def _scoped(self, scope):
-        """401 without an fsv1_ bearer; 403 when the token lacks the route's scope."""
+    def _auth(self, scopes, slug=None, name=None):
+        """401 without an fsv1_ bearer; 403 outside the token's scopes or boundary."""
         auth = self.headers.get("authorization") or ""
         if not auth.startswith("Bearer fsv1_"):
             self._error(401, "auth.unauthenticated", "missing/invalid fsv1_ bearer token")
             return False
         token = auth[len("Bearer "):]
-        granted = STATE["tokens"].get(token, ALL_SCOPES)
-        if scope not in granted:
-            self._error(403, "auth.forbidden", f"token missing required scope: {scope}")
+        reg = STATE["tokens"].get(token)
+        granted = set(reg["scopes"]) if reg else ALL_SCOPES
+        if not (granted & set(scopes)):
+            self._error(403, "auth.forbidden", f"token needs one of: {sorted(scopes)}")
             return False
+        # A register-only token is confined to its boundary.
+        if reg and "admin:servers:write" not in granted and "admin:servers:manage" not in granted and slug:
+            b = reg.get("boundary") or {"backendSlugs": []}
+            if slug not in b.get("backendSlugs", []) or (
+                b.get("nodeNames") and name not in b["nodeNames"]
+            ):
+                self._error(403, "servers.registration_boundary", "This token may not act for that node")
+                return False
         return True
 
     def _record(self):
         STATE["requests"].append({"method": self.command, "path": self.path})
 
-    # --- routes ---------------------------------------------------------------
+    # --- routes -------------------------------------------------------------------
 
     def do_GET(self):
         self._record()
         if self.path == "/__state":
             return self._send(200, STATE)
         if self.path == "/api/v1/admin/status":
-            if not self._scoped("admin:status:read"):
+            if not self._auth({"admin:status:read"}):
                 return
-            return self._send(200, {
-                "users": {"active": 0, "grace": 0, "disabled": 0, "deleted": 0, "inactive": 0},
-                "backendDrift": 0,
-                "backends": [
-                    {"slug": s, "backend": r["backend"], "isActive": True, "keyCount": 0,
-                     "healthy": True, "lastHealthOkAt": None, "lastHealthRttMs": None,
-                     "fleetStats": None}
-                    for s, r in STATE["servers"].items()
-                ],
-            })
-        if self.path == "/api/v1/admin/remnawave/node-stats":
-            if not self._scoped("admin:servers:read"):
+            return self._send(200, {"users": {}, "backendDrift": 0, "backends": []})
+        m = BY_NAME.match(self.path)
+        if m and not m.group("verb"):
+            if not self._auth({"admin:servers:read", "admin:edges:register", "admin:servers:manage"}, m.group("slug"), m.group("name")):
                 return
-            return self._send(200, {
-                "nodes": [],
-                "placements": [{"modeId": m, "boundCount": len(STATE["pools"].get(m, []))}
-                               for m in MODE_IDS],
-            })
+            i = STATE["nodes"].get(_key(m.group("slug"), m.group("name")))
+            if not i:
+                return self._error(404, "not_found", "Not found")
+            if STATE["scenario"] == "blocked_later":
+                # FCP blocked the node while verifying the applied machine.
+                i["registration"] = {**i["registration"], "state": "blocked", "code": "servers.node_offline"}
+            return self._send(200, _view(i))
         self._error(404, "not_found", self.path)
 
     def do_PUT(self):
         self._record()
-        if not self._scoped("admin:servers:write"):
-            return
-        m = re.match(r"^/api/v1/admin/servers/([^/]+)/handoff$", self.path)
-        if m:
-            version = int(self._body().get("roleContractVersion") or 0)
-            if version < 1:
-                return self._error(400, "validation", "roleContractVersion must be a positive integer")
-            STATE["handoff"][m.group(1)] = version
-            return self._send(200, {"ok": True, "required": REQUIRED_ROLE_CONTRACT,
-                                    "current": version >= REQUIRED_ROLE_CONTRACT})
-        m = re.match(r"^/api/v1/admin/servers/([^/]+)/reservations/([^/]+)$", self.path)
-        if m:
-            from urllib.parse import unquote
-            row = STATE["reservations"].get(unquote(m.group(2)))
-            if not row or row["slug"] != m.group(1):
-                return self._error(404, "not_found", "No such reservation")
-            body = self._body()
-            if isinstance(body.get("created"), str) and body["created"]:
-                row.update(state="owned", panelUuid=body["created"])
-                return self._send(200, {"ok": True, "state": "owned"})
-            if body.get("rejected_pre_mutation") is True:
-                row.update(state="released")
-                return self._send(200, {"ok": True, "state": "released"})
-            return self._error(400, "validation", "Settle with created or rejected_pre_mutation")
-        m = re.match(r"^/api/v1/admin/backend-servers/by-slug/(.+)$", self.path)
-        if not m:
+        m = BY_NAME.match(self.path)
+        if not m or m.group("verb"):
             return self._error(404, "not_found", self.path)
-        slug = m.group(1)
+        slug, name = m.group("slug"), m.group("name")
+        if not self._auth({"admin:servers:write", "admin:edges:register", "admin:servers:manage"}, slug, name):
+            return
         body = self._body()
-        backend = body.get("backend")
-        if backend not in ("remnawave", "outline"):
-            return self._error(400, "validation", "backend must be remnawave|outline")
-        existing = STATE["servers"].get(slug)
-        if existing and existing["backend"] != backend:
-            return self._error(400, "admin.error", f'exists as type "{existing["backend"]}"')
-        if not existing:
-            if backend == "remnawave" and not (body.get("baseUrl") and body.get("apiToken")):
-                return self._error(400, "admin.error", "A Remnawave instance needs a base URL and an API token")
-            if backend == "outline" and not body.get("apiUrl"):
-                return self._error(400, "admin.error", "An Outline instance needs an apiUrl")
-        mk = body.get("maxKeys")
-        if mk is not None and "maxKeys" in body and not (isinstance(mk, int) and mk >= 1):
-            return self._error(400, "admin.error", "maxKeys must be a positive integer (or null to clear the cap)")
-        row = dict(existing or {})
-        # keep-secret-on-blank: only non-empty strings overwrite
-        for k in ("baseUrl", "apiToken", "apiUrl"):
-            if isinstance(body.get(k), str) and body[k]:
-                row[k] = body[k]
-        for k in ("name", "isActive", "priority", "websocketEnabled", "websocketDomain", "maxKeys"):
-            if k in body:
-                row[k] = body[k]
-        row["backend"] = backend
-        STATE["servers"][slug] = row
-        return self._send(200, {"id": "srv_" + slug, "slug": slug, "backend": backend,
-                                "created": existing is None})
+        if STATE["scenario"] == "not_set_up":
+            return self._error(409, "servers.panel_not_set_up", "Set up this panel in Servers first")
+        if int(body.get("roleContractVersion") or 0) < 2:
+            return self._error(409, "servers.contract_version", "This panel expects role contract v2")
+        if body.get("purpose") not in ("direct", "front", "relay"):
+            return self._error(400, "validation", "purpose")
+        if not NODE_NAME.match(name):
+            return self._error(400, "validation", "name")
+        obs = body.get("observed") or {}
+        mgmt = obs.get("management") or {}
+        if not mgmt.get("address") or not isinstance(mgmt.get("port"), int):
+            return self._error(400, "validation", "observed.management")
+        i = STATE["nodes"].get(_key(slug, name))
+        if i:
+            if i["purpose"] != body.get("purpose"):
+                return self._error(409, "servers.purpose_change_needs_admin", "A node keeps its purpose")
+            if i["retirement"]:
+                return self._error(409, "servers.node_retiring", "This node is being retired")
+            i["_observed"] = obs
+            i["registration"]["generation"] += 1
+        else:
+            i = _intent(slug, name, body)
+            STATE["nodes"][_key(slug, name)] = i
+        if STATE["scenario"] == "blocked":
+            i["registration"] = {"state": "blocked", "code": "servers.origin_name_taken", "generation": 1}
+        return self._send(200, _view(i))
 
     def do_DELETE(self):
         self._record()
-        if not self._scoped("admin:servers:write"):
-            return
-        m = re.match(r"^/api/v1/admin/backend-servers/by-slug/(.+)$", self.path)
-        if not m:
+        m = BY_NAME.match(self.path)
+        if not m or m.group("verb"):
             return self._error(404, "not_found", self.path)
-        existed = STATE["servers"].pop(m.group(1), None) is not None
-        return self._send(200, {"ok": True, "deleted": existed})
+        slug, name = m.group("slug"), m.group("name")
+        if not self._auth({"admin:servers:write", "admin:edges:register", "admin:servers:manage"}, slug, name):
+            return
+        i = STATE["nodes"].get(_key(slug, name))
+        if not i:
+            return self._error(404, "not_found", "Not found")
+        stage = "needs_admin" if STATE["scenario"] == "needs_admin" else "ready_to_wipe"
+        i["retirement"] = {"stage": stage, "code": None}
+        i["delivery"] = "retiring"
+        return self._send(200, _view(i))
 
     def do_POST(self):
         self._record()
-        if self.path == "/__tombstone":
-            b = self._body()
-            STATE["tombstones"].append([b.get("slug"), b.get("kind"), b.get("identity")])
-            return self._send(200, {"ok": True})
-        m = re.match(r"^/api/v1/admin/servers/([^/]+)/reservations$", self.path)
-        if m:
-            if not self._scoped("admin:servers:write"):
-                return
-            slug, body = m.group(1), self._body()
-            op, kind, identity = str(body.get("roleOpId") or ""), body.get("kind"), _identity(body)
-            if not re.match(r"^[A-Za-z0-9._:-]{8,80}$", op) or not identity \
-                    or kind not in ("node", "host", "inbound", "squad", "profile"):
-                return self._error(400, "validation", "bad reservation")
-            mine = STATE["reservations"].get(op)
-            if mine:
-                if (mine["slug"], mine["kind"], mine["identity"]) == (slug, kind, identity):
-                    return self._send(200, {"ok": True, "roleOpId": op, "state": mine["state"]})
-                return self._error(409, "servers.reservation_conflict", "roleOpId reused")
-            if [slug, kind, identity] in STATE["tombstones"]:
-                return self._error(409, "servers.tombstoned", "removed on purpose")
-            for r in STATE["reservations"].values():
-                if (r["slug"], r["kind"], r["identity"]) == (slug, kind, identity):
-                    code = "servers.reservation_open" if r["state"] == "reserved" else "servers.exists"
-                    if r["state"] != "released":
-                        return self._error(409, code, "held")
-            STATE["reservations"][op] = {"slug": slug, "kind": kind, "identity": identity,
-                                         "state": "reserved", "panelUuid": None}
-            return self._send(200, {"ok": True, "roleOpId": op, "state": "reserved"})
-        # Test hook (unauthenticated, like /__state): register a restricted token.
         if self.path == "/__mint":
             body = self._body()
-            token = body.get("token")
-            scopes = body.get("scopes")
+            token, scopes = body.get("token"), body.get("scopes")
             if not (isinstance(token, str) and token.startswith("fsv1_") and isinstance(scopes, list)):
-                return self._error(400, "validation", "__mint needs {token: 'fsv1_...', scopes: [...]}")
-            bad = [s for s in scopes if s not in ALL_SCOPES]
-            if bad:
-                return self._error(400, "validation", f"unknown scopes: {bad}")
-            STATE["tokens"][token] = list(scopes)
+                return self._error(400, "validation", "__mint needs {token, scopes}")
+            STATE["tokens"][token] = {"scopes": scopes, "boundary": body.get("boundary")}
             return self._send(200, {"ok": True})
-        if not self._scoped("admin:servers:read"):
+        if self.path == "/__scenario":
+            STATE["scenario"] = (self._body().get("name") or "plain")
+            return self._send(200, {"ok": True, "scenario": STATE["scenario"]})
+        m = BY_NAME.match(self.path)
+        if not m or not m.group("verb"):
+            return self._error(404, "not_found", self.path)
+        slug, name, verb = m.group("slug"), m.group("name"), m.group("verb")
+        if not self._auth({"admin:servers:write", "admin:edges:register", "admin:servers:manage"}, slug, name):
             return
-        if self.path == "/api/v1/admin/backend-servers/test-connection":
+        i = STATE["nodes"].get(_key(slug, name))
+        if not i:
+            return self._error(404, "not_found", "Not found")
+        if verb == "bootstrap":
+            if STATE["scenario"] == "unreachable_bootstrap":
+                return self._error(502, "backend.panel_read_failed", "The panel could not be read")
+            STATE["secrets_served"] += 1
+            if i["stage"] == "registered":
+                i["stage"] = "bootstrap_available"
+            ingress = (
+                {
+                    "hostname": i["origin"]["hostname"],
+                    "externalPort": 443,
+                    "routes": [{"path": "/ws", "port": 8443}],
+                }
+                if i["purpose"] == "front"
+                else None
+            )
+            return self._send(200, {
+                "machineRevision": i["machineRevision"],
+                "secretKey": SECRET,
+                "node": {"port": 2222, "name": name, "purpose": i["purpose"]},
+                "ingress": ingress,
+                "origin": i["origin"],
+            })
+        if verb == "applied":
             body = self._body()
-            # Mirror Convex arg-validator strictness: an undeclared field is an
-            # error (this is what broke the probe when it carried `name`).
-            extra = set(body) - TESTCONN_FIELDS
-            if extra:
-                return self._error(400, "validation", f"undeclared fields: {sorted(extra)}")
-            if body.get("backend") not in ("remnawave", "outline"):
-                return self._error(400, "validation", "backend must be remnawave|outline")
-            return self._send(200, {"ok": True, "keyCount": 0})
-        self._error(404, "not_found", self.path)
-
-    def _apply_placements(self, modes):
-        """Shared mode-placements body handler (canonical slugs only — the alias
-        route remaps its keys BEFORE calling this, exactly like FCP)."""
-        if not isinstance(modes, dict):
-            return self._error(400, "validation", "mode-placement patch must be an object")
-        wrote = False
-        for mode_id, entry in modes.items():
-            if mode_id not in MODE_IDS or not isinstance(entry, dict):
-                continue  # unknown slugs are skipped, never a 400 (like FCP)
-            replace = entry.get("squadUuids")
-            add = entry.get("addSquadUuids")
-            remove = entry.get("removeSquadUuids")
-            if replace is None and add is None and remove is None:
-                continue
-            # FCP validates replace/add entries as UUIDs; remove is any string.
-            for field, val, strict in (("squadUuids", replace, True),
-                                       ("addSquadUuids", add, True),
-                                       ("removeSquadUuids", remove, False)):
-                if val is None:
-                    continue
-                if not isinstance(val, list) or any(not isinstance(s, str) or not s.strip() for s in val):
-                    return self._error(400, "validation", f"{field} must be an array of non-empty strings")
-                if strict:
-                    bad = [s for s in val if not UUID_RE.match(s.strip())]
-                    if bad:
-                        return self._error(400, "validation", "not a squad UUID: " + ", ".join(bad))
-            pool = list(replace) if replace is not None else list(STATE["pools"].get(mode_id, []))
-            if add:
-                pool += [s for s in add if s not in pool]
-            if remove:
-                pool = [s for s in pool if s not in set(remove)]
-            # dedupe, keep order
-            seen, deduped = set(), []
-            for s in pool:
-                if s not in seen:
-                    seen.add(s)
-                    deduped.append(s)
-            STATE["pools"][mode_id] = deduped
-            wrote = True
-        if not wrote:
-            return self._error(400, "validation", "no recognized mode-placement fields")
-        return self._send(200, {
-            "bound": [m for m in MODE_IDS if STATE["pools"].get(m)],
-            "placements": [{"modeId": m, "boundCount": len(STATE["pools"].get(m, []))}
-                           for m in MODE_IDS],
-        })
-
-    def do_PATCH(self):
-        self._record()
-        if self.path == "/api/v1/admin/backends/remnawave/mode-placements":
-            # The generic per-backend route the role targets: canonical slugs
-            # ONLY — a pre-rename id here is skipped like any unknown slug.
-            if not self._scoped("admin:servers:write"):
-                return
-            return self._apply_placements(self._body().get("modes"))
-        if self.path == "/api/v1/admin/remnawave/mode-placements":
-            # Legacy byte-compatible ALIAS: maps pre-rename entry ids onto the
-            # current slugs (canonical entry wins when both spellings appear).
-            if not self._scoped("admin:servers:write"):
-                return
-            raw = self._body().get("modes")
-            if not isinstance(raw, dict):
-                return self._error(400, "validation", "mode-placement patch must be an object")
-            modes = {}
-            for key, entry in raw.items():
-                canonical = LEGACY_ALIAS.get(key)
-                if canonical:
-                    if canonical not in raw:
-                        modes[canonical] = entry
-                else:
-                    modes[key] = entry
-            return self._apply_placements(modes)
-        m = re.match(r"^/api/v1/admin/connection-modes/([a-z0-9-]+)$", self.path)
-        if m:
-            if not self._scoped("admin:settings:write"):
-                return
-            slug = m.group(1)
-            if slug not in MODES:
-                return self._error(404, "not_found", f"unknown connection mode: {slug}")
-            body = self._body()
-            if body.get("makeDefault"):
-                if not MODES[slug]:
-                    return self._error(400, "validation", "cannot make a disabled mode the default")
-                STATE["defaultMode"] = slug
-            if "enabled" in body:
-                MODES[slug] = bool(body["enabled"])
-            return self._send(200, {"ok": True})
-        # NOTE: the old BULK PATCH /api/v1/admin/connection-modes is deliberately
-        # ABSENT (404) — FCP removed it 2026-07-28; a role regression back to
-        # that shape must fail here.
+            rev = int(body.get("appliedRevision") or 0)
+            if STATE["scenario"] == "stale_revision" or rev < i["machineRevision"]:
+                return self._error(409, "servers.revision_stale", "Run the role again")
+            if rev > i["machineRevision"]:
+                return self._error(409, "servers.revision_unknown", "Never served")
+            if body.get("nodeStarted") is not True:
+                return self._error(400, "validation", "nodeStarted")
+            repeated = i["appliedRevision"] == rev
+            i["appliedRevision"] = rev
+            if i["stage"] in ("registered", "bootstrap_available", "machine_applied"):
+                i["stage"] = "machine_ready"
+            return self._send(200, {"stage": i["stage"], "repeated": repeated})
+        if verb == "wiped":
+            r = i["retirement"]
+            if not r:
+                return self._error(409, "servers.not_retiring", "This node is not being retired")
+            if r["stage"] not in ("ready_to_wipe", "wiped", "retired"):
+                return self._error(409, "servers.retirement_stage", "Not ready to wipe")
+            r["stage"] = "retired"
+            i["registration"]["state"] = "retired"
+            return self._send(200, {"stage": "retired"})
         self._error(404, "not_found", self.path)
 
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8811
-    print(f"[mock-fcp] listening on 127.0.0.1:{port}", file=sys.stderr)
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

@@ -7,3 +7,8 @@ HANDOFF-cdn-transports.md
 
 # Ansible local cache / runtime dir
 .ansible/
+
+# Offline test scratch (tests/run.sh cleans these up; belt and braces)
+tests/.reg/
+tests/.caddyfile.rendered
+tests/.compose.rendered

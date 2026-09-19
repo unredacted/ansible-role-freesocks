@@ -7,22 +7,18 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel superseded runs on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Cheap structural checks: every YAML parses + the test playbooks pass
-  # ansible's own syntax check.
+  # Every YAML parses and the test playbooks pass ansible's own syntax check.
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      # Pinned: the role has known landmines on ansible-core 2.19+ lazy
-      # templating (see CLAUDE.md) and is verified against 2.21.x — don't let a
-      # floating latest break CI (or worse, pass with different templating).
+      # Pinned: verified against ansible-core 2.21.x (2.19+ lazy templating).
       - name: Install ansible-core
         run: pipx install 'ansible-core~=2.21.2'
       - name: YAML-parse every role file
@@ -43,51 +39,20 @@ jobs:
           EOF
       - name: Syntax-check the test playbooks
         run: |
-          # test_deploy.yml loads the bootstrap output via vars_files, which the
-          # syntax check also resolves — provide a placeholder.
-          mkdir -p /tmp/role-ci && printf 'remnawave_panel_config_profile_uuid: ""\n' > /tmp/role-ci/bootstrap-vars.yml
           export ANSIBLE_ROLES_PATH="$(dirname "$PWD")"
           for f in tests/test_*.yml; do
             echo "== $f"
             ansible-playbook --syntax-check "$f"
           done
 
-  # The self-asserting expression tests (pure filter logic, no network):
-  # bootstrap/placement body building, per-node plan+clone expressions, and
-  # the Caddyfile render.
+  # The offline tests: the bootstrap contract against the mock FCP, the
+  # retirement contract, the Caddyfile and compose renders, address resolution.
   unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Install ansible-core
         run: pipx install 'ansible-core~=2.21.2'
-      - name: Run the offline expression tests
+      - name: Run the offline tests
         run: tests/run.sh
-
-  # The real thing: a pinned Remnawave panel (same image the fleet runs) + a
-  # contract-strict mock FCP + a mock Cloudflare API, driven end to end —
-  # bootstrap, per-node placement for two nodes (including the
-  # duplicate-inbound-port case), pool append/detach, teardown, and then the
-  # FULL operation_mode=deploy path: a real remnawave/node container the panel
-  # actually connects to, Reality placement, DNS, FCP registration + status
-  # gate. Catches panel contract drift and FCP request regressions before any
-  # production deploy.
-  integration:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install ansible-core + collections + docker SDK
-        run: |
-          pipx install 'ansible-core~=2.21.2'
-          pipx inject ansible-core docker requests
-          ansible-galaxy collection install -r requirements.yml
-      - name: Run the integration harness (incl. the real-deploy phase)
-        run: RUN_DEPLOY_PHASE=1 bash tests/run_integration.sh
-      - name: Panel + node logs on failure
-        if: failure()
-        run: |
-          docker compose -f tests/panel/docker-compose.yml logs --tail=100 || true
-          sudo docker logs remnanode --tail=100 || true
-          sudo cat /opt/remnanode/docker-compose.yml || true

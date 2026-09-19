@@ -1,27 +1,27 @@
 {# templates/remnanode-caddyfile.j2
-   Rendered to /etc/caddy/Caddyfile.
+   Rendered to /etc/caddy/Caddyfile from what FCP served (the ingress of the
+   bootstrap answer): one `handle` per route to its loopback Xray inbound,
+   every other path falls through to the decoy site.
 
-   Data-driven, path-routed multi-transport model: each enabled entry in
-   remnawave_cdn_transports gets a Caddy route to its loopback Xray inbound,
-   and every other path falls through to a decoy/camouflage site. Caddy
-   auto-binds port 80 for ACME HTTP-01 + HTTPS redirects; the site block listens
-   on remnawave_caddy_listen_port (default 443) and terminates TLS.
-
-   - ws    -> exact path match, reverse_proxy to the inbound (the WebSocket
-              upgrade passes through transparently).
+   The site has TWO addresses: the origin hostname (Caddy issues its
+   certificate, HTTP-01 on port 80) and a catch-all `https://`, so an edge that
+   sends its OWN hostname as SNI and Host (Cloudflare in `full` mode) is still
+   answered: `fallback_sni` serves the origin certificate for an unmatched SNI,
+   and the catch-all routes the foreign Host. Nothing makes that certificate
+   valid FOR the foreign name; which provider modes that suits is recorded in
+   FCP (docs/edges.md "Node role contract").
 #}
 {
     email {{ remnawave_caddy_email }}
+    fallback_sni {{ origin_hostname }}
 }
 
-{{ dns_hostname }}:{{ remnawave_caddy_listen_port }} {
-{% for t in remnawave_cdn_transports if (t.enabled | default(true)) %}
-{% if t.network == 'ws' %}
-    @{{ t.name }} path {{ t.path }}
-    handle @{{ t.name }} {
-        reverse_proxy 127.0.0.1:{{ t.internal_port }}
+{{ origin_hostname }}:{{ caddy_listen_port }}, https://:{{ caddy_listen_port }} {
+{% for r in caddy_routes %}
+    @r{{ loop.index }} path {{ r.path }}
+    handle @r{{ loop.index }} {
+        reverse_proxy 127.0.0.1:{{ r.port }}
     }
-{% endif %}
 {% endfor %}
     handle {
         root * {{ remnawave_decoy_root }}
