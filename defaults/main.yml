@@ -205,6 +205,23 @@ fcp_server_name: "{{ random_hostname | default('') }}"   # human-friendly name i
 fcp_server_slug: "{{ random_hostname | default('') }}"   # unique, immutable key in FCP
 fcp_register_remnawave_panel: false # register the Remnawave panel as a backendServers row
 fcp_remnawave_panel_slug: "remnawave-primary"
+# fcp_managed: this panel's nodes, Hosts, squads and Config Profiles are ALSO
+# written from FCP's admin (Servers). Set it in INVENTORY at handoff and leave
+# it set: it is deliberately not something the role asks FCP, so that an
+# unreachable FCP fails the run closed instead of reading as "not managed".
+# With it set the role (contract version 1):
+#   * never PATCHes an existing Config Profile or an existing squad;
+#   * never re-creates an existing relay Host on drift (FCP's Edges own it);
+#   * creates an absent node, Host, squad or profile only after reserving it in
+#     FCP (tasks/providers/fcp/reserve.yml), so what FCP removed on purpose is
+#     not recreated and nothing is created twice;
+#   * creates nothing when FCP cannot be reached.
+# Needs fcp_api_url, fcp_api_token (the same admin:servers:write token) and
+# fcp_remnawave_panel_slug. Independent of fcp_enabled.
+fcp_managed: false
+fcp_role_contract_version: 1
+fcp_managed_retries: 3
+fcp_managed_delay: 5
 fcp_verify_connectivity: true       # after registering, assert FCP can reach the backend (needs admin:servers:read)
 # The connectivity probe polls until FCP can reach the just-registered origin,
 # waiting out fresh-deploy DNS propagation + Caddy's first Let's Encrypt cert

@@ -150,6 +150,9 @@
   loop_control:
     loop_var: _relay_target
     label: "{{ _relay_target.remark | default('?') }}"
+  # fcp_managed: an existing relay Host belongs to FCP's edges machinery; the
+  # role removes none of them. FCP's admin (Edges) retires what is stale.
+  when: not (fcp_managed | default(false) | bool)
 
 - name: Ensure one relay Host per SNI (GET-first, replace on drift)
   include_tasks: providers/remnawave/create_relay_host_one.yml

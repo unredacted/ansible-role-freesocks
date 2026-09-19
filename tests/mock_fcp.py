@@ -66,7 +66,22 @@ STATE = {
     "defaultMode": None,
     "requests": [],       # [{method, path}] audit trail for assertions
     "tokens": {},         # token -> [scopes] (only /__mint-registered; others get ALL_SCOPES)
+    # The Servers ownership contract (fcp_managed): mirrors FCP's
+    # convex/panelReservations.ts closely enough to catch a role regression.
+    "handoff": {},        # slug -> roleContractVersion
+    "reservations": {},   # roleOpId -> {slug, kind, identity, state, panelUuid}
+    "tombstones": [],     # [[slug, kind, identity]] seeded via /__tombstone
 }
+
+REQUIRED_ROLE_CONTRACT = 1
+
+
+def _identity(body):
+    if body.get("kind") == "host":
+        h = body.get("host") or {}
+        return json.dumps([h.get("remark"), h.get("inboundUuid"),
+                           str(h.get("address", "")).lower(), int(h.get("port") or 0)])
+    return body.get("identity") or ""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -137,6 +152,28 @@ class Handler(BaseHTTPRequestHandler):
         self._record()
         if not self._scoped("admin:servers:write"):
             return
+        m = re.match(r"^/api/v1/admin/servers/([^/]+)/handoff$", self.path)
+        if m:
+            version = int(self._body().get("roleContractVersion") or 0)
+            if version < 1:
+                return self._error(400, "validation", "roleContractVersion must be a positive integer")
+            STATE["handoff"][m.group(1)] = version
+            return self._send(200, {"ok": True, "required": REQUIRED_ROLE_CONTRACT,
+                                    "current": version >= REQUIRED_ROLE_CONTRACT})
+        m = re.match(r"^/api/v1/admin/servers/([^/]+)/reservations/([^/]+)$", self.path)
+        if m:
+            from urllib.parse import unquote
+            row = STATE["reservations"].get(unquote(m.group(2)))
+            if not row or row["slug"] != m.group(1):
+                return self._error(404, "not_found", "No such reservation")
+            body = self._body()
+            if isinstance(body.get("created"), str) and body["created"]:
+                row.update(state="owned", panelUuid=body["created"])
+                return self._send(200, {"ok": True, "state": "owned"})
+            if body.get("rejected_pre_mutation") is True:
+                row.update(state="released")
+                return self._send(200, {"ok": True, "state": "released"})
+            return self._error(400, "validation", "Settle with created or rejected_pre_mutation")
         m = re.match(r"^/api/v1/admin/backend-servers/by-slug/(.+)$", self.path)
         if not m:
             return self._error(404, "not_found", self.path)
@@ -181,6 +218,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._record()
+        if self.path == "/__tombstone":
+            b = self._body()
+            STATE["tombstones"].append([b.get("slug"), b.get("kind"), b.get("identity")])
+            return self._send(200, {"ok": True})
+        m = re.match(r"^/api/v1/admin/servers/([^/]+)/reservations$", self.path)
+        if m:
+            if not self._scoped("admin:servers:write"):
+                return
+            slug, body = m.group(1), self._body()
+            op, kind, identity = str(body.get("roleOpId") or ""), body.get("kind"), _identity(body)
+            if not re.match(r"^[A-Za-z0-9._:-]{8,80}$", op) or not identity \
+                    or kind not in ("node", "host", "inbound", "squad", "profile"):
+                return self._error(400, "validation", "bad reservation")
+            mine = STATE["reservations"].get(op)
+            if mine:
+                if (mine["slug"], mine["kind"], mine["identity"]) == (slug, kind, identity):
+                    return self._send(200, {"ok": True, "roleOpId": op, "state": mine["state"]})
+                return self._error(409, "servers.reservation_conflict", "roleOpId reused")
+            if [slug, kind, identity] in STATE["tombstones"]:
+                return self._error(409, "servers.tombstoned", "removed on purpose")
+            for r in STATE["reservations"].values():
+                if (r["slug"], r["kind"], r["identity"]) == (slug, kind, identity):
+                    code = "servers.reservation_open" if r["state"] == "reserved" else "servers.exists"
+                    if r["state"] != "released":
+                        return self._error(409, code, "held")
+            STATE["reservations"][op] = {"slug": slug, "kind": kind, "identity": identity,
+                                         "state": "reserved", "panelUuid": None}
+            return self._send(200, {"ok": True, "roleOpId": op, "state": "reserved"})
         # Test hook (unauthenticated, like /__state): register a restricted token.
         if self.path == "/__mint":
             body = self._body()

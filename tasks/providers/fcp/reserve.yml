@@ -1,0 +1,56 @@
+---
+# tasks/providers/fcp/reserve.yml
+#
+# Reserve an identity in FCP BEFORE creating it on the panel. "Create when
+# absent" is how two writers make duplicates, and how one recreates what the
+# other removed on purpose; FCP decides in one mutation instead.
+#
+# Caller passes:
+#   _fcp_res_key       short unique suffix within the run (e.g. "squad-reality")
+#   _fcp_res_kind      node | host | squad | profile | inbound
+#   _fcp_res_identity  the name (node, squad, profile) or the inbound tag
+#   _fcp_res_host      for kind=host instead: {remark, inboundUuid, address, port}
+#
+# A refusal is FINAL for this run (no retry): the play fails with FCP's code.
+#   servers.tombstoned        removed on purpose in FCP. Do not recreate it;
+#                             restore it from FCP's admin if it is wanted back.
+#   servers.exists            FCP already sees it. Re-run after FCP has looked
+#                             at the panel again (Servers -> Refresh).
+#   servers.reservation_open  an earlier run reserved it and never settled.
+#   servers.op_running        FCP's admin is creating it right now.
+# Only a transport failure is retried: the same call again is the same answer.
+
+- name: Report the handoff first (once per run; fails closed when FCP is unreachable)
+  include_tasks: providers/fcp/managed_preflight.yml
+  when: _fcp_handoff is not defined
+
+- name: "Reserve in FCP: {{ _fcp_res_kind }} ({{ _fcp_res_key }})"
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/servers/{{ fcp_remnawave_panel_slug | urlencode }}/reservations"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+    body_format: json
+    body: >-
+      {{ {'roleOpId': _fcp_run_id ~ ':' ~ _fcp_res_key, 'kind': _fcp_res_kind}
+         | combine({'host': _fcp_res_host} if _fcp_res_kind == 'host'
+                   else {'identity': _fcp_res_identity}) }}
+    status_code: [200, 409]
+    return_content: yes
+  delegate_to: localhost
+  no_log: true
+  register: _fcp_reserve
+  retries: "{{ fcp_managed_retries | default(3) }}"
+  delay: "{{ fcp_managed_delay | default(5) }}"
+  until: _fcp_reserve.status | default(0) in [200, 409]
+
+- name: "Stop when FCP refuses the reservation ({{ _fcp_res_key }})"
+  assert:
+    that:
+      - _fcp_reserve.status == 200
+    fail_msg: >-
+      FCP refused to let this run create {{ _fcp_res_kind }} '{{ _fcp_res_key }}':
+      {{ _fcp_reserve.json.error.code | default('unknown') }}. Nothing was
+      created. See tasks/providers/fcp/reserve.yml for what each code means.
