@@ -207,6 +207,15 @@ fcp_status_gate: false                # poll GET /admin/status until healthy (ad
 
 **Node placement (per-mode squad pools).** FCP homes each new key into the chosen connection mode's squad pool, bound via `PATCH /api/v1/admin/backends/remnawave/mode-placements` (scope `admin:servers:write`; needs the FCP 2026-07-28 DB-driven mode-catalog release — older role versions used the still-alive `/api/v1/admin/remnawave/mode-placements` alias with the pre-rename ids `evade`/`privacy`). The default topology is **one panel-wide squad per transport**: bootstrap creates `FreeSocks-Fastly` (→ `freedom-ws`), `FreeSocks-Reality` (→ `privacy-reality`) and `FreeSocks-Relay` (→ `freedom-reality`) and binds them as the pools; every node activates the shared base inbounds and adds its own Hosts, so a subscription carries every node's endpoint. Retiring a node (`force_wipe_remnawave`) deletes its Hosts and node entry; squads and pools stay. Squad UUIDs are `no_log`'d — FCP validates them server-side and audits only a `poolBound` boolean + pool size. A **legacy per-node model** (`remnawave_per_node_placement: true`) clones inbounds per node with its own `FSF-`/`FSR-<hostname>` squad (panel caps names at 30 chars), appended to the pools and detached at teardown.
 
+**When FCP also manages the panel (`fcp_managed: true`).** FCP's admin (Servers) can write nodes, Hosts, squads and Config Profiles on a panel it observes. Two writers need a protocol, so set `fcp_managed: true` **in inventory** at handoff and leave it set (it is deliberately not something the role asks FCP: an unreachable FCP must fail the run closed, not read as "not managed"). With it set the role follows contract version 1:
+
+- it reports the handoff (`PUT /api/v1/admin/servers/{slug}/handoff`), which FCP requires before it writes anything itself;
+- it **never PATCHes an existing Config Profile or an existing squad**, and never re-creates an existing relay Host on drift. It prints what it would have changed; apply it from FCP;
+- it creates an absent node, Host, squad or profile only after **reserving** it (`POST …/servers/{slug}/reservations`) and then settles the outcome. FCP refuses what it removed on purpose (`servers.tombstoned`), what already exists, and what another run holds, and the play stops with that code. A create whose outcome is uncertain is left open; FCP closes it when it next sees the object;
+- it creates nothing when FCP cannot be reached.
+
+Needs `fcp_api_url`, the same `admin:servers:write` token, and `fcp_remnawave_panel_slug` (the panel's slug in FCP). Independent of `fcp_enabled`. Change, migrate and teardown modes still move or remove this node's own panel row.
+
 **Migrate cleans up the source row.** An Outline migration registers the destination under its own slug, then deletes the source's row by the source slug (`source_kv_hostname`) — a single idempotent `DELETE …/by-slug/{slug}`. Skipped when source and destination slugs match.
 
 ## Fastly fronting (CDN)

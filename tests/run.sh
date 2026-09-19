@@ -7,6 +7,8 @@
 # Usage: tests/run.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# test_fcp_managed.yml includes task files through the role (include_role).
+export ANSIBLE_ROLES_PATH="${ANSIBLE_ROLES_PATH:-$(dirname "$PWD")}"
 
 shopt -s nullglob
 # test_integration.yml / test_deploy.yml need the live panel + mocks — they run

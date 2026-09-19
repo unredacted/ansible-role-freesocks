@@ -61,6 +61,26 @@
   set_fact:
     _existing_host_remarks: "{{ _remnawave_hosts | map(attribute='remark') | list }}"
 
+# fcp_managed: FCP decides whether this run may create it (providers/fcp/reserve.yml).
+- name: "Reserve in FCP before: Create a Remnawave Host per enabled CDN transport (x edge domain)"
+  include_tasks: providers/fcp/reserve.yml
+  vars:
+    _fcp_res_key: "host-{{ random_hostname }}-{{ item.0.name }}-{{ item.1 | hash('sha256') | truncate(6, true, '') }}"
+    _fcp_res_kind: "host"
+    _fcp_res_host:
+      remark: "{{ random_hostname }}-{{ item.0.name }}{{ ('-' ~ (item.1 | hash('sha256') | truncate(6, true, ''))) if (_host_edge_domains | length > 1) else '' }}"
+      inboundUuid: "{{ item.0.inbound_uuid }}"
+      address: "{{ item.1 }}"
+      port: 443
+  loop: "{{ remnawave_cdn_transports | default([]) | product(_host_edge_domains) | list }}"
+  loop_control:
+    label: "{{ item.0.name }} @ {{ item.1 }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - item.0.enabled | default(true) | bool
+    - item.0.inbound_uuid | default('') | length > 0
+    - (random_hostname ~ '-' ~ item.0.name ~ (('-' ~ (item.1 | hash('sha256') | truncate(6, true, ''))) if (_host_edge_domains | length > 1) else '')) not in _existing_host_remarks
+
 - name: Create a Remnawave Host per enabled CDN transport (x edge domain)
   uri:
     url: "{{ remnawave_panel_url }}/api/hosts"
@@ -95,6 +115,20 @@
     - item.0.enabled | default(true) | bool
     - item.0.inbound_uuid | default('') | length > 0
     - (random_hostname ~ '-' ~ item.0.name ~ (('-' ~ (item.1 | hash('sha256') | truncate(6, true, ''))) if (_host_edge_domains | length > 1) else '')) not in _existing_host_remarks
+
+- name: "Settle in FCP after: Create a Remnawave Host per enabled CDN transport (x edge domain)"
+  include_tasks: providers/fcp/settle.yml
+  vars:
+    _fcp_res_key: "host-{{ random_hostname }}-{{ _fcp_r.item.0.name }}-{{ _fcp_r.item.1 | hash('sha256') | truncate(6, true, '') }}"
+    _fcp_res_created: "{{ _fcp_r.json.response.uuid | default('') }}"
+    _fcp_res_status: "{{ _fcp_r.status | default(0) }}"
+  loop: "{{ remnawave_host_results.results | default([]) }}"
+  loop_control:
+    loop_var: _fcp_r
+    label: "{{ _fcp_r.item.0.name | default('') }}"
+  when:
+    - fcp_managed | default(false) | bool
+    - not (_fcp_r.skipped | default(false))
 
 - name: Summarize Host creation
   debug:
