@@ -1,20 +1,20 @@
 ---
-# tasks/setup/caddy.yml - Standalone Caddy install (TLS terminator + WS proxy
-# for Remnawave node).
-#
-# Caddy listens on remnawave_caddy_listen_port (default 443), auto-issues a
-# Let's Encrypt cert via HTTP-01 (port 80 — must be free), and path-routes each
-# enabled remnawave_cdn_transports entry to its loopback Xray inbound (all other
-# paths fall through to a decoy site). The Panel-side Xray inbounds must be
-# configured to listen on those internal ports with plaintext WS —
-# coordinate panel config accordingly.
+# tasks/setup/caddy.yml - Caddy in front of a front node's loopback WebSocket
+# inbound: TLS on the external port FCP declared (remnawave_caddy_listen_port
+# when it declared none) for the origin hostname FCP served (HTTP-01 on port
+# 80, which must be free), the routes FCP declared proxied to their loopback
+# ports, everything else a decoy site.
 
-- name: Validate Caddy required variables
+- name: Set the routes and the external port FCP declared
+  set_fact:
+    caddy_routes: "{{ _fcp_bootstrap.ingress.routes | default([]) }}"
+    caddy_listen_port: "{{ _fcp_bootstrap.ingress.externalPort | default(remnawave_caddy_listen_port) | int }}"
+
+- name: Assert FCP declared at least one route
   assert:
     that:
-      - remnawave_caddy_email is defined
-      - remnawave_caddy_email | length > 0
-    fail_msg: "remnawave_caddy_email must be set when remnawave_caddy_enabled=true (used for ACME registration)"
+      - caddy_routes | length > 0
+    fail_msg: "FCP served no ingress routes for this front node"
 
 # === Install Caddy from the official apt repo ===
 - name: Install Caddy apt prerequisites
@@ -27,9 +27,6 @@
     state: present
   become: yes
 
-# Own the keyrings dir here rather than depend on setup/docker.yml having created
-# it (the deploy graph happens to run docker.yml first for Remnawave, but this
-# task must not rely on that ordering).
 - name: Ensure /etc/apt/keyrings exists
   file:
     path: /etc/apt/keyrings
@@ -37,7 +34,7 @@
     mode: '0755'
   become: yes
 
-- name: Download Caddy apt signing key
+- name: Download the Caddy apt signing key
   get_url:
     url: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
     dest: /etc/apt/keyrings/caddy-stable-archive-keyring.asc
@@ -45,7 +42,7 @@
     force: no
   become: yes
 
-- name: Add Caddy apt repository
+- name: Add the Caddy apt repository
   apt_repository:
     repo: "deb [signed-by=/etc/apt/keyrings/caddy-stable-archive-keyring.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
     filename: caddy-stable
@@ -59,12 +56,10 @@
     state: present
   become: yes
 
-# === Decoy site (served by Caddy on all non-transport paths) ===
-- name: Set up decoy/camouflage site
+- name: Set up the decoy site
   include_tasks: decoy.yml
 
-# === Render Caddyfile ===
-- name: Render Caddyfile
+- name: Render the Caddyfile
   template:
     src: remnanode-caddyfile.j2
     dest: /etc/caddy/Caddyfile
@@ -80,24 +75,18 @@
     enabled: yes
   become: yes
 
-# Run any pending notifies (Caddyfile reload) before the next task chain.
-- name: Flush handlers (apply Caddyfile changes immediately)
+- name: Flush handlers (apply the Caddyfile now)
   meta: flush_handlers
 
-# === Health check ===
 - name: Wait for Caddy to bind the listen port
   wait_for:
     host: 127.0.0.1
-    port: "{{ remnawave_caddy_listen_port }}"
+    port: "{{ caddy_listen_port }}"
     timeout: 30
     delay: 2
 
-# Verify Caddy actually OWNS the port. If the panel-side Xray inbound was
-# misconfigured to bind it, Xray (host network) grabs it first and the wait_for
-# above passes against Xray, masking the conflict. Read-only check; requires
-# `ss` (iproute2, standard on Debian/Ubuntu) — skipped gracefully if absent.
-- name: Check which process owns the Caddy listen port
-  shell: "ss -ltnHp 'sport = :{{ remnawave_caddy_listen_port }}'"
+- name: Check which process owns the listen port
+  shell: "ss -ltnHp 'sport = :{{ caddy_listen_port }}'"
   register: caddy_port_owner
   changed_when: false
   failed_when: false
@@ -108,11 +97,21 @@
     that:
       - "'caddy' in caddy_port_owner.stdout"
     fail_msg: >-
-      Port {{ remnawave_caddy_listen_port }} is not owned by Caddy
+      Port {{ caddy_listen_port }} is not owned by Caddy
       (listeners: {{ caddy_port_owner.stdout | trim | default('none') }}).
-      A panel-side Xray inbound is likely bound to this port. Reconfigure the
-      inbounds to listen on their loopback ports
-      ({{ remnawave_cdn_transports | rejectattr('enabled', 'equalto', false) | map(attribute='internal_port') | join(', ') }})
-      with plaintext WS so Caddy can own {{ remnawave_caddy_listen_port }}.
-    success_msg: "Caddy owns port {{ remnawave_caddy_listen_port }}."
+      The panel's inbound for this node must listen on its loopback port
+      ({{ caddy_routes | map(attribute='port') | join(', ') }}), which FCP's
+      profile does; look at the profile in Admin -> Servers.
   when: caddy_port_owner.stdout | default('') | length > 0
+
+# Whether the certificate is there yet is reported to FCP with the applied
+# revision; FCP checks it from outside either way.
+- name: Check for the origin certificate
+  stat:
+    path: "/var/lib/caddy/.local/share/caddy/certificates"
+  register: _caddy_certs
+  become: yes
+
+- name: Note certificate readiness
+  set_fact:
+    _caddy_cert_ready: "{{ _caddy_certs.stat.exists | default(false) }}"

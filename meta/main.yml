@@ -1,10 +1,9 @@
 galaxy_info:
   author: lunarthegrey
-  description: Deploys and CDN-fronts FreeSocks proxy nodes (Remnawave/Xray, optional Outline) and registers them with the FreeSocks Control Plane
+  description: Bootstraps a FreeSocks proxy node (Remnawave/Xray) and enrolls it with the FreeSocks Control Plane, which owns the panel and the release to members
   company: Unredacted Inc
   license: GPL-3.0-only
-  # Needs community.docker >=3.4.0 (docker_compose_v2) + modern Jinja filters,
-  # both of which require ansible-core 2.15+.
+  # community.docker >=3.4.0 (docker_compose_v2) and modern Jinja filters need ansible-core 2.15+.
   min_ansible_version: "2.15"
   platforms:
     - name: Debian
@@ -15,5 +14,4 @@ galaxy_info:
     - networking
     - security
     - vpn
-    - cloudflare
 dependencies: []

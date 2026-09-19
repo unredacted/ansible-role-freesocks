@@ -1,0 +1,164 @@
+---
+# tasks/providers/fcp/register_node.yml - the bootstrap contract v2
+# (FCP docs/servers.md "Node registration (contract v2)"):
+#
+#   PUT  {slug}/nodes/by-name/{name}   enroll (purpose, label; taken once) or
+#                                      report observations (every run)
+#   GET  the same                      the node's own view; polled until FCP
+#                                      has reconciled the panel row
+#   POST …/bootstrap                   the machine configuration and the panel's
+#                                      node secret (never logged, never cached)
+#
+# Every refusal stops the play with FCP's code. Facts published:
+#   _fcp_view          the node's view (registration, stage, origin)
+#   _fcp_bootstrap     machineRevision, node.port, ingress, origin
+#   remnawave_panel_secret_key   (no_log)
+
+- name: Set the FCP node URL
+  set_fact:
+    _fcp_node_url: "{{ fcp_api_url }}/api/v1/admin/servers/{{ fcp_remnawave_panel_slug }}/nodes/by-name/{{ node_name | urlencode }}"
+    _fcp_headers:
+      Authorization: "Bearer {{ fcp_api_token }}"
+      Content-Type: "application/json"
+      Accept: "application/json"
+  no_log: true
+
+# The body is built as ONE expression so its numbers and booleans reach FCP
+# as JSON numbers and booleans (a templated scalar would travel as a string).
+- name: Shape the enrollment body
+  set_fact:
+    _fcp_enroll_body: >-
+      {{ {
+           'roleContractVersion': fcp_role_contract_version | int,
+           'purpose': node_purpose,
+           'observed': {
+             'management': {'address': remnawave_node_address_effective, 'port': 2222},
+             'publicIps': {'v4': _public_v4} | combine({'v6': _public_v6} if (_public_v6 | length > 0) else {}),
+             'capabilities': {'caddy': node_purpose == 'front', 'ipv6': _public_v6 | length > 0},
+           },
+         } | combine({'label': node_label} if (node_label | length > 0) else {}) }}
+
+- name: Enroll the node (or report this run's observations)
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: PUT
+    headers: "{{ _fcp_headers }}"
+    body_format: json
+    body: "{{ _fcp_enroll_body }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_put
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+
+- name: Fail closed when FCP refused or could not be reached
+  fail:
+    msg: >-
+      FCP refused the enrollment of {{ node_name }}:
+      {{ (_fcp_put.json.error.code if (_fcp_put.json is defined and _fcp_put.json.error is defined) else ('HTTP ' ~ (_fcp_put.status | default('unreachable')))) }}.
+      {{ (_fcp_put.json.error.message if (_fcp_put.json is defined and _fcp_put.json.error is defined) else '') }}
+  when: _fcp_put.status | default(0) != 200
+
+# The registration reconciles from FCP's own actions: poll the node's view
+# until the panel row exists (state ready), or stop on a blocked state.
+- name: Wait for FCP to reconcile the node
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_view
+  delegate_to: localhost
+  no_log: true
+  until: >-
+    _fcp_view.status == 200 and
+    (_fcp_view.json.registration.state in ['ready', 'blocked'])
+  retries: "{{ fcp_registration_retries | int }}"
+  delay: "{{ fcp_registration_delay | int }}"
+
+- name: Fail closed on a blocked registration
+  fail:
+    msg: >-
+      FCP could not reconcile {{ node_name }} with the panel:
+      {{ _fcp_view.json.registration.code | default('unknown') }}.
+      Look at the node in Admin -> Servers.
+  when: _fcp_view.json.registration.state != 'ready'
+
+- name: Fetch the machine configuration and the node secret
+  uri:
+    url: "{{ _fcp_node_url }}/bootstrap"
+    method: POST
+    headers: "{{ _fcp_headers }}"
+    body_format: json
+    body: {}
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_boot
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+
+- name: Fail closed when the bootstrap answer is missing
+  fail:
+    msg: >-
+      FCP did not serve the machine configuration for {{ node_name }}:
+      {{ (_fcp_boot.json.error.code if (_fcp_boot.json is defined and _fcp_boot.json.error is defined) else ('HTTP ' ~ (_fcp_boot.status | default('unreachable')))) }}.
+  when: _fcp_boot.status | default(0) != 200
+
+- name: Keep the machine configuration and the secret as facts
+  set_fact:
+    _fcp_bootstrap:
+      machineRevision: "{{ _fcp_boot.json.machineRevision | int }}"
+      nodePort: "{{ _fcp_boot.json.node.port | int }}"
+      ingress: "{{ _fcp_boot.json.ingress }}"
+      origin: "{{ _fcp_boot.json.origin }}"
+    remnawave_panel_secret_key: "{{ _fcp_boot.json.secretKey }}"
+    cacheable: false
+  no_log: true
+
+- name: Assert the secret was served
+  assert:
+    that:
+      - remnawave_panel_secret_key | length > 0
+    fail_msg: "FCP answered without a node secret"
+  no_log: true
+
+- name: Wait for the origin name to resolve (front nodes)
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  # Its own register: a skipped task would otherwise overwrite _fcp_view.
+  register: _fcp_origin_view
+  delegate_to: localhost
+  no_log: true
+  until: _fcp_origin_view.status == 200 and _fcp_origin_view.json.origin.dns in ['resolves', 'none']
+  retries: "{{ fcp_registration_retries | int }}"
+  delay: "{{ fcp_registration_delay | int }}"
+  when: node_purpose == 'front'
+
+- name: Set the origin hostname a front node presents
+  set_fact:
+    origin_hostname: >-
+      {{ (_fcp_bootstrap.ingress.hostname
+          if (_fcp_bootstrap.ingress is mapping and _fcp_bootstrap.ingress.hostname is defined)
+          else node_origin_hostname) }}
+  when: node_purpose == 'front'
+
+- name: Assert a front node has an origin hostname
+  assert:
+    that:
+      - origin_hostname | trim | length > 0
+    fail_msg: >-
+      FCP served no origin hostname for this front node and node_origin_hostname
+      is empty. Choose an origin-names account in Set up this panel, or set the
+      node's hostname under its Settings in Admin -> Servers.
+  when: node_purpose == 'front'

@@ -1,0 +1,119 @@
+---
+# tests/test_wipe.yml
+#
+# Offline test of the retirement contract against tests/mock_fcp.py:
+#   (a) a node that needs an admin's decision stops the play with the machine
+#       untouched (no wiped ack, the name kept);
+#   (b) a node FCP made ready_to_wipe is acked as wiped and retired.
+# The machine steps (compose down, Caddy) are skipped: no Docker here.
+#
+# Run: ansible-playbook tests/test_wipe.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _port: 8828
+    fcp_api_url: "http://127.0.0.1:8828"
+    fcp_api_token: "fsv1_test_token_for_the_mock"
+    fcp_remnawave_panel_slug: "panel-a"
+    fcp_registration_retries: 3
+    fcp_registration_delay: 0
+    node_name: "quiet-falcon-nest"
+    _url: "http://127.0.0.1:8828/api/v1/admin/servers/panel-a/nodes/by-name/quiet-falcon-nest"
+    _hdr: { Authorization: "Bearer fsv1_test_token_for_the_mock" }
+  tasks:
+    - name: Start the mock FCP
+      command: python3 {{ playbook_dir }}/mock_fcp.py {{ _port }}
+      async: 600
+      poll: 0
+
+    - name: Wait for the mock
+      uri:
+        url: "http://127.0.0.1:{{ _port }}/__state"
+        status_code: 200
+      register: _up
+      until: _up.status == 200
+      retries: 20
+      delay: 1
+
+    - block:
+        - name: Enroll a node to retire
+          uri:
+            url: "{{ _url }}"
+            method: PUT
+            headers: "{{ _hdr }}"
+            body_format: json
+            body:
+              roleContractVersion: 2
+              purpose: direct
+              observed: { management: { address: "192.0.2.1", port: 2222 }, publicIps: { v4: "203.0.113.1" }, capabilities: { caddy: false, ipv6: false } }
+            status_code: [200]
+
+        # (a) needs an admin
+        - name: Scenario needs_admin
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: needs_admin }
+        - name: Ask for the retirement
+          uri:
+            url: "{{ _url }}"
+            method: DELETE
+            headers: "{{ _hdr }}"
+            status_code: [200]
+            return_content: yes
+          register: _r1
+        - name: Assert the play would stop for a decision
+          assert:
+            that:
+              - _r1.json.retirement.stage == 'needs_admin'
+        - name: The wipe ack is refused before ready_to_wipe
+          uri:
+            url: "{{ _url }}/wiped"
+            method: POST
+            headers: "{{ _hdr }}"
+            body_format: json
+            body: {}
+            status_code: [409]
+            return_content: yes
+          register: _early
+        - name: Assert servers.retirement_stage
+          assert:
+            that:
+              - _early.json.error.code == 'servers.retirement_stage'
+
+        # (b) ready to wipe, then acked
+        - name: Scenario ready_to_wipe
+          uri:
+            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: ready_to_wipe }
+        - name: Ask again
+          uri:
+            url: "{{ _url }}"
+            method: DELETE
+            headers: "{{ _hdr }}"
+            status_code: [200]
+            return_content: yes
+          register: _r2
+        - name: Ack the wipe
+          uri:
+            url: "{{ _url }}/wiped"
+            method: POST
+            headers: "{{ _hdr }}"
+            body_format: json
+            body: {}
+            status_code: [200]
+            return_content: yes
+          register: _wiped
+        - name: Assert retired
+          assert:
+            that:
+              - _r2.json.retirement.stage == 'ready_to_wipe'
+              - _wiped.json.stage == 'retired'
+            success_msg: "retirement: needs_admin stops, ready_to_wipe is acked as retired."
+      always:
+        - name: Stop the mock
+          shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"

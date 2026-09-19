@@ -1,0 +1,64 @@
+---
+# tasks/providers/fcp/applied.yml - report the applied machine revision, then
+# (optionally) wait for FCP to verify the machine (machine_ready). Idempotent:
+# the same revision reported again changes nothing; a revision FCP has moved
+# past is refused (servers.revision_stale) and the play stops: run it again.
+
+- name: Report the applied revision
+  uri:
+    url: "{{ _fcp_node_url }}/applied"
+    method: POST
+    headers: "{{ _fcp_headers }}"
+    body_format: json
+    body: >-
+      {{ {'appliedRevision': _fcp_bootstrap.machineRevision | int, 'nodeStarted': true}
+         | combine({'caddy': {'certificateReady': _caddy_cert_ready | default(false) | bool}}
+                   if (node_purpose == 'front') else {}) }}
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_applied
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+
+- name: Fail closed when the applied report was refused
+  fail:
+    msg: >-
+      FCP refused the applied report for {{ node_name }}:
+      {{ (_fcp_applied.json.error.code if (_fcp_applied.json is defined and _fcp_applied.json.error is defined) else ('HTTP ' ~ (_fcp_applied.status | default('unreachable')))) }}.
+  when: _fcp_applied.status | default(0) != 200
+
+- name: Persist the applied revision
+  copy:
+    content: "{{ _fcp_bootstrap.machineRevision }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.applied_revision"
+    mode: '0640'
+  become: "{{ _fcp_become | default(true) }}"  # the offline tests write into the playbook dir
+
+- name: Wait for FCP to find the machine ready
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_view
+  delegate_to: localhost
+  no_log: true
+  until: >-
+    _fcp_view.status == 200 and
+    (_fcp_view.json.stage not in ['registered', 'bootstrap_available', 'machine_applied']
+     or _fcp_view.json.registration.state == 'blocked')
+  retries: "{{ fcp_registration_retries | int }}"
+  delay: "{{ fcp_registration_delay | int }}"
+  when: fcp_wait_machine_ready | bool
+
+- name: Note what FCP found
+  debug:
+    msg: >-
+      {{ node_name }}: stage {{ _fcp_view.json.stage }},
+      registration {{ _fcp_view.json.registration.state }}
+      {{ ('(' ~ _fcp_view.json.registration.code ~ ')') if _fcp_view.json.registration.code else '' }}.
+  when: fcp_wait_machine_ready | bool

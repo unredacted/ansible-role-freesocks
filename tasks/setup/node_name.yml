@@ -1,0 +1,25 @@
+---
+# tasks/setup/node_name.yml - three dictionary words, once per machine.
+#
+# `wamerican` gives /usr/share/dict/words; the words are lowercased, letters
+# only, 4 to 7 characters, joined with hyphens. The name is persisted by
+# main.yml after enrollment so every later run uses the same one.
+
+- name: Install the word list
+  apt:
+    name: wamerican
+    state: present
+  become: yes
+
+- name: Pick the words
+  shell: |
+    set -o pipefail
+    grep -E '^[a-z]{4,7}$' /usr/share/dict/words | shuf -n {{ node_name_word_count | int }} | paste -sd '-'
+  args:
+    executable: /bin/bash
+  register: _node_words
+  changed_when: false
+
+- name: Set the node name
+  set_fact:
+    node_name: "{{ _node_words.stdout | trim }}"

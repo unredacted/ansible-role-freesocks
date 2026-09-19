@@ -11,7 +11,7 @@
 #
 # Sections:
 #   (a1) interface unset  -> remnawave_node_address wins
-#   (a2) interface unset + blank address -> dns_hostname fallback
+#   (a2) interface unset + blank address -> the public-address fallback
 #   (b1) interface set    -> its IPv4 beats remnawave_node_address
 #   (b2) family=ipv6      -> the GLOBAL-scope address, not link-local
 #   (b3) dashed/dotted device name -> resolves via the sanitized fact key
@@ -21,10 +21,9 @@
 #   (c2) interface without an IPv4 -> fail
 #   (c3) family=ipv6 but only link-local -> fail
 #   (c4) invalid family -> fail
-#   (d1) STRUCTURAL: register_node/update_node send the RESOLVED fact, their
-#        nested includes use role-tasks-relative paths (a bare sibling filename
-#        does NOT resolve inside tasks/providers/<x>/), and update mode keeps its
-#        opt-in, wipe-safe address re-sync gated on credentials + .node_uuid
+#   (d1) STRUCTURAL: the enrollment sends the RESOLVED fact and main.yml
+#        resolves it (role-tasks-relative include, which is the only form that
+#        resolves from inside tasks/) before the enrollment
 #   (d2) STRUCTURAL: the network-fact refresh is gated ONLY on the interface
 #        selector — never on the device already being in the fact set, which
 #        would skip the refresh for a device that is present but unaddressed
@@ -36,7 +35,7 @@
   vars:
     _resolve: "{{ playbook_dir | dirname }}/tasks/providers/remnawave/resolve_node_address.yml"
     remnawave_node_port: 2222
-    dns_hostname: "quiet-falcon.freesocks.example"
+    remnawave_node_address_fallback: "203.0.113.10"
     remnawave_node_address: "quiet-falcon-a1b2c3d4.freesocks.example"
     remnawave_node_address_interface: ""
     remnawave_node_address_family: "ipv4"
@@ -85,11 +84,11 @@
         ansible_facts: *fake_facts
         remnawave_node_address: ""
 
-    - name: (a2) Assert the dns_hostname fallback survives
+    - name: (a2) Assert the public-address fallback is used
       assert:
         that:
-          - remnawave_node_address_effective == 'quiet-falcon.freesocks.example'
-        success_msg: "Blank remnawave_node_address → dns_hostname (pre-existing behaviour kept)."
+          - remnawave_node_address_effective == '203.0.113.10'
+        success_msg: "Blank remnawave_node_address → the fallback (the machine's public address)."
 
     # ----------------------------------------------------------- (b) interface
     - name: (b1) Resolve from the tailscale0 interface
@@ -243,81 +242,37 @@
             success_msg: "Only ipv4/ipv6 are accepted."
 
     # ---------------------------------------------------------- (d) structural
-    - name: (d1) Read the panel node-API task files
+    - name: (d1) Read the enrollment and the role entry point
       set_fact:
-        _reg_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/providers/remnawave/register_node.yml') }}"
-        _upd_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/providers/remnawave/update_node.yml') }}"
-        _updmode_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/update/remnawave_update.yml') }}"
+        _reg_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/providers/fcp/register_node.yml') }}"
+        _main_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/main.yml') }}"
 
-    # assert.that items ARE expressions, and an expression cannot contain
-    # template delimiters — so the needles are concatenated from single braces.
-    - name: (d1) Compose the wire-body needles
-      set_fact:
-        _ob: "{{ '{' ~ '{' }}"
-        _cb: "{{ '}' ~ '}' }}"
-
-    - name: (d1) Compose the resolved / raw address needles
-      set_fact:
-        _needle_resolved: "{{ 'address: \"' ~ _ob ~ ' remnawave_node_address_effective ' ~ _cb ~ '\"' }}"
-        # Prefix only: catches both the bare var and any filter chain after it.
-        _needle_raw: "{{ 'address: \"' ~ _ob ~ ' remnawave_node_address ' }}"
-
-    - name: (d1) Assert both API bodies send the RESOLVED address
+    - name: (d1) Assert the enrollment body carries the RESOLVED address
       assert:
         that:
-          # The wire body, not a comment: the key with the fact as its value.
-          - _needle_resolved in _reg_src
-          - _needle_resolved in _upd_src
-          # ...and neither still sends the raw var (bare or filtered).
-          - _needle_raw not in _reg_src
-          - _needle_raw not in _upd_src
-          # Both must resolve the address before shaping a request body.
-          - _reg_src.find('resolve_node_address') < _reg_src.find(_needle_resolved)
-          - _upd_src.find('resolve_node_address') < _upd_src.find(_needle_resolved)
-        success_msg: "POST /api/nodes and PATCH /api/nodes both carry the resolved address."
+          # The wire body, not a comment: the management address IS the fact.
+          - "\"'address': remnawave_node_address_effective\" in _reg_src"
+          # ...and never the raw var or the interface selector.
+          - "'remnawave_node_address_interface' not in _reg_src"
+          - "\"'address': remnawave_node_address,\" not in _reg_src"
+        success_msg: "PUT …/nodes/by-name/{name} carries the resolved management address."
 
-    - name: (d1) Assert nested includes use role-tasks-relative paths
+    - name: (d1) Assert main.yml resolves the address before enrolling
       assert:
         that:
           # A bare sibling filename does NOT resolve from tasks/providers/<x>/ —
           # ansible searches the role's tasks/ dir, not the including file's dir.
-          - "'include_tasks: providers/remnawave/resolve_node_address.yml' in _reg_src"
-          - "'include_tasks: providers/remnawave/resolve_node_address.yml' in _upd_src"
-          - "'include_tasks: resolve_node_address.yml' not in _reg_src"
-          - "'include_tasks: resolve_node_address.yml' not in _upd_src"
-          - "'include_tasks: update_node.yml' not in _reg_src"
-        success_msg: "Nested includes are role-tasks-relative, so they resolve in every flow."
-
-    # update mode is the only lifecycle mode that runs against a deployed node
-    # without rotating it, so it is where an existing fleet is moved onto
-    # interface addresses. Wiring that goes missing would be silent.
-    # Slice from the task name so the explanatory comment above it (which names
-    # the flag it deliberately does NOT gate on) cannot satisfy these.
-    - name: (d1) Materialize the update-mode re-sync task
-      set_fact:
-        _updmode_resync: "{{ _updmode_src[_updmode_src.find('- name: Re-sync the panel-side node address'):] }}"
-
-    - name: (d1) Assert the re-sync gate keys on credentials + persisted state
-      assert:
-        that:
-          # An update run carries the panel token and reads .node_uuid off disk;
-          # it does NOT re-pass deploy-time flags, so gating on
-          # remnawave_panel_register_node makes the documented one-liner a no-op.
-          - "'remnawave_panel_api_token' in _updmode_resync"
-          - "'remnawave_node_uuid' in _updmode_resync"
-          - "'remnawave_panel_register_node' not in _updmode_resync"
-        success_msg: "update mode's re-sync gates on the token + persisted uuid, not a deploy flag."
-
-    - name: (d1) Assert update mode can re-sync the address, opt-in and wipe-safe
-      assert:
-        that:
-          - "'include_tasks: ../providers/remnawave/update_node.yml' in _updmode_src"
-          - "'remnawave_node_reconcile_address' in _updmode_src"
+          - "'include_tasks: providers/remnawave/resolve_node_address.yml' in _main_src"
+          - "'include_tasks: resolve_node_address.yml' not in _main_src"
+          - "'include_tasks: providers/fcp/register_node.yml' in _main_src"
           - >-
-            _updmode_src.find('Re-sync the panel-side node address')
-            < _updmode_src.find('remnawave_node_reconcile_address')
-          - "'not (force_wipe_remnawave | default(false) | bool)' in _updmode_src"
-        success_msg: "update mode PATCHes the address only under the opt-in flag, never after a wipe."
+            _main_src.find('providers/remnawave/resolve_node_address.yml')
+            < _main_src.find('providers/fcp/register_node.yml')
+          # The public address is detected first: it is the resolver's fallback.
+          - >-
+            _main_src.find('setup/public_addresses.yml')
+            < _main_src.find('providers/remnawave/resolve_node_address.yml')
+        success_msg: "main.yml detects the public address, resolves the management address, then enrolls."
 
     # ------------------------------------------------------ (d2) STRUCTURAL
     # A device can be in the fact set and still have no usable address — e.g.
