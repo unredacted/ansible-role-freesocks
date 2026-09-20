@@ -64,9 +64,11 @@ ansible-playbook playbook.yml -e target=node3 -e operation_mode=deploy -e node_m
   -e node_address_interface=tailscale0 -e node_public_address=203.0.113.7
 ```
 
-The run persists the node's name and mode on the machine first, enrolls the node, fetches its machine configuration and secret, starts the container (and Caddy when FCP declared an ingress), reports the applied revision, and waits for FCP to find the machine ready. Then, in FCP: **Edges -> Protect a node** for an edge-fronted mode, and **Servers -> the node -> Approve and activate**.
+The run persists the node's name on the machine first, enrolls the node, fetches its machine configuration and secret, starts the container (and Caddy when FCP declared an ingress, or takes an earlier run's Caddy out of the way when it declared none), reports the applied revision, and waits for FCP to find the machine ready. Then, in FCP: **Edges -> Protect a node** for an edge-fronted mode, and **Servers -> the node -> Approve and activate**.
 
-Running `deploy` again is how a machine change FCP made (a route, a port) is applied: the role reports only what it observes; FCP owns the settings. A run that stopped halfway resumes against the same node: the name and mode are read back from the machine, so later runs need neither.
+Running `deploy` again is how a machine change FCP made (a route, a port) is applied: the role reports only what it observes; FCP owns the settings. A run that stopped halfway resumes against the same node: the name and mode are read back from the machine, so later runs need neither. The mode is written only once FCP has accepted it, so a mode the backend is not set up for is corrected by running again with the right one.
+
+A machine deployed before modes existed carries a purpose instead (`direct`, `front`, `relay`). Its mode is derived from `fcp_legacy_purpose_modes` (`privacy-reality`, `freedom-ws`, `freedom-reality`) and written on the first v2 run, so such a node stays deployable; pass `-e node_mode=...` when the backend names those modes otherwise.
 
 ### 3. Update, wipe
 
@@ -83,6 +85,7 @@ ansible-playbook playbook.yml -e target=node1 -e operation_mode=wipe     # retir
 | ------------------------------------- | ---------------------- | ------------------------------------------------------------------------- |
 | `operation_mode`                      |                        | `deploy`, `update` or `wipe`                                              |
 | `node_mode`                           | persisted              | The connection mode it serves (set up in FCP); taken at the first deploy   |
+| `fcp_legacy_purpose_modes`            | the built-in modes     | The mode a machine's `direct`/`front`/`relay` purpose becomes              |
 | `node_name`                           | generated              | The panel node name (3 to 30 plain characters); persisted in `.node_name` |
 | `node_label`                          | from the name          | The DNS label of a managed origin name (WebSocket)                        |
 | `node_address_interface`              |                        | The interface whose address the panel dials (e.g. `tailscale0`)           |
@@ -101,7 +104,7 @@ ansible-playbook playbook.yml -e target=node1 -e operation_mode=wipe     # retir
 
 ## What the role writes on the machine
 
-`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` and `.node_mode` (written before the first FCP call), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`. The node's country lives in FCP (the node's Settings), not here.
+`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`. The node's country lives in FCP (the node's Settings), not here.
 
 ## Testing
 
@@ -109,7 +112,7 @@ ansible-playbook playbook.yml -e target=node1 -e operation_mode=wipe     # retir
 tests/run.sh
 ```
 
-Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`), the retirement contract (`test_wipe.yml`), the Caddyfile and compose renders, the management address resolution. CI runs the same.
+Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`), the retirement contract (`test_wipe.yml`), the name and mode resolution including a machine that carries a legacy purpose (`test_identity.yml`), the Caddyfile and compose renders, the management address resolution. CI runs the same.
 
 ## License
 

@@ -1,0 +1,149 @@
+---
+# tasks/setup/identity.yml - the node's name and its connection MODE.
+#
+# Both are taken once and belong to the machine afterwards.
+#
+# The NAME is persisted here, before the first FCP call, so a run that stops
+# halfway (a lost bootstrap answer, an origin name that never resolves) resumes
+# against the same node instead of enrolling a second one.
+#
+# The MODE is persisted only once FCP has accepted it
+# (providers/fcp/register_node.yml): a mode this role cannot check, such as a
+# typo or a mode the backend is not set up for, is then corrected by running
+# again rather than by deleting a file on the machine. A mode FCP has accepted
+# is immutable: a different one passed later is refused here rather than sent.
+#
+# A machine deployed before modes existed carries .node_purpose instead
+# (direct | front | relay). Its mode is derived from fcp_legacy_purpose_modes so
+# the node stays deployable; pass -e node_mode=... when the backend's modes are
+# named otherwise.
+
+- name: Read the persisted identity
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/{{ item }}"
+  loop: [".node_name", ".node_mode", ".node_purpose"]
+  register: _identity_files
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+# Each of the three is defined either way, empty where the machine carries
+# nothing: a run against several machines then never reads the one before.
+- name: Take what the machine carries
+  set_fact:
+    _persisted_name: "{{ _identity_files.results[0].content | default('') | b64decode | trim }}"
+    _persisted_mode: "{{ _identity_files.results[1].content | default('') | b64decode | trim }}"
+    _legacy_purpose: "{{ _identity_files.results[2].content | default('') | b64decode | trim }}"
+
+- name: Use the persisted node name
+  set_fact:
+    node_name: "{{ _persisted_name }}"
+  when:
+    - node_name | trim | length == 0
+    - _persisted_name | length > 0
+
+- name: Refuse a mode that differs from the persisted one
+  assert:
+    that:
+      - node_mode | trim | length == 0 or node_mode | trim == _persisted_mode
+    fail_msg: >-
+      This machine was enrolled for the {{ _persisted_mode }} mode; a node keeps its
+      mode (got '{{ node_mode }}'). An admin changes it from Servers.
+  when: _persisted_mode | length > 0
+
+- name: Take the persisted mode
+  set_fact:
+    node_mode: "{{ _persisted_mode }}"
+  when:
+    - node_mode | trim | length == 0
+    - _persisted_mode | length > 0
+
+# --- a machine deployed before modes existed ---------------------------------
+
+- name: Derive the mode from the purpose the machine carries
+  set_fact:
+    node_mode: "{{ fcp_legacy_purpose_modes[_legacy_purpose] }}"
+  when:
+    - node_mode | trim | length == 0
+    - _persisted_mode | length == 0
+    - _legacy_purpose | length > 0
+    - _legacy_purpose in fcp_legacy_purpose_modes
+
+- name: Note the mode the purpose maps to
+  debug:
+    msg: >-
+      {{ node_name }} was deployed as a {{ _legacy_purpose }} node: taking it for
+      the {{ node_mode }} mode. Pass -e node_mode=... if the backend names that
+      mode otherwise; FCP refuses a mode it is not set up for.
+  when:
+    - _legacy_purpose | length > 0
+    - _persisted_mode | length == 0
+    - node_mode | trim | length > 0
+
+- name: Refuse a purpose no mode is mapped to
+  assert:
+    that:
+      - node_mode | trim | length > 0
+    fail_msg: >-
+      This machine was deployed as a '{{ _legacy_purpose }}' node and
+      fcp_legacy_purpose_modes maps no mode to it: pass
+      -e node_mode=<a mode the backend is set up for in FCP>.
+  when:
+    - _legacy_purpose | length > 0
+    - _persisted_mode | length == 0
+    - node_mode | trim | length == 0
+
+# --- validate ----------------------------------------------------------------
+
+- name: Validate node_mode
+  assert:
+    that:
+      - node_mode | trim is match('^[a-z0-9][a-z0-9-]{0,39}$')
+    fail_msg: >-
+      node_mode must name a connection mode the backend is set up for in FCP
+      (got '{{ node_mode }}'). A machine that was deployed before carries it in
+      {{ remnawave_node_install_dir }}/.node_mode.
+  when: operation_mode != 'wipe'
+
+- name: Normalize the given node name
+  set_fact:
+    node_name: "{{ node_name | trim }}"
+    node_mode: "{{ node_mode | trim }}"
+
+- name: Refuse to invent a name for a machine that was never deployed
+  assert:
+    that:
+      - node_name | length > 0
+    fail_msg: >-
+      No node name was given and none is persisted on this machine
+      ({{ remnawave_node_install_dir }}/.node_name): nothing to {{ operation_mode }}.
+  when: operation_mode != 'deploy'
+
+- name: Generate a node name
+  # Role-relative: a bare sibling filename does not resolve from tasks/setup/.
+  include_tasks: setup/node_name.yml
+  when: node_name | length == 0
+
+- name: Validate the node name
+  assert:
+    that:
+      - node_name is match('^[A-Za-z0-9 ._-]{3,30}$')
+      - node_name == node_name | trim
+    fail_msg: "node_name must be 3 to 30 plain characters (got '{{ node_name }}')"
+
+# --- persist the name (the mode follows FCP's acceptance) --------------------
+
+- name: Persist the node's name before the first FCP call
+  when: operation_mode != 'wipe'
+  become: "{{ _fcp_become | default(true) }}"
+  block:
+    - name: Create the install directory
+      file:
+        path: "{{ remnawave_node_install_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Persist the node name
+      copy:
+        content: "{{ node_name }}\n"
+        dest: "{{ remnawave_node_install_dir }}/.node_name"
+        mode: '0640'

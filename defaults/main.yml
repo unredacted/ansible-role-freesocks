@@ -43,9 +43,18 @@ fcp_status_gate_delay: 20
 # (XHTTP under REALITY behind an L4 edge), freedom-ws (WebSocket behind Caddy,
 # fronted by an L7 edge). What the machine runs follows from the mode: FCP's
 # bootstrap answer says whether Caddy and which routes are wanted.
-# Taken at the first deploy and persisted on the machine (.node_mode); a later
-# run may omit it. A node keeps its mode (FCP refuses a change).
+# Taken at the first deploy and persisted on the machine (.node_mode) once FCP
+# has accepted it; a later run may omit it. A node keeps its mode (FCP refuses
+# a change).
 node_mode: ""
+# A machine deployed before modes existed carries a purpose (.node_purpose)
+# instead. This is the mode each of those purposes becomes, so such a node stays
+# deployable; the defaults are the modes a backend is set up for out of the box.
+# Pass -e node_mode=... when the backend names its modes otherwise.
+fcp_legacy_purpose_modes:
+  direct: privacy-reality
+  relay: freedom-reality
+  front: freedom-ws
 # The node's name on the panel and in FCP. Empty = three dictionary words are
 # generated at the first deploy. Persisted on the machine (.node_name) BEFORE
 # the first FCP call, so a run that stops halfway resumes against the same node.

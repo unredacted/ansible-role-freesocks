@@ -272,13 +272,40 @@
           - >-
             _main_src.find('setup/public_addresses.yml')
             < _main_src.find('providers/remnawave/resolve_node_address.yml')
-          # The node's identity is on the machine BEFORE the first FCP call, so a
+          # The node's NAME is on the machine BEFORE the first FCP call, so a
           # run that stops halfway resumes against the same node.
-          - "'.node_mode' in _main_src"
+          - "'include_tasks: setup/identity.yml' in _main_src"
           - >-
-            _main_src.find('Persist the node name and mode')
+            _main_src.find('setup/identity.yml')
             < _main_src.find('providers/fcp/register_node.yml')
-        success_msg: "main.yml persists the identity, detects the public address, resolves the management address, then enrolls."
+        success_msg: "main.yml resolves the identity, detects the public address, resolves the management address, then enrolls."
+
+    - name: (d1) Read the identity resolution
+      set_fact:
+        _identity_src: "{{ lookup('file', playbook_dir | dirname ~ '/tasks/setup/identity.yml') }}"
+
+    # The NAME is persisted before FCP is called; the MODE only once FCP has
+    # accepted it, so a mode this role cannot check (a typo, a mode the backend
+    # is not set up for) is corrected by running again rather than by deleting a
+    # file on the machine.
+    - name: (d1) Assert the name is persisted before enrolling and the mode after
+      assert:
+        that:
+          - "'.node_name' in _identity_src"
+          - "'/.node_mode\"' not in _identity_src"
+          - "'/.node_mode\"' in _reg_src"
+          - >-
+            _reg_src.find('Fail closed when FCP refused')
+            < _reg_src.find('Persist the mode FCP accepted')
+          - >-
+            _reg_src.find('Persist the mode FCP accepted')
+            < _reg_src.find('Fetch the machine configuration')
+          # A purpose left by an earlier release is translated, not ignored.
+          - "'fcp_legacy_purpose_modes' in _identity_src"
+          - "'.node_purpose' in _identity_src"
+          # Same include gotcha as above, from tasks/setup/ this time.
+          - "'include_tasks: setup/node_name.yml' in _identity_src"
+        success_msg: "the name is persisted before enrolling, the mode after FCP accepted it."
 
     # ------------------------------------------------------ (d2) STRUCTURAL
     # A device can be in the fact set and still have no usable address — e.g.

@@ -3,7 +3,7 @@
 #
 # `wamerican` gives /usr/share/dict/words; the words are lowercased, letters
 # only, 4 to 7 characters, joined with hyphens. The name is persisted by
-# main.yml after enrollment so every later run uses the same one.
+# setup/identity.yml before the first FCP call, so every later run uses it.
 
 - name: Install the word list
   apt:

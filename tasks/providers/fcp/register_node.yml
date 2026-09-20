@@ -88,6 +88,23 @@
       Look at the node in Admin -> Servers.
   when: _fcp_view.json.registration.state != 'ready'
 
+# FCP has taken the mode (it refuses one it is not set up for, and refuses a
+# change), so the machine can carry it from here: a later run may omit it. Until
+# this point nothing was written, which is what lets a refused mode be corrected
+# by running again. FCP's own answer is persisted, not what was passed.
+- name: Persist the mode FCP accepted
+  copy:
+    content: "{{ _fcp_view.json.mode.slug | default(node_mode) }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.node_mode"
+    mode: '0640'
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Remove the purpose an earlier release left
+  file:
+    path: "{{ remnawave_node_install_dir }}/.node_purpose"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+
 - name: Fetch the machine configuration and the node secret
   uri:
     url: "{{ _fcp_node_url }}/bootstrap"

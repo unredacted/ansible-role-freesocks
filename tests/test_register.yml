@@ -83,14 +83,15 @@
             return_content: yes
           register: _state
 
-        - name: Assert the stage and that the secret travelled once
+        - name: Assert the stage, the persisted mode and that the secret travelled once
           assert:
             that:
               - _fcp_view.json.stage == 'machine_ready'
               - _state.json.secrets_served == 1
               - "(_state.json.requests | selectattr('method', 'equalto', 'PUT') | list | length) == 1"
               - lookup('file', remnawave_node_install_dir ~ '/.applied_revision') | trim == '1'
-            success_msg: "machine_ready; one PUT, one secret."
+              - lookup('file', remnawave_node_install_dir ~ '/.node_mode') | trim == 'privacy-reality'
+            success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine."
 
         # (b) observations only on a rerun
         - name: Enroll again (observations)
@@ -107,6 +108,28 @@
               - _fcp_view.json.mode.slug == 'privacy-reality'
               - _state.json.secrets_served == 2
             success_msg: "rerun is observations only."
+
+        # (b2) a mode the backend is not set up for is refused, and nothing of
+        # it stays on the machine: the next run passes a corrected mode.
+        - name: Enroll with a mode FCP does not know
+          block:
+            - name: Enroll a node for an unknown mode
+              include_tasks: "{{ _tasks }}/register_node.yml"
+              vars:
+                node_mode: privacy-realit
+                node_name: "typo-node-one"
+                remnawave_node_install_dir: "{{ playbook_dir }}/.reg-typo"
+            - name: (b2) Unreached
+              assert:
+                that: [false]
+                fail_msg: "An unknown mode was enrolled."
+          rescue:
+            - name: Assert the refusal and that no mode was persisted
+              assert:
+                that:
+                  - "'servers.mode_unknown' in (ansible_failed_result.msg | default(''))"
+                  - not (lookup('file', playbook_dir ~ '/.reg-typo/.node_mode', errors='ignore') | default('', true) | trim | length > 0)
+                success_msg: "a refused mode leaves nothing behind."
 
         # (c) blocked
         - name: Scenario blocked
@@ -245,7 +268,10 @@
       always:
         - name: Stop the mock
           shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"
-        - name: Remove the test dir
+        - name: Remove the test dirs
           file:
-            path: "{{ remnawave_node_install_dir }}"
+            path: "{{ item }}"
             state: absent
+          loop:
+            - "{{ remnawave_node_install_dir }}"
+            - "{{ playbook_dir }}/.reg-typo"

@@ -1,0 +1,50 @@
+---
+# tasks/setup/caddy_absent.yml - this node's mode wants no ingress.
+#
+# FCP declared no ingress, so nothing belongs in front of the node: its own
+# transport (REALITY, XHTTP under REALITY) binds the public TLS port itself.
+# A machine that ran a mode with an ingress before still has Caddy installed,
+# enabled and holding that port, and the node would fail to bind it while the
+# role still reported the revision as applied. Stop it, disable it and remove
+# its configuration; the package is left installed.
+
+- name: Look for an installed Caddy
+  stat:
+    path: "{{ item }}"
+  loop:
+    - /etc/caddy/Caddyfile
+    - /usr/bin/caddy
+  register: _caddy_present
+  become: yes
+
+- name: Take Caddy out of the way
+  when: _caddy_present.results | selectattr('stat.exists') | list | length > 0
+  become: yes
+  block:
+    - name: Stop and disable the Caddy service
+      systemd:
+        name: caddy
+        state: stopped
+        enabled: no
+      failed_when: false
+
+    - name: Remove the Caddy configuration of an earlier mode
+      file:
+        path: /etc/caddy/Caddyfile
+        state: absent
+
+    - name: Look for a listener Caddy still holds
+      shell: "ss -ltnHp | grep caddy || true"
+      register: _caddy_listeners
+      changed_when: false
+      failed_when: false
+
+    - name: Assert Caddy holds no listener any more
+      assert:
+        that:
+          - _caddy_listeners.stdout | trim | length == 0
+        fail_msg: >-
+          Caddy still holds a listener after being stopped
+          ({{ _caddy_listeners.stdout | trim }}). This node's mode has no ingress:
+          its own transport needs the public TLS port.
+        success_msg: "no Caddy in front of this node."
