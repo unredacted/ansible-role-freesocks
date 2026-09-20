@@ -59,10 +59,24 @@ def _key(slug, name):
     return f"{slug}/{name}"
 
 
+# The modes a backend is set up for, as FCP would answer them (shape decides the machine).
+MODES = {
+    "privacy-reality": {"slug": "privacy-reality", "name": "Privacy-Reality", "shape": {"transport": "reality", "fronting": "direct"}},
+    "freedom-reality": {"slug": "freedom-reality", "name": "Freedom-Reality", "shape": {"transport": "reality", "fronting": "edge-l4"}},
+    "freedom-xhttp": {"slug": "freedom-xhttp", "name": "Freedom-XHTTP", "shape": {"transport": "xhttp-reality", "fronting": "edge-l4"}},
+    "freedom-ws": {"slug": "freedom-ws", "name": "Freedom-WebSocket", "shape": {"transport": "ws", "fronting": "edge-l7"}},
+}
+
+
+def _is_ws(mode):
+    return MODES[mode]["shape"]["transport"] == "ws"
+
+
 def _intent(slug, name, body):
+    mode = body.get("mode")
     return {
         "name": name,
-        "purpose": body.get("purpose"),
+        "mode": MODES[mode],
         "registration": {"state": "ready", "code": None, "generation": 1},
         "stage": "registered",
         "delivery": "staged",
@@ -70,8 +84,8 @@ def _intent(slug, name, body):
         "appliedRevision": None,
         "node": {"uuid": "00000001-0000-4000-8000-000000000000", "port": 2222},
         "origin": {
-            "hostname": (f"{name}.origin.example" if body.get("purpose") == "front" else None),
-            "dns": ("resolves" if body.get("purpose") == "front" else "none"),
+            "hostname": (f"{name}.origin.example" if _is_ws(mode) else None),
+            "dns": ("resolves" if _is_ws(mode) else "none"),
         },
         "retirement": None,
         "updatedAt": "2026-09-19T00:00:00.000Z",
@@ -164,8 +178,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(409, "servers.panel_not_set_up", "Set up this panel in Servers first")
         if int(body.get("roleContractVersion") or 0) < 2:
             return self._error(409, "servers.contract_version", "This panel expects role contract v2")
-        if body.get("purpose") not in ("direct", "front", "relay"):
-            return self._error(400, "validation", "purpose")
+        if body.get("mode") not in MODES:
+            return self._error(409, "servers.mode_unknown", "This backend is not set up for that mode")
         if not NODE_NAME.match(name):
             return self._error(400, "validation", "name")
         obs = body.get("observed") or {}
@@ -174,8 +188,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "validation", "observed.management")
         i = STATE["nodes"].get(_key(slug, name))
         if i:
-            if i["purpose"] != body.get("purpose"):
-                return self._error(409, "servers.purpose_change_needs_admin", "A node keeps its purpose")
+            if i["mode"]["slug"] != body.get("mode"):
+                return self._error(409, "servers.mode_change_needs_admin", "A node keeps its mode")
             if i["retirement"]:
                 return self._error(409, "servers.node_retiring", "This node is being retired")
             i["_observed"] = obs
@@ -236,13 +250,13 @@ class Handler(BaseHTTPRequestHandler):
                     "externalPort": 443,
                     "routes": [{"path": "/ws", "port": 8443}],
                 }
-                if i["purpose"] == "front"
+                if _is_ws(i["mode"]["slug"])
                 else None
             )
             return self._send(200, {
                 "machineRevision": i["machineRevision"],
                 "secretKey": SECRET,
-                "node": {"port": 2222, "name": name, "purpose": i["purpose"]},
+                "node": {"port": 2222, "name": name, "mode": i["mode"]},
                 "ingress": ingress,
                 "origin": i["origin"],
             })

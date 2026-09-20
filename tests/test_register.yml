@@ -6,7 +6,7 @@
 #       applied and reaches machine_ready; the secret is in no fact FCP could
 #       read back and only the bootstrap answer carried it;
 #   (b) a second run is observations only (the mock's generation moves, the
-#       purpose stays);
+#       mode stays);
 #   (c) a blocked registration fails the play closed;
 #   (d) an FCP that is not set up fails the play closed;
 #   (e) a stale revision fails the play closed;
@@ -28,7 +28,7 @@
     fcp_registration_retries: 3
     fcp_registration_delay: 0
     fcp_wait_machine_ready: true
-    node_purpose: direct
+    node_mode: privacy-reality
     node_name: "quiet-falcon-nest"
     node_label: ""
     node_origin_hostname: ""
@@ -83,14 +83,15 @@
             return_content: yes
           register: _state
 
-        - name: Assert the stage and that the secret travelled once
+        - name: Assert the stage, the persisted mode and that the secret travelled once
           assert:
             that:
               - _fcp_view.json.stage == 'machine_ready'
               - _state.json.secrets_served == 1
               - "(_state.json.requests | selectattr('method', 'equalto', 'PUT') | list | length) == 1"
               - lookup('file', remnawave_node_install_dir ~ '/.applied_revision') | trim == '1'
-            success_msg: "machine_ready; one PUT, one secret."
+              - lookup('file', remnawave_node_install_dir ~ '/.node_mode') | trim == 'privacy-reality'
+            success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine."
 
         # (b) observations only on a rerun
         - name: Enroll again (observations)
@@ -104,9 +105,31 @@
           assert:
             that:
               - _fcp_view.json.registration.generation == 2
-              - _fcp_view.json.purpose == 'direct'
+              - _fcp_view.json.mode.slug == 'privacy-reality'
               - _state.json.secrets_served == 2
             success_msg: "rerun is observations only."
+
+        # (b2) a mode the backend is not set up for is refused, and nothing of
+        # it stays on the machine: the next run passes a corrected mode.
+        - name: Enroll with a mode FCP does not know
+          block:
+            - name: Enroll a node for an unknown mode
+              include_tasks: "{{ _tasks }}/register_node.yml"
+              vars:
+                node_mode: privacy-realit
+                node_name: "typo-node-one"
+                remnawave_node_install_dir: "{{ playbook_dir }}/.reg-typo"
+            - name: (b2) Unreached
+              assert:
+                that: [false]
+                fail_msg: "An unknown mode was enrolled."
+          rescue:
+            - name: Assert the refusal and that no mode was persisted
+              assert:
+                that:
+                  - "'servers.mode_unknown' in (ansible_failed_result.msg | default(''))"
+                  - not (lookup('file', playbook_dir ~ '/.reg-typo/.node_mode', errors='ignore') | default('', true) | trim | length > 0)
+                success_msg: "a refused mode leaves nothing behind."
 
         # (c) blocked
         - name: Scenario blocked
@@ -149,8 +172,8 @@
             body_format: json
             body:
               roleContractVersion: 2
-              purpose: direct
-              observed: { management: { address: "192.0.2.1", port: 2222 }, publicIps: {}, capabilities: { caddy: false, ipv6: false } }
+              mode: privacy-reality
+              observed: { management: { address: "192.0.2.1", port: 2222 }, publicIps: {}, capabilities: { caddy: true, ipv6: false } }
             status_code: [409]
             return_content: yes
           register: _nsu
@@ -204,12 +227,12 @@
               - _bound.json.error.code == 'servers.registration_boundary'
 
         # (g) a front node
-        - name: Enroll a front node
+        - name: Enroll a WebSocket node (FCP answers an ingress)
           include_tasks: "{{ _tasks }}/register_node.yml"
           vars:
-            node_purpose: front
+            node_mode: freedom-ws
             node_name: "bright-harbor-lane"
-        - name: Assert the front node's ingress
+        - name: Assert the node's ingress
           assert:
             that:
               - origin_hostname == 'bright-harbor-lane.origin.example'
@@ -227,10 +250,10 @@
             body: { name: blocked_later }
         - name: A node blocked after the applied report must stop the play
           block:
-            - name: Report applied for the front node
+            - name: Report applied for the WebSocket node
               include_tasks: "{{ _tasks }}/applied.yml"
               vars:
-                node_purpose: front
+                node_mode: freedom-ws
                 node_name: "bright-harbor-lane"
             - name: (h) Unreached
               assert:
@@ -245,7 +268,10 @@
       always:
         - name: Stop the mock
           shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"
-        - name: Remove the test dir
+        - name: Remove the test dirs
           file:
-            path: "{{ remnawave_node_install_dir }}"
+            path: "{{ item }}"
             state: absent
+          loop:
+            - "{{ remnawave_node_install_dir }}"
+            - "{{ playbook_dir }}/.reg-typo"

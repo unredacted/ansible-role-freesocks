@@ -1,0 +1,259 @@
+---
+# tests/test_identity.yml
+#
+# Offline test of tasks/setup/identity.yml, the node's name and mode:
+#   (a) a machine deployed before modes existed (.node_purpose) is taken for the
+#       mode that purpose maps to, and its name is read back;
+#   (b) an explicit node_mode overrides that mapping (a backend whose modes are
+#       named otherwise);
+#   (c) a mode that differs from the persisted one is refused;
+#   (d) a fresh machine persists its NAME only: the mode is persisted once FCP
+#       has accepted it, so a refused mode is corrected by running again;
+#   (e) a purpose no mode is mapped to stops the play with what to pass.
+#
+# Each case is its own play so the facts of the previous one are cleared.
+#
+# Run: ansible-playbook tests/test_identity.yml
+
+- name: (a) a purpose left by an earlier release becomes a mode
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-a"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: ""
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        node_name: ""
+        node_mode: ""
+
+    - block:
+        - name: Prepare the machine directory
+          file:
+            path: "{{ _dir }}"
+            state: directory
+
+        - name: A machine with a name and a purpose, no mode
+          copy:
+            content: "{{ item.value }}\n"
+            dest: "{{ _dir }}/{{ item.file }}"
+          loop:
+            - { file: ".node_name", value: "quiet-falcon-nest" }
+            - { file: ".node_purpose", value: "relay" }
+
+        - name: Resolve the identity
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the name was read back and the purpose mapped
+          assert:
+            that:
+              - node_name == 'quiet-falcon-nest'
+              - node_mode == 'freedom-reality'
+              - not (lookup('file', _dir ~ '/.node_mode', errors='ignore') | default('', true) | trim | length > 0)
+            success_msg: "relay -> freedom-reality; nothing persisted for the mode yet."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: (b) an explicit mode overrides the mapping
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-b"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: "freedom-ws-eu"
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        node_name: ""
+        node_mode: "freedom-ws-eu"
+
+    - block:
+        - name: Prepare the machine directory
+          file:
+            path: "{{ _dir }}"
+            state: directory
+
+        - name: A machine with a name and a purpose, no mode
+          copy:
+            content: "{{ item.value }}\n"
+            dest: "{{ _dir }}/{{ item.file }}"
+          loop:
+            - { file: ".node_name", value: "bright-harbor-lane" }
+            - { file: ".node_purpose", value: "front" }
+
+        - name: Resolve the identity
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the given mode won
+          assert:
+            that:
+              - node_mode == 'freedom-ws-eu'
+            success_msg: "the mode passed on the command line wins over the mapping."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: (c) a node keeps the mode FCP accepted
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-c"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: "freedom-ws"
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        node_name: ""
+        node_mode: "freedom-ws"
+
+    - block:
+        - name: Prepare the machine directory
+          file:
+            path: "{{ _dir }}"
+            state: directory
+
+        - name: A machine enrolled for another mode
+          copy:
+            content: "{{ item.value }}\n"
+            dest: "{{ _dir }}/{{ item.file }}"
+          loop:
+            - { file: ".node_name", value: "quiet-falcon-nest" }
+            - { file: ".node_mode", value: "privacy-reality" }
+
+        - name: A different mode must stop the play
+          block:
+            - name: Resolve the identity
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/identity.yml
+            - name: (c) Unreached
+              assert:
+                that: [false]
+                fail_msg: "A mode change was accepted on the machine."
+          rescue:
+            - name: Assert the reason
+              assert:
+                that:
+                  - "'keeps its mode' in (ansible_failed_result.msg | default(''))"
+                success_msg: "a persisted mode is not changed from the command line."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: (d) a fresh machine persists its name only
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-d"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: "still-water-ridge"
+    node_mode: "privacy-reality"
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        node_name: "still-water-ridge"
+        node_mode: "privacy-reality"
+
+    - block:
+        - name: Resolve the identity
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the name is on the machine and the mode is not
+          assert:
+            that:
+              - lookup('file', _dir ~ '/.node_name') | trim == 'still-water-ridge'
+              - not (lookup('file', _dir ~ '/.node_mode', errors='ignore') | default('', true) | trim | length > 0)
+            success_msg: "the name is persisted before FCP is called, the mode is not."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: (e) a purpose no mode is mapped to stops the play
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-e"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: ""
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        node_name: ""
+        node_mode: ""
+
+    - block:
+        - name: Prepare the machine directory
+          file:
+            path: "{{ _dir }}"
+            state: directory
+
+        - name: A machine with a purpose nothing maps
+          copy:
+            content: "{{ item.value }}\n"
+            dest: "{{ _dir }}/{{ item.file }}"
+          loop:
+            - { file: ".node_name", value: "quiet-falcon-nest" }
+            - { file: ".node_purpose", value: "gateway" }
+
+        - name: It must stop the play
+          block:
+            - name: Resolve the identity
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/identity.yml
+            - name: (e) Unreached
+              assert:
+                that: [false]
+                fail_msg: "An unmapped purpose was deployed without a mode."
+          rescue:
+            - name: Assert the reason names what to pass
+              assert:
+                that:
+                  - "'fcp_legacy_purpose_modes' in (ansible_failed_result.msg | default(''))"
+                  - "'node_mode' in (ansible_failed_result.msg | default(''))"
+                success_msg: "an unmapped purpose asks for an explicit mode."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts

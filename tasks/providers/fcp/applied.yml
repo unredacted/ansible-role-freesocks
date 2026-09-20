@@ -13,7 +13,7 @@
     body: >-
       {{ {'appliedRevision': _fcp_bootstrap.machineRevision | int, 'nodeStarted': true}
          | combine({'caddy': {'certificateReady': _caddy_cert_ready | default(false) | bool}}
-                   if (node_purpose == 'front') else {}) }}
+                   if (_fcp_bootstrap.ingress is mapping) else {}) }}
     status_code: [200]
     return_content: yes
     timeout: 30

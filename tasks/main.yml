@@ -4,10 +4,11 @@
 # The role bootstraps the MACHINE and reports; FCP owns the panel and the
 # release to members (contract v2, FCP docs/servers.md "Node lifecycle"):
 #
-#   deploy   validate -> base packages, Docker -> resolve addresses ->
-#            enroll / report observations (PUT) -> fetch the machine
-#            configuration + node secret (POST bootstrap) ->
-#            [front] wait for the origin name to resolve, Caddy + decoy ->
+#   deploy   validate -> name and mode -> base packages, Docker ->
+#            resolve addresses -> enroll / report observations (PUT) ->
+#            fetch the machine configuration + node secret (POST bootstrap) ->
+#            [ingress] wait for the origin name to resolve, Caddy + decoy,
+#            [no ingress] take an earlier run's Caddy out of the way ->
 #            render compose, start the node -> report applied ->
 #            [optional] wait for FCP's machine_ready
 #   update   re-pull the image, recreate, re-report applied
@@ -37,112 +38,8 @@
       - "'$ANSIBLE_VAULT;' not in (fcp_api_token | string)"
     fail_msg: "fcp_api_token is still a raw vault blob: pass --ask-vault-pass or a vault id"
 
-- name: Validate front-node settings
-  assert:
-    that:
-      - remnawave_caddy_email | length > 0
-    fail_msg: "remnawave_caddy_email is required on a front node (ACME registration)"
-  when: node_purpose == 'front'
-
-# --- the node's identity: name and purpose, taken once, persisted on the machine ---
-#
-# Both are persisted BEFORE the first FCP call, so a run that stops halfway
-# (a lost bootstrap answer, an origin name that never resolves) resumes
-# against the same node instead of enrolling a second one. A later run may
-# omit both: they are read back. A purpose is immutable at FCP; a different
-# one passed later is refused here rather than sent.
-
-- name: Read the persisted node name and purpose
-  slurp:
-    src: "{{ remnawave_node_install_dir }}/{{ item }}"
-  loop: [".node_name", ".node_purpose"]
-  register: _identity_files
-  failed_when: false
-  become: yes
-
-- name: Use the persisted node name
-  set_fact:
-    node_name: "{{ _identity_files.results[0].content | b64decode | trim }}"
-  when:
-    - node_name | trim | length == 0
-    - _identity_files.results[0].content is defined
-
-- name: Use the persisted purpose
-  set_fact:
-    _persisted_purpose: "{{ _identity_files.results[1].content | b64decode | trim }}"
-  when: _identity_files.results[1].content is defined
-
-- name: Refuse a purpose that differs from the persisted one
-  assert:
-    that:
-      - node_purpose | trim | length == 0 or node_purpose | trim == _persisted_purpose
-    fail_msg: >-
-      This machine was enrolled as a {{ _persisted_purpose }} node; a node keeps its
-      purpose (got '{{ node_purpose }}'). An admin changes it from Servers.
-  when: _persisted_purpose is defined
-
-- name: Take the persisted purpose
-  set_fact:
-    node_purpose: "{{ _persisted_purpose }}"
-  when:
-    - node_purpose | trim | length == 0
-    - _persisted_purpose is defined
-
-- name: Validate node_purpose
-  assert:
-    that:
-      - node_purpose | trim in ['direct', 'front', 'relay']
-    fail_msg: >-
-      node_purpose must be one of: direct, front, relay (got '{{ node_purpose }}').
-      A machine that was deployed before carries it in
-      {{ remnawave_node_install_dir }}/.node_purpose.
-  when: operation_mode != 'wipe'
-
-- name: Normalize the given node name
-  set_fact:
-    node_name: "{{ node_name | trim }}"
-    node_purpose: "{{ node_purpose | trim }}"
-
-- name: Refuse to invent a name for a machine that was never deployed
-  assert:
-    that:
-      - node_name | length > 0
-    fail_msg: >-
-      No node name was given and none is persisted on this machine
-      ({{ remnawave_node_install_dir }}/.node_name): nothing to {{ operation_mode }}.
-  when: operation_mode != 'deploy'
-
-- name: Generate a node name
-  include_tasks: setup/node_name.yml
-  when: node_name | length == 0
-
-- name: Validate the node name
-  assert:
-    that:
-      - node_name is match('^[A-Za-z0-9 ._-]{3,30}$')
-      - node_name == node_name | trim
-    fail_msg: "node_name must be 3 to 30 plain characters (got '{{ node_name }}')"
-
-- name: Persist the node's identity before the first FCP call
-  when: operation_mode != 'wipe'
-  become: yes
-  block:
-    - name: Create the install directory
-      file:
-        path: "{{ remnawave_node_install_dir }}"
-        state: directory
-        mode: '0755'
-
-    - name: Persist the node name and purpose
-      copy:
-        content: "{{ item.value }}\n"
-        dest: "{{ remnawave_node_install_dir }}/{{ item.file }}"
-        mode: '0640'
-      loop:
-        - { file: ".node_name", value: "{{ node_name }}" }
-        - { file: ".node_purpose", value: "{{ node_purpose }}" }
-      loop_control:
-        label: "{{ item.file }}"
+- name: Resolve the node's name and mode
+  include_tasks: setup/identity.yml
 
 # --- wipe --------------------------------------------------------------------
 
@@ -176,9 +73,18 @@
     - name: Enroll with FCP and fetch the machine configuration
       include_tasks: providers/fcp/register_node.yml
 
-    - name: Set up Caddy and the decoy site (front nodes)
+    # FCP's bootstrap answer says whether this mode wants Caddy in front of a
+    # loopback transport (an ingress with routes); the role knows no shapes.
+    - name: Set up Caddy and the decoy site (when FCP declared an ingress)
       include_tasks: setup/caddy.yml
-      when: node_purpose == 'front'
+      when: _fcp_bootstrap.ingress is mapping
+
+    # And where it declared none, this node's own transport owns the public TLS
+    # port: an earlier run's Caddy is stopped and its configuration removed,
+    # otherwise it keeps the port and the node cannot bind it.
+    - name: Take down an earlier run's Caddy (no ingress)
+      include_tasks: setup/caddy_absent.yml
+      when: _fcp_bootstrap.ingress is not mapping
 
     - name: Start the node
       include_tasks: setup/remnawave.yml
@@ -195,6 +101,6 @@
 - name: Summary
   debug:
     msg: >-
-      {{ node_name }} ({{ node_purpose }}): {{ operation_mode }} done.
+      {{ node_name }} ({{ node_mode }}): {{ operation_mode }} done.
       {% if operation_mode != 'wipe' %}FCP stage: {{ _fcp_view.json.stage | default('unknown') }}.
       Release it to members from Admin -> Servers.{% endif %}

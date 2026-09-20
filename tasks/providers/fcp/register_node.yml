@@ -2,7 +2,7 @@
 # tasks/providers/fcp/register_node.yml - the bootstrap contract v2
 # (FCP docs/servers.md "Node registration (contract v2)"):
 #
-#   PUT  {slug}/nodes/by-name/{name}   enroll (purpose, label; taken once) or
+#   PUT  {slug}/nodes/by-name/{name}   enroll (mode, label; taken once) or
 #                                      report observations (every run)
 #   GET  the same                      the node's own view; polled until FCP
 #                                      has reconciled the panel row
@@ -30,11 +30,11 @@
     _fcp_enroll_body: >-
       {{ {
            'roleContractVersion': fcp_role_contract_version | int,
-           'purpose': node_purpose,
+           'mode': node_mode,
            'observed': {
              'management': {'address': remnawave_node_address_effective, 'port': 2222},
              'publicIps': {'v4': _public_v4} | combine({'v6': _public_v6} if (_public_v6 | length > 0) else {}),
-             'capabilities': {'caddy': node_purpose == 'front', 'ipv6': _public_v6 | length > 0},
+             'capabilities': {'caddy': true, 'ipv6': _public_v6 | length > 0},
            },
          } | combine({'label': node_label} if (node_label | length > 0) else {}) }}
 
@@ -87,6 +87,23 @@
       {{ _fcp_view.json.registration.code | default('unknown') }}.
       Look at the node in Admin -> Servers.
   when: _fcp_view.json.registration.state != 'ready'
+
+# FCP has taken the mode (it refuses one it is not set up for, and refuses a
+# change), so the machine can carry it from here: a later run may omit it. Until
+# this point nothing was written, which is what lets a refused mode be corrected
+# by running again. FCP's own answer is persisted, not what was passed.
+- name: Persist the mode FCP accepted
+  copy:
+    content: "{{ _fcp_view.json.mode.slug | default(node_mode) }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.node_mode"
+    mode: '0640'
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Remove the purpose an earlier release left
+  file:
+    path: "{{ remnawave_node_install_dir }}/.node_purpose"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
 
 - name: Fetch the machine configuration and the node secret
   uri:
@@ -143,22 +160,22 @@
   until: _fcp_origin_view.status == 200 and _fcp_origin_view.json.origin.dns in ['resolves', 'none']
   retries: "{{ fcp_registration_retries | int }}"
   delay: "{{ fcp_registration_delay | int }}"
-  when: node_purpose == 'front'
+  when: _fcp_bootstrap.ingress is mapping
 
-- name: Set the origin hostname a front node presents
+- name: Set the origin hostname the node presents
   set_fact:
     origin_hostname: >-
       {{ (_fcp_bootstrap.ingress.hostname
-          if (_fcp_bootstrap.ingress is mapping and _fcp_bootstrap.ingress.hostname is defined)
+          if (_fcp_bootstrap.ingress.hostname is defined)
           else node_origin_hostname) }}
-  when: node_purpose == 'front'
+  when: _fcp_bootstrap.ingress is mapping
 
-- name: Assert a front node has an origin hostname
+- name: Assert a node with an ingress has an origin hostname
   assert:
     that:
       - origin_hostname | trim | length > 0
     fail_msg: >-
-      FCP served no origin hostname for this front node and node_origin_hostname
-      is empty. Choose an origin-names account in Set up this panel, or set the
+      FCP served no origin hostname for this node and node_origin_hostname is
+      empty. Choose an origin-names account in Set up this backend, or set the
       node's hostname under its Settings in Admin -> Servers.
-  when: node_purpose == 'front'
+  when: _fcp_bootstrap.ingress is mapping

@@ -2,7 +2,7 @@
 # See README.md for the variables.
 #
 #   ansible-playbook -i hosts example-playbook.yml -e target=node1 \
-#     -e operation_mode=deploy -e node_purpose=direct
+#     -e operation_mode=deploy -e node_mode=privacy-reality
 #
 # The role bootstraps the machine and enrolls it with the FreeSocks Control
 # Plane (FCP). FCP owns the panel, the origin DNS of a front node, the
@@ -15,9 +15,10 @@
   hosts: "{{ target }}"
   remote_user: root
   vars:
-    # operation_mode (deploy | update | wipe) and node_purpose (direct | front
-    # | relay) come from -e. The purpose is taken at the first deploy and read
-    # back from the machine after; never default it here, a wrong one is refused.
+    # operation_mode (deploy | update | wipe) and node_mode (a connection mode
+    # the backend is set up for in FCP) come from -e. The mode is taken at the
+    # first deploy and read back from the machine after; never default it here,
+    # a wrong one is refused.
     fcp_api_url: "https://fcp.example.org"
     fcp_api_token: "{{ vault_fcp_api_token }}"   # an fsv1_ token, vaulted
     fcp_remnawave_panel_slug: "remnawave-primary"

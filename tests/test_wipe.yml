@@ -45,7 +45,7 @@
             body_format: json
             body:
               roleContractVersion: 2
-              purpose: direct
+              mode: privacy-reality
               observed: { management: { address: "192.0.2.1", port: 2222 }, publicIps: { v4: "203.0.113.1" }, capabilities: { caddy: false, ipv6: false } }
             status_code: [200]
 
