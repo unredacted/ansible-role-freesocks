@@ -37,25 +37,18 @@
       - "'$ANSIBLE_VAULT;' not in (fcp_api_token | string)"
     fail_msg: "fcp_api_token is still a raw vault blob: pass --ask-vault-pass or a vault id"
 
-- name: Validate front-node settings
-  assert:
-    that:
-      - remnawave_caddy_email | length > 0
-    fail_msg: "remnawave_caddy_email is required on a front node (ACME registration)"
-  when: node_purpose == 'front'
-
-# --- the node's identity: name and purpose, taken once, persisted on the machine ---
+# --- the node's identity: name and mode, taken once, persisted on the machine ---
 #
 # Both are persisted BEFORE the first FCP call, so a run that stops halfway
 # (a lost bootstrap answer, an origin name that never resolves) resumes
 # against the same node instead of enrolling a second one. A later run may
-# omit both: they are read back. A purpose is immutable at FCP; a different
-# one passed later is refused here rather than sent.
+# omit both: they are read back. A mode is immutable at FCP; a different one
+# passed later is refused here rather than sent.
 
-- name: Read the persisted node name and purpose
+- name: Read the persisted node name and mode
   slurp:
     src: "{{ remnawave_node_install_dir }}/{{ item }}"
-  loop: [".node_name", ".node_purpose"]
+  loop: [".node_name", ".node_mode"]
   register: _identity_files
   failed_when: false
   become: yes
@@ -67,41 +60,41 @@
     - node_name | trim | length == 0
     - _identity_files.results[0].content is defined
 
-- name: Use the persisted purpose
+- name: Use the persisted mode
   set_fact:
-    _persisted_purpose: "{{ _identity_files.results[1].content | b64decode | trim }}"
+    _persisted_mode: "{{ _identity_files.results[1].content | b64decode | trim }}"
   when: _identity_files.results[1].content is defined
 
-- name: Refuse a purpose that differs from the persisted one
+- name: Refuse a mode that differs from the persisted one
   assert:
     that:
-      - node_purpose | trim | length == 0 or node_purpose | trim == _persisted_purpose
+      - node_mode | trim | length == 0 or node_mode | trim == _persisted_mode
     fail_msg: >-
-      This machine was enrolled as a {{ _persisted_purpose }} node; a node keeps its
-      purpose (got '{{ node_purpose }}'). An admin changes it from Servers.
-  when: _persisted_purpose is defined
+      This machine was enrolled for the {{ _persisted_mode }} mode; a node keeps its
+      mode (got '{{ node_mode }}'). An admin changes it from Servers.
+  when: _persisted_mode is defined
 
-- name: Take the persisted purpose
+- name: Take the persisted mode
   set_fact:
-    node_purpose: "{{ _persisted_purpose }}"
+    node_mode: "{{ _persisted_mode }}"
   when:
-    - node_purpose | trim | length == 0
-    - _persisted_purpose is defined
+    - node_mode | trim | length == 0
+    - _persisted_mode is defined
 
-- name: Validate node_purpose
+- name: Validate node_mode
   assert:
     that:
-      - node_purpose | trim in ['direct', 'front', 'relay']
+      - node_mode | trim is match('^[a-z0-9][a-z0-9-]{0,39}$')
     fail_msg: >-
-      node_purpose must be one of: direct, front, relay (got '{{ node_purpose }}').
-      A machine that was deployed before carries it in
-      {{ remnawave_node_install_dir }}/.node_purpose.
+      node_mode must name a connection mode the backend is set up for in FCP
+      (got '{{ node_mode }}'). A machine that was deployed before carries it in
+      {{ remnawave_node_install_dir }}/.node_mode.
   when: operation_mode != 'wipe'
 
 - name: Normalize the given node name
   set_fact:
     node_name: "{{ node_name | trim }}"
-    node_purpose: "{{ node_purpose | trim }}"
+    node_mode: "{{ node_mode | trim }}"
 
 - name: Refuse to invent a name for a machine that was never deployed
   assert:
@@ -133,14 +126,14 @@
         state: directory
         mode: '0755'
 
-    - name: Persist the node name and purpose
+    - name: Persist the node name and mode
       copy:
         content: "{{ item.value }}\n"
         dest: "{{ remnawave_node_install_dir }}/{{ item.file }}"
         mode: '0640'
       loop:
         - { file: ".node_name", value: "{{ node_name }}" }
-        - { file: ".node_purpose", value: "{{ node_purpose }}" }
+        - { file: ".node_mode", value: "{{ node_mode }}" }
       loop_control:
         label: "{{ item.file }}"
 
@@ -176,9 +169,11 @@
     - name: Enroll with FCP and fetch the machine configuration
       include_tasks: providers/fcp/register_node.yml
 
-    - name: Set up Caddy and the decoy site (front nodes)
+    # FCP's bootstrap answer says whether this mode wants Caddy in front of a
+    # loopback transport (an ingress with routes); the role knows no shapes.
+    - name: Set up Caddy and the decoy site (when FCP declared an ingress)
       include_tasks: setup/caddy.yml
-      when: node_purpose == 'front'
+      when: _fcp_bootstrap.ingress is mapping
 
     - name: Start the node
       include_tasks: setup/remnawave.yml
@@ -195,6 +190,6 @@
 - name: Summary
   debug:
     msg: >-
-      {{ node_name }} ({{ node_purpose }}): {{ operation_mode }} done.
+      {{ node_name }} ({{ node_mode }}): {{ operation_mode }} done.
       {% if operation_mode != 'wipe' %}FCP stage: {{ _fcp_view.json.stage | default('unknown') }}.
       Release it to members from Admin -> Servers.{% endif %}

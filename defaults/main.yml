@@ -37,12 +37,15 @@ fcp_status_gate_retries: 45
 fcp_status_gate_delay: 20
 
 # --- the node ------------------------------------------------------------------
-# direct  REALITY, members connect straight to it
-# front   WebSocket behind Caddy, fronted by an L7 edge (Cloudflare, Fastly) from FCP
-# relay   REALITY behind an L4 edge from FCP
-# Taken at the first deploy and persisted on the machine (.node_purpose); a
-# later run may omit it. A node keeps its purpose (FCP refuses a change).
-node_purpose: ""
+# The connection MODE this node serves: one of the modes the backend was set up
+# for in FCP (Admin -> Servers), e.g. privacy-reality (REALITY, members connect
+# straight to it), freedom-reality (REALITY behind an L4 edge), freedom-xhttp
+# (XHTTP under REALITY behind an L4 edge), freedom-ws (WebSocket behind Caddy,
+# fronted by an L7 edge). What the machine runs follows from the mode: FCP's
+# bootstrap answer says whether Caddy and which routes are wanted.
+# Taken at the first deploy and persisted on the machine (.node_mode); a later
+# run may omit it. A node keeps its mode (FCP refuses a change).
+node_mode: ""
 # The node's name on the panel and in FCP. Empty = three dictionary words are
 # generated at the first deploy. Persisted on the machine (.node_name) BEFORE
 # the first FCP call, so a run that stops halfway resumes against the same node.

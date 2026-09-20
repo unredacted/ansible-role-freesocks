@@ -137,6 +137,6 @@
   file:
     path: "{{ remnawave_node_install_dir }}/{{ item }}"
     state: absent
-  loop: [".node_name", ".node_purpose"]
+  loop: [".node_name", ".node_mode"]
   become: yes
   when: _fcp_retire.status == 404 or (_fcp_wiped.status | default(0)) == 200

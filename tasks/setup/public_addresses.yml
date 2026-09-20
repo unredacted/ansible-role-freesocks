@@ -15,8 +15,8 @@
 # The default route's address is what a machine with a public interface
 # carries. Behind NAT (a cloud private interface, a relay on a tailnet) it is
 # not reachable from outside: node_public_address then says what is, for
-# every purpose (a direct node's member address, a front node's origin
-# record, what an edge dials for a relay).
+# every mode (a direct node's member address, a WebSocket node's origin
+# record, what an edge dials for a fronted node).
 - name: Detect the public addresses
   set_fact:
     _public_v4: >-

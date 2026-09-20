@@ -274,9 +274,9 @@
             < _main_src.find('providers/remnawave/resolve_node_address.yml')
           # The node's identity is on the machine BEFORE the first FCP call, so a
           # run that stops halfway resumes against the same node.
-          - "'.node_purpose' in _main_src"
+          - "'.node_mode' in _main_src"
           - >-
-            _main_src.find('Persist the node name and purpose')
+            _main_src.find('Persist the node name and mode')
             < _main_src.find('providers/fcp/register_node.yml')
         success_msg: "main.yml persists the identity, detects the public address, resolves the management address, then enrolls."
 

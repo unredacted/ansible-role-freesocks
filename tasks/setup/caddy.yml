@@ -14,7 +14,13 @@
   assert:
     that:
       - caddy_routes | length > 0
-    fail_msg: "FCP served no ingress routes for this front node"
+    fail_msg: "FCP served an ingress without routes for this node"
+
+- name: Assert the ACME registration address is set
+  assert:
+    that:
+      - remnawave_caddy_email | length > 0
+    fail_msg: "remnawave_caddy_email is required on a node that runs Caddy (ACME registration)"
 
 # === Install Caddy from the official apt repo ===
 - name: Install Caddy apt prerequisites
