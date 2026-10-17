@@ -9,9 +9,14 @@
 #   POST …/bootstrap                   the machine configuration and the panel's
 #                                      node secret (never logged, never cached)
 #
+# A node FCP renamed answers under its old name too; the view's `name` is the
+# current one, and the role follows it (providers/fcp/rename.yml).
+#
 # Every refusal stops the play with FCP's code. Facts published:
-#   _fcp_view          the node's view (registration, stage, origin)
-#   _fcp_bootstrap     machineRevision, node.port, ingress, origin
+#   _fcp_view          the node's view (registration, stage, origin, firewall)
+#   _fcp_bootstrap     machineRevision, nodePort, ingress, origin, and firewall:
+#                      the ports the node's firewall must let in, or none from
+#                      an FCP that predates the firewall acknowledgement
 #   remnawave_panel_secret_key   (no_log)
 
 - name: Set the FCP node URL
@@ -60,6 +65,15 @@
       {{ (_fcp_put.json.error.code if (_fcp_put.json is defined and _fcp_put.json.error is defined) else ('HTTP ' ~ (_fcp_put.status | default('unreachable')))) }}.
       {{ (_fcp_put.json.error.message if (_fcp_put.json is defined and _fcp_put.json.error is defined) else '') }}
   when: _fcp_put.status | default(0) != 200
+
+- name: Follow a rename FCP made
+  include_tasks: providers/fcp/rename.yml
+  vars:
+    _fcp_current_name: "{{ _fcp_put.json.name }}"
+  when:
+    - _fcp_put.json.name is defined
+    - _fcp_put.json.name | length > 0
+    - _fcp_put.json.name != node_name
 
 # The registration reconciles from FCP's own actions: poll the node's view
 # until the panel row exists (state ready), or stop on a blocked state.
@@ -134,6 +148,7 @@
       nodePort: "{{ _fcp_boot.json.node.port | int }}"
       ingress: "{{ _fcp_boot.json.ingress }}"
       origin: "{{ _fcp_boot.json.origin }}"
+      firewall: "{{ _fcp_boot.json.firewall.ports if (_fcp_boot.json.firewall is defined and _fcp_boot.json.firewall is mapping) else none }}"
     remnawave_panel_secret_key: "{{ _fcp_boot.json.secretKey }}"
     cacheable: false
   no_log: true

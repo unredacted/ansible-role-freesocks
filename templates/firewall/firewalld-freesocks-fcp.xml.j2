@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Managed by ansible-role-freesocks: the TCP ports FCP lists for this node. -->
+<service>
+  <short>freesocks-fcp</short>
+  <description>The TCP ports the FreeSocks Control Plane lists for this node.</description>
+{% for p in _fw_desired %}
+  <port protocol="tcp" port="{{ p }}"/>
+{% endfor %}
+</service>

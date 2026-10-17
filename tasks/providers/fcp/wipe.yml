@@ -118,6 +118,25 @@
     - "{{ remnawave_decoy_root }}"
   become: yes
 
+# Only the role's own object: emptied (SSH and the node API port excepted),
+# nothing of yours touched. A rule that only lets traffic in to a node that no
+# longer runs is no reason to keep the node from retiring: a failure here is
+# reported and the wipe goes on.
+- name: Take the role's firewall rules down
+  block:
+    - name: Empty the role's firewall object
+      include_tasks: setup/firewall/main.yml
+      vars:
+        _fw_listed: []
+        _fw_wipe: true
+  rescue:
+    - name: Note the firewall rules left behind
+      debug:
+        msg: >-
+          The role's firewall rules could not be taken down
+          ({{ ansible_failed_result.msg | default('unknown') }}); they only let
+          traffic in to a node that no longer runs. Remove them by hand if you wish.
+
 - name: Tell FCP the machine is wiped
   uri:
     url: "{{ _fcp_node_url }}/wiped"
@@ -137,6 +156,6 @@
   file:
     path: "{{ remnawave_node_install_dir }}/{{ item }}"
     state: absent
-  loop: [".node_name", ".node_mode", ".node_purpose"]
+  loop: [".node_name", ".node_mode", ".node_purpose", ".node_former_names"]
   become: yes
   when: _fcp_retire.status == 404 or (_fcp_wiped.status | default(0)) == 200

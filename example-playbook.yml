@@ -26,6 +26,12 @@
     # Front nodes: Caddy registers with the ACME provider under this address.
     remnawave_caddy_email: "ops@example.org"
 
+    # The host firewall (README "Firewall"): `auto` keeps the role's rules in
+    # the ufw, firewalld or nftables it finds. With none on the host, or behind
+    # a provider firewall, vouch for the ports FCP lists once they are open
+    # there; until then a port change waits on this node.
+    # fcp_firewall_assume_open: true
+
     # Relay nodes on a tailnet: the panel dials the overlay address, an edge
     # dials the public one.
     # node_address_interface: "tailscale0"

@@ -17,22 +17,27 @@
 # (direct | front | relay). Its mode is derived from fcp_legacy_purpose_modes so
 # the node stays deployable; pass -e node_mode=... when the backend's modes are
 # named otherwise.
+#
+# A node FCP RENAMED carries the current name in .node_name and the names it had
+# in .node_former_names (providers/fcp/rename.yml). An inventory that still says
+# a former name means this node: the current name is used.
 
 - name: Read the persisted identity
   slurp:
     src: "{{ remnawave_node_install_dir }}/{{ item }}"
-  loop: [".node_name", ".node_mode", ".node_purpose"]
+  loop: [".node_name", ".node_mode", ".node_purpose", ".node_former_names"]
   register: _identity_files
   failed_when: false
   become: "{{ _fcp_become | default(true) }}"
 
-# Each of the three is defined either way, empty where the machine carries
+# Each of these is defined either way, empty where the machine carries
 # nothing: a run against several machines then never reads the one before.
 - name: Take what the machine carries
   set_fact:
     _persisted_name: "{{ _identity_files.results[0].content | default('') | b64decode | trim }}"
     _persisted_mode: "{{ _identity_files.results[1].content | default('') | b64decode | trim }}"
     _legacy_purpose: "{{ _identity_files.results[2].content | default('') | b64decode | trim }}"
+    _former_names: "{{ (_identity_files.results[3].content | default('') | b64decode).splitlines() | map('trim') | select | list }}"
 
 - name: Use the persisted node name
   set_fact:
@@ -40,6 +45,26 @@
   when:
     - node_name | trim | length == 0
     - _persisted_name | length > 0
+
+- name: Note the inventory's former name
+  debug:
+    msg: >-
+      FCP renamed this node from {{ _identity_given_name }} to {{ _persisted_name }}:
+      going on as {{ _persisted_name }}. Change the inventory when convenient.
+  vars:
+    _identity_given_name: "{{ node_name | trim }}"
+  when:
+    - _persisted_name | length > 0
+    - _identity_given_name != _persisted_name
+    - _identity_given_name in _former_names
+
+- name: Follow a rename FCP made
+  set_fact:
+    node_name: "{{ _persisted_name }}"
+  when:
+    - _persisted_name | length > 0
+    - node_name | trim != _persisted_name
+    - node_name | trim in _former_names
 
 - name: Refuse a mode that differs from the persisted one
   assert:

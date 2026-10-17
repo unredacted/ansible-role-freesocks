@@ -1,0 +1,132 @@
+---
+# tasks/setup/firewall/firewalld.yml - the role's firewalld service
+# (`freesocks-fcp`, under /etc/firewalld/services) and its place in one zone
+# (fcp_firewall_firewalld_zone, else the default zone), permanent and runtime.
+# Your zones' own services and ports are never touched. firewalld learns a
+# changed service definition only on a reload, so a change to the role's list
+# reloads it (as any reload, that drops runtime-only changes nobody made
+# permanent); an unchanged list reloads nothing. A firewalld that is not running
+# is never started.
+
+- name: Set the role's firewalld service path
+  set_fact:
+    _fw_fwd_service: "{{ _fcp_fw_firewalld_dir | default('/etc/firewalld/services') }}/freesocks-fcp.xml"
+
+- name: Ask firewalld whether it runs
+  command: firewall-cmd --state
+  register: _fw_fwd_state
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Fail closed without a running firewalld
+  fail:
+    msg: >-
+      fcp_firewall_backend is firewalld but firewalld is not running here
+      ({{ (_fw_fwd_state.stdout | default('') | trim) or (_fw_fwd_state.msg | default('not installed')) }}).
+      The role never starts a firewall: start it yourself, or choose another
+      fcp_firewall_backend.
+  when: (_fw_fwd_state.rc | default(1)) != 0 or (_fw_fwd_state.stdout | trim) != 'running'
+
+- name: Find the default zone
+  command: firewall-cmd --get-default-zone
+  register: _fw_fwd_default_zone
+  changed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when: fcp_firewall_firewalld_zone | length == 0
+
+- name: Settle on the zone
+  set_fact:
+    _fw_zone: "{{ fcp_firewall_firewalld_zone if (fcp_firewall_firewalld_zone | length > 0) else (_fw_fwd_default_zone.stdout | trim) }}"
+
+- name: Validate the zone name
+  assert:
+    that:
+      - _fw_zone is match('^[A-Za-z0-9_-]+$')
+    fail_msg: "Not a firewalld zone name: '{{ _fw_zone }}'"
+    quiet: true
+
+- name: Read the role's service as it is
+  slurp:
+    src: "{{ _fw_fwd_service }}"
+  register: _fw_fwd_before
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take the ports the service lets in now
+  set_fact:
+    _fw_owned_before: >-
+      {{ (_fw_fwd_before.content | default('') | b64decode)
+         | regex_findall('protocol="tcp" port="[0-9]+"')
+         | map('regex_replace', '[^0-9]', '') | select | map('int') | unique | sort }}
+
+- name: Work out the ports
+  include_tasks: setup/firewall/desired.yml
+
+- name: Write the role's service
+  template:
+    src: firewall/firewalld-freesocks-fcp.xml.j2
+    dest: "{{ _fw_fwd_service }}"
+    mode: '0644'
+  register: _fw_fwd_written
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Load the role's service (a new or changed definition)
+  command: firewall-cmd --reload
+  register: _fw_fwd_reload
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_fwd_written is changed
+
+- name: Is the service in the zone (permanent)
+  command: firewall-cmd --permanent --zone={{ _fw_zone }} --query-service=freesocks-fcp
+  register: _fw_fwd_perm
+  changed_when: false
+  failed_when: _fw_fwd_perm.rc not in [0, 1]
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Put the service in the zone (permanent)
+  command: firewall-cmd --permanent --zone={{ _fw_zone }} --add-service=freesocks-fcp
+  register: _fw_fwd_perm_add
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_fwd_perm.rc == 1
+
+- name: Is the service in the zone (runtime)
+  command: firewall-cmd --zone={{ _fw_zone }} --query-service=freesocks-fcp
+  register: _fw_fwd_run
+  changed_when: false
+  failed_when: _fw_fwd_run.rc not in [0, 1]
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Put the service in the zone (runtime)
+  command: firewall-cmd --zone={{ _fw_zone }} --add-service=freesocks-fcp
+  register: _fw_fwd_run_add
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_fwd_run.rc == 1
+
+# --- read back -------------------------------------------------------------------
+
+- name: Read back the service as firewalld runs it
+  command: firewall-cmd --info-service=freesocks-fcp
+  register: _fw_fwd_info
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Read back its place in the zone
+  command: firewall-cmd --zone={{ _fw_zone }} --query-service=freesocks-fcp
+  register: _fw_fwd_run_after
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take what the role's service lets in
+  set_fact:
+    _fw_open: >-
+      {{ ((_fw_fwd_info.stdout | default('') | regex_search('(?m)^ *ports:.*$') | default('', true)
+           | regex_replace('^ *ports:', '')).split(' '))
+         | select('match', '^[0-9]+/tcp$') | map('regex_replace', '/tcp$', '') | map('int') | unique | sort
+         if ((_fw_fwd_info.rc | default(1)) == 0 and (_fw_fwd_run_after.rc | default(1)) == 0) else [] }}
+    _fw_effective: true
+    _fw_changed: >-
+      {{ (_fw_fwd_written is changed) or (_fw_fwd_reload is changed) or (_fw_fwd_perm_add is changed)
+         or (_fw_fwd_run_add is changed) }}

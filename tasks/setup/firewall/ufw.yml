@@ -1,0 +1,142 @@
+---
+# tasks/setup/firewall/ufw.yml - the role's ufw application profile
+# (`freesocks-fcp`, under /etc/ufw/applications.d) and the ONE rule allowing it.
+# The role's rule is an application rule, so it never matches, shadows or
+# deletes a port rule of yours. ufw's default policies, its other rules and
+# whether it is enabled are left alone: on an inactive ufw the rule waits for it
+# to be enabled, and nothing on the host filters meanwhile.
+
+- name: Set the role's ufw paths
+  set_fact:
+    _fw_ufw_profile: "{{ _fcp_fw_ufw_dir | default('/etc/ufw') }}/applications.d/freesocks-fcp"
+    _fw_ufw_rules: "{{ _fcp_fw_ufw_dir | default('/etc/ufw') }}/user.rules"
+
+- name: Look for ufw
+  command: ufw status
+  register: _fw_ufw_status
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Fail closed without ufw
+  fail:
+    msg: >-
+      fcp_firewall_backend is ufw but ufw cannot be run here
+      ({{ (_fw_ufw_status.stderr | default('') | trim) or (_fw_ufw_status.msg | default('not installed')) }}).
+      The role never installs a firewall: set ufw up yourself, or choose another
+      fcp_firewall_backend.
+  when: (_fw_ufw_status.rc | default(1)) != 0
+
+- name: Read the role's profile as it is
+  slurp:
+    src: "{{ _fw_ufw_profile }}"
+  register: _fw_ufw_before
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take the ports the profile lets in now
+  set_fact:
+    _fw_owned_before: >-
+      {{ ((_fw_ufw_before.content | default('') | b64decode)
+          | regex_search('(?m)^ports=[0-9,]+/tcp$') | default('', true)
+          | regex_replace('^ports=', '') | regex_replace('/tcp$', '')).split(',')
+         | select | map('int') | unique | sort }}
+
+- name: Work out the ports
+  include_tasks: setup/firewall/desired.yml
+
+- name: Refuse more ports than one ufw rule holds
+  assert:
+    that:
+      - _fw_desired | length <= 15
+    fail_msg: "A ufw rule holds at most 15 ports; the role would need {{ _fw_desired | length }}."
+    quiet: true
+
+- name: Write the role's ufw profile
+  template:
+    src: firewall/ufw-freesocks-fcp.j2
+    dest: "{{ _fw_ufw_profile }}"
+    mode: '0644'
+  register: _fw_ufw_written
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_desired | length > 0
+
+# ufw keeps an application rule in user.rules as a tuple carrying the ports it
+# expanded the profile to; that, not the profile file, is what it enforces.
+- name: Read the rules ufw holds
+  slurp:
+    src: "{{ _fw_ufw_rules }}"
+  register: _fw_ufw_held
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take the role's rule as ufw holds it
+  set_fact:
+    _fw_ufw_rule: "{{ _fw_ufw_tuple | length > 0 }}"
+    _fw_ufw_rule_ports: >-
+      {{ (_fw_ufw_tuple.split(' ')[5] if (_fw_ufw_tuple | length > 0) else '').split(',')
+         | select | map('int') | unique | sort }}
+  vars:
+    _fw_ufw_tuple: >-
+      {{ (_fw_ufw_held.content | default('') | b64decode)
+         | regex_search('(?m)^### tuple ### allow tcp [0-9,]+ [^ ]+ [^ ]+ [^ ]+ freesocks-fcp .*$')
+         | default('', true) }}
+
+- name: Allow the role's profile
+  command: ufw allow freesocks-fcp
+  register: _fw_ufw_allow
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - _fw_desired | length > 0
+    - not (_fw_ufw_rule | bool)
+
+# Also when a run stopped between writing the profile and this step.
+- name: Bring the role's rule to the profile
+  command: ufw app update freesocks-fcp
+  register: _fw_ufw_update
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - _fw_desired | length > 0
+    - _fw_ufw_rule | bool
+    - (_fw_ufw_written is changed) or (_fw_ufw_rule_ports != _fw_desired)
+
+# ufw resolves an application rule through its profile, so the rule goes first.
+- name: Drop the role's rule (nothing to let in)
+  command: ufw delete allow freesocks-fcp
+  register: _fw_ufw_delete
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - _fw_desired | length == 0
+    - _fw_ufw_rule | bool
+
+- name: Remove the role's profile (nothing to let in)
+  file:
+    path: "{{ _fw_ufw_profile }}"
+    state: absent
+  register: _fw_ufw_removed
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_desired | length == 0
+
+# --- read back -------------------------------------------------------------------
+
+- name: Read back the rules ufw holds
+  slurp:
+    src: "{{ _fw_ufw_rules }}"
+  register: _fw_ufw_held_after
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take what the role's rule lets in
+  set_fact:
+    _fw_open: >-
+      {{ (_fw_ufw_tuple.split(' ')[5] if (_fw_ufw_tuple | length > 0) else '').split(',')
+         | select | map('int') | unique | sort }}
+    _fw_effective: true
+    _fw_changed: >-
+      {{ (_fw_ufw_written is changed) or (_fw_ufw_allow is changed) or (_fw_ufw_update is changed)
+         or (_fw_ufw_delete is changed) or (_fw_ufw_removed is changed) }}
+  vars:
+    _fw_ufw_tuple: >-
+      {{ (_fw_ufw_held_after.content | default('') | b64decode)
+         | regex_search('(?m)^### tuple ### allow tcp [0-9,]+ [^ ]+ [^ ]+ [^ ]+ freesocks-fcp .*$')
+         | default('', true) }}

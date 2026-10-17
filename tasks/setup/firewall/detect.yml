@@ -1,0 +1,52 @@
+---
+# tasks/setup/firewall/detect.yml - which host firewall the role keeps its rules
+# in. `auto` looks, in this order, for a running firewalld, an active ufw and an
+# active nftables.service, and settles on `none` when none is: the role never
+# installs, enables or starts a firewall.
+
+- name: Validate fcp_firewall_backend
+  assert:
+    that:
+      - fcp_firewall_backend in ['auto', 'ufw', 'firewalld', 'nftables', 'none']
+    fail_msg: >-
+      fcp_firewall_backend must be one of auto, ufw, firewalld, nftables, none
+      (got '{{ fcp_firewall_backend }}')
+    quiet: true
+
+- name: Look for a running firewalld
+  command: systemctl is-active firewalld
+  register: _fw_probe_firewalld
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when: fcp_firewall_backend == 'auto'
+
+- name: Look for an active ufw
+  command: ufw status
+  register: _fw_probe_ufw
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - fcp_firewall_backend == 'auto'
+    - (_fw_probe_firewalld.rc | default(1)) != 0
+
+- name: Look for an active nftables ruleset
+  command: systemctl is-active nftables
+  register: _fw_probe_nftables
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - fcp_firewall_backend == 'auto'
+    - (_fw_probe_firewalld.rc | default(1)) != 0
+    - "'Status: active' not in (_fw_probe_ufw.stdout | default(''))"
+
+- name: Settle on the backend
+  set_fact:
+    _fw_backend: >-
+      {{ fcp_firewall_backend if fcp_firewall_backend != 'auto'
+         else 'firewalld' if (_fw_probe_firewalld.rc | default(1)) == 0
+         else 'ufw' if 'Status: active' in (_fw_probe_ufw.stdout | default(''))
+         else 'nftables' if (_fw_probe_nftables.rc | default(1)) == 0
+         else 'none' }}

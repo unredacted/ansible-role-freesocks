@@ -3,6 +3,43 @@
 # (optionally) wait for FCP to verify the machine (machine_ready). Idempotent:
 # the same revision reported again changes nothing; a revision FCP has moved
 # past is refused (servers.revision_stale) and the play stops: run it again.
+#
+# The report also says which ports the firewall lets in for FCP (FCP docs/
+# servers.md "Firewall acknowledgement"): that is what confirms a port change
+# waiting on this node, whatever the revision. The node's view is read first,
+# so a change staged since the bootstrap answer is let in before it is reported.
+# A report without `firewall` confirms nothing (setup/firewall/main.yml decides).
+
+- name: Read the node's view before reporting
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_report_view
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+
+- name: Fail closed when the node's view cannot be read
+  fail:
+    msg: >-
+      FCP did not answer the view of {{ node_name }} before the report:
+      {{ (_fcp_report_view.json.error.code if (_fcp_report_view.json is defined and _fcp_report_view.json.error is defined) else ('HTTP ' ~ (_fcp_report_view.status | default('unreachable')))) }}.
+  when: _fcp_report_view.status | default(0) != 200
+
+- name: Let in what FCP lists now (it moved since the bootstrap answer)
+  include_tasks: setup/firewall/main.yml
+  vars:
+    _fw_listed: "{{ _fcp_report_view.json.firewall.ports }}"
+  when:
+    - _fcp_report_view.json.firewall is defined
+    - _fcp_report_view.json.firewall is mapping
+    - (_fw_listed_ports is not defined) or
+      ((_fcp_report_view.json.firewall.ports | selectattr('protocol', 'equalto', 'tcp')
+        | map(attribute='port') | map('int') | unique | sort) != _fw_listed_ports)
 
 - name: Report the applied revision
   uri:
@@ -13,7 +50,9 @@
     body: >-
       {{ {'appliedRevision': _fcp_bootstrap.machineRevision | int, 'nodeStarted': true}
          | combine({'caddy': {'certificateReady': _caddy_cert_ready | default(false) | bool}}
-                   if (_fcp_bootstrap.ingress is mapping) else {}) }}
+                   if (_fcp_bootstrap.ingress is mapping) else {})
+         | combine({'firewall': _fw_report}
+                   if (_fw_report is defined and _fw_report is mapping) else {}) }}
     status_code: [200]
     return_content: yes
     timeout: 30
@@ -28,6 +67,29 @@
       FCP refused the applied report for {{ node_name }}:
       {{ (_fcp_applied.json.error.code if (_fcp_applied.json is defined and _fcp_applied.json.error is defined) else ('HTTP ' ~ (_fcp_applied.status | default('unreachable')))) }}.
   when: _fcp_applied.status | default(0) != 200
+
+- name: Keep the ports the report named
+  set_fact:
+    _fw_reported_ports: >-
+      {{ (_fw_report.ports | map(attribute='port') | map('int') | list)
+         if (_fw_report is defined and _fw_report is mapping) else [] }}
+
+# FCP answers the view: a change staged between the read above and the report
+# is in it, and waits for the next run.
+- name: Note a port change staged while this run reported
+  debug:
+    msg: >-
+      FCP staged a port change for {{ node_name }} while this run reported
+      ({{ _fcp_applied_pending | join(', ') }}): run the role again to let it in.
+  vars:
+    _fcp_applied_pending: >-
+      {{ (_fcp_applied.json.firewall.ports | default([]) | selectattr('reason', 'equalto', 'pending')
+          | map(attribute='port') | map('int') | list)
+         | difference(_fw_reported_ports) | difference(_fw_pending_ports | default([])) }}
+  when:
+    - _fcp_applied.json is defined
+    - _fcp_applied.json.firewall is defined
+    - _fcp_applied_pending | length > 0
 
 - name: Persist the applied revision
   copy:
