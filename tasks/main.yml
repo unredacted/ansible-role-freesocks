@@ -7,13 +7,15 @@
 #   deploy   validate -> name and mode -> base packages, Docker ->
 #            resolve addresses -> enroll / report observations (PUT) ->
 #            fetch the machine configuration + node secret (POST bootstrap) ->
+#            let in the ports FCP lists (the role's own firewall rules) ->
 #            [ingress] wait for the origin name to resolve, Caddy + decoy,
 #            [no ingress] take an earlier run's Caddy out of the way ->
-#            render compose, start the node -> report applied ->
-#            [optional] wait for FCP's machine_ready
+#            render compose, start the node -> report applied (and which
+#            ports the firewall lets in) -> [optional] wait for machine_ready
 #   update   re-pull the image, recreate, re-report applied
 #   wipe     ask FCP to retire the node; FCP tears down what it made and
-#            answers ready_to_wipe; the machine is cleaned up; FCP told (wiped)
+#            answers ready_to_wipe; the machine is cleaned up (the role's
+#            firewall rules too); FCP told (wiped)
 #
 # Nothing here ever calls the panel. Every FCP call fails the play closed:
 # an FCP that cannot be reached, or that refuses, stops the run with its code.
@@ -72,6 +74,21 @@
 
     - name: Enroll with FCP and fetch the machine configuration
       include_tasks: providers/fcp/register_node.yml
+
+    # Before anything listens, and before the report: FCP waits on it to move
+    # a port (FCP docs/servers.md "Firewall acknowledgement").
+    - name: Let in the ports FCP lists for this node
+      include_tasks: setup/firewall/main.yml
+      vars:
+        _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+      when: _fcp_bootstrap.firewall is not none
+
+    - name: Note an FCP that lists no firewall ports
+      debug:
+        msg: >-
+          FCP's bootstrap answer carries no firewall list (it predates the firewall
+          acknowledgement): the role leaves the host firewall as it is.
+      when: _fcp_bootstrap.firewall is none
 
     # FCP's bootstrap answer says whether this mode wants Caddy in front of a
     # loopback transport (an ingress with routes); the role knows no shapes.

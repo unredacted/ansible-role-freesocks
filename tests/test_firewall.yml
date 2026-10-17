@@ -1,0 +1,647 @@
+---
+# tests/test_firewall.yml
+#
+# Offline test of tasks/setup/firewall/ (FCP docs/servers.md "Firewall
+# acknowledgement") against a fake host firewall (tests/fake_firewall.py, run
+# through wrappers named ufw, firewall-cmd, nft and systemctl on PATH):
+#   ufw        (u1) auto finds an active ufw; the role's profile and one rule let
+#              the listed ports in, the operator's rules (443 among them) stay;
+#              (u2) a second pass changes nothing; (u3) a port FCP stops listing
+#              leaves the role's profile only, nothing of the operator's is
+#              deleted; (u4) a protected port (SSH) the role once opened is
+#              kept after FCP stops listing it; (u5) a rule left behind by an
+#              interrupted run is brought to the profile; (u6) an empty list
+#              is a gap, not "close everything"; (u7) a wipe keeps only the
+#              protected port; (u8) an explicit ufw that is not there fails closed;
+#   firewalld  (f1) auto finds firewalld; the role's service is defined,
+#              loaded and put in the zone, permanent and runtime; (f2) a second
+#              pass reloads nothing; (f3) pruning edits the role's service only;
+#              (f4) an explicit firewalld that does not run fails closed;
+#              (f5) a reload that failed is retried by the next run though the
+#              file did not change;
+#   nftables   (n1) auto finds nftables.service and the wired set; the set file
+#              is checked and written and the live set moves in one
+#              transaction; (n2) a second pass changes nothing; (n3) pruning;
+#              (n4) an explicit nftables whose ruleset does not use the set
+#              fails closed with the file in place; (n5) under auto the same
+#              ruleset leaves the role's rules not in effect, so nothing is
+#              reported; (n6) a set only a drop rule mentions, and (n7) an
+#              accept in a chain off the input hook, are not wired;
+#   none       (x1) auto finds nothing: no rule, no report; (x2) assume-open
+#              reports every listed port; (x3) a list of ports vouches for
+#              those only; (x4) a provider firewall in front: only what is
+#              vouched for is reported though the role's rules let more in;
+#              (x5) the same with nothing vouched: no report at all;
+#   switching  (s1-s3) a node moved from ufw to firewalld: the role's ufw
+#              object is pruned as FCP stops listing its ports (never added
+#              to) and forgotten once empty; (s4) with `none` the old object
+#              keeps what FCP still lists; (s5) a wipe empties it; (s6) a
+#              stopped firewalld is remembered for a later run.
+#
+# Run: ansible-playbook tests/test_firewall.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.fw"
+    _fw_state_file: "{{ playbook_dir }}/.fw/state.json"
+    _fcp_become: false
+    _fcp_fw_ufw_dir: "{{ playbook_dir }}/.fw/ufw"
+    _fcp_fw_firewalld_dir: "{{ playbook_dir }}/.fw/firewalld"
+    remnawave_node_install_dir: "{{ playbook_dir }}/.fw/node"
+    _marker: "{{ playbook_dir }}/.fw/node/.firewall_backends"
+    fcp_firewall_nftables_file: "{{ playbook_dir }}/.fw/nftables.d/freesocks-fcp.nft"
+    node_name: "quiet-falcon-nest"
+    _profile: "{{ playbook_dir }}/.fw/ufw/applications.d/freesocks-fcp"
+    _service: "{{ playbook_dir }}/.fw/firewalld/freesocks-fcp.xml"
+    # Before a port change is sent (443 serves, 8443 waits on this node) and after.
+    _listed_a:
+      - { port: 443, protocol: tcp, reason: serving }
+      - { port: 8443, protocol: tcp, reason: pending }
+    _listed_b:
+      - { port: 8443, protocol: tcp, reason: serving }
+    _host_bare:
+      active: []
+      ufw: { installed: false, enabled: false, rules: [], dir: "{{ playbook_dir }}/.fw/ufw" }
+      firewalld:
+        running: false
+        default_zone: public
+        dir: "{{ playbook_dir }}/.fw/firewalld"
+        builtin: { ssh: ["22/tcp"] }
+        known: { ssh: ["22/tcp"] }
+        permanent: {}
+        runtime: {}
+      nft: { tables: {} }
+      calls: []
+    _operator_ufw_rules: ["ufw allow 22/tcp", "ufw allow 80/tcp", "ufw allow 443/tcp"]
+    # The operator's input chain, with the role's set let in, and without.
+    _operator_chains:
+      - name: input
+        hook: input
+        type: filter
+        rules: ["ct state established,related accept", "tcp dport 22 accept", "tcp dport @freesocks_fcp accept"]
+    _operator_chains_unwired:
+      - name: input
+        hook: input
+        type: filter
+        rules: ["ct state established,related accept", "tcp dport 22 accept"]
+  environment:
+    PATH: "{{ playbook_dir }}/.fw/bin:{{ lookup('env', 'PATH') }}"
+    FAKE_FW_STATE: "{{ playbook_dir }}/.fw/state.json"
+  tasks:
+    - name: Prepare the fake host
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ _dir }}/bin"
+        - "{{ _dir }}/ufw/applications.d"
+        - "{{ _dir }}/firewalld"
+        - "{{ _dir }}/node"
+
+    - name: Put the fake tools on PATH
+      copy:
+        dest: "{{ _dir }}/bin/{{ item }}"
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          exec python3 "{{ playbook_dir }}/fake_firewall.py" {{ item }} "$@"
+      loop: [ufw, firewall-cmd, nft, systemctl]
+
+    - block:
+        # === ufw ===================================================================
+        - name: (u1) auto, an active ufw
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': [], 'ufw': {'installed': true, 'enabled': true,
+                 'rules': _operator_ufw_rules}}, recursive=true) }}
+        - name: (u1) the role's profile and rule let the list in, the operator's rules stay
+          assert:
+            that:
+              - _fw_backend == 'ufw'
+              - "'ports=443,8443/tcp' in lookup('file', _profile)"
+              - "'ufw allow freesocks-fcp' in _fake.ufw.rules"
+              - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
+              - _fw_open == [443, 8443]
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}, {'port': 8443, 'protocol': 'tcp'}]}"
+              - _fw_changed | bool
+              - _new_calls | select('match', '^ufw delete') | list | length == 0
+            success_msg: "ufw: one application rule of the role's, the operator's rules untouched."
+
+        - name: (u2) the same list again
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+        - name: (u2) nothing changes
+          assert:
+            that:
+              - not (_fw_changed | bool)
+              - _new_calls | select('match', '^ufw (allow|delete|app)') | list | length == 0
+              - _fw_report.ports | length == 2
+            success_msg: "ufw: idempotent."
+
+        - name: (u3) the change was sent; FCP lists 8443 only
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+        - name: (u3) 443 leaves the role's profile, not the operator's rule
+          assert:
+            that:
+              - "'ports=8443/tcp' in lookup('file', _profile)"
+              - "'ufw app update freesocks-fcp' in _new_calls"
+              - _new_calls | select('match', '^ufw delete') | list | length == 0
+              - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
+              - _fw_open == [8443]
+              - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
+            success_msg: "ufw: pruning touches the role's profile only."
+
+        - name: (u4) FCP lists SSH's port for a while
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 22, protocol: tcp, reason: serving }, { port: 8443, protocol: tcp, reason: serving }]
+        - name: (u4) and stops listing it
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+        - name: (u4) the role keeps SSH's port, and reports only what is listed
+          assert:
+            that:
+              - "'ports=22,8443/tcp' in lookup('file', _profile)"
+              - _fw_kept_protected == [22]
+              - _fw_open == [22, 8443]
+              - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
+            success_msg: "ufw: a protected port is never closed on FCP's account."
+
+        - name: (u5) a run stopped between the profile and the rule
+          copy:
+            dest: "{{ _dir }}/ufw/user.rules"
+            content: |
+              ### tuple ### allow tcp 22 0.0.0.0/0 any 0.0.0.0/0 in
+              ### tuple ### allow tcp 443 0.0.0.0/0 any 0.0.0.0/0 freesocks-fcp - in
+        - name: (u5) the same list
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+        - name: (u5) the rule is brought to the profile
+          assert:
+            that:
+              - "'ufw app update freesocks-fcp' in _new_calls"
+              - _fw_open == [22, 8443]
+            success_msg: "ufw: a stale rule is brought to the profile."
+
+        - name: (u6) FCP lists nothing
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: []
+        - name: (u6) a gap is not "close everything"
+          assert:
+            that:
+              - "'ports=22,8443/tcp' in lookup('file', _profile)"
+              - not (_fw_changed | bool)
+              - "_fw_report == {'ports': []}"
+            success_msg: "ufw: an empty list keeps what the role let in."
+
+        - name: (u7) the node is wiped
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: []
+            _fw_wipe: true
+        - name: (u7) only the protected port stays
+          assert:
+            that:
+              - "'ports=22/tcp' in lookup('file', _profile)"
+              - _fw_open == [22]
+            success_msg: "ufw: a wipe empties the role's profile but for SSH."
+
+        - name: (u8) an explicit ufw on a host without it
+          block:
+            - name: Run against a host without ufw
+              include_tasks: firewall_run.yml
+              vars:
+                _fw_listed: "{{ _listed_a }}"
+                fcp_firewall_backend: ufw
+                _case_state: "{{ _host_bare }}"
+            - name: (u8) Unreached
+              assert:
+                that: [false]
+                fail_msg: "ufw was taken for there."
+          rescue:
+            - name: (u8) it fails closed
+              assert:
+                that:
+                  - "'ufw cannot be run here' in (ansible_failed_result.msg | default(''))"
+                success_msg: "ufw: missing, the play stops."
+
+        # === firewalld =============================================================
+        - name: (f1) auto, a running firewalld
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['firewalld'], 'firewalld': {'running': true,
+                 'permanent': {'public': {'services': ['ssh'], 'ports': ['443/tcp']}},
+                 'runtime': {'public': {'services': ['ssh'], 'ports': ['443/tcp']}}}}, recursive=true) }}
+        - name: (f1) the role's service is loaded and in the zone
+          assert:
+            that:
+              - _fw_backend == 'firewalld'
+              - "'port=\"443\"' in lookup('file', _service)"
+              - "'port=\"8443\"' in lookup('file', _service)"
+              - "'firewall-cmd --reload' in _new_calls"
+              - "'freesocks-fcp' in _fake.firewalld.permanent.public.services"
+              - "'freesocks-fcp' in _fake.firewalld.runtime.public.services"
+              - "'ssh' in _fake.firewalld.permanent.public.services"
+              - _fake.firewalld.permanent.public.ports == ['443/tcp']
+              - _fw_open == [443, 8443]
+              - _fw_report.ports | length == 2
+            success_msg: "firewalld: the role's service, the zone's own entries untouched."
+
+        - name: (f2) the same list again
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+        - name: (f2) nothing reloads
+          assert:
+            that:
+              - not (_fw_changed | bool)
+              - _new_calls | select('match', '.*(--reload|--add-|--remove-)') | list | length == 0
+            success_msg: "firewalld: idempotent, no reload."
+
+        - name: (f3) FCP lists 8443 only
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+        - name: (f3) 443 leaves the role's service only
+          assert:
+            that:
+              - "'port=\"443\"' not in lookup('file', _service)"
+              - _fw_open == [8443]
+              - _fake.firewalld.runtime.public.ports == ['443/tcp']
+              - "'ssh' in _fake.firewalld.runtime.public.services"
+              - _new_calls | select('match', '.*--remove-') | list | length == 0
+            success_msg: "firewalld: pruning edits the role's service only."
+
+        - name: (f5) firewalld refuses the next reload
+          copy:
+            dest: "{{ _fw_state_file }}"
+            content: "{{ (lookup('file', _fw_state_file) | from_json) | combine({'firewalld': {'fail_reload': true}}, recursive=true) | to_nice_json }}"
+        - name: (f5) a run whose reload fails
+          block:
+            - name: Run with the list moved back
+              include_tasks: firewall_run.yml
+              vars:
+                _fw_listed: "{{ _listed_a }}"
+            - name: (f5) Unreached
+              assert:
+                that: [false]
+                fail_msg: "A failed reload went unnoticed."
+          rescue:
+            - name: (f5) the file moved, the loaded service did not
+              assert:
+                that:
+                  - "'port=\"443\"' in lookup('file', _service)"
+                  - (lookup('file', _fw_state_file) | from_json).firewalld.known['freesocks-fcp'] == ['8443/tcp']
+        - name: (f5) firewalld reloads again
+          copy:
+            dest: "{{ _fw_state_file }}"
+            content: "{{ (lookup('file', _fw_state_file) | from_json) | combine({'firewalld': {'fail_reload': false}}, recursive=true) | to_nice_json }}"
+        - name: (f5) the next run, the file unchanged
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+        - name: (f5) it reloads all the same
+          assert:
+            that:
+              - "'firewall-cmd --reload' in _new_calls"
+              - _fw_open == [443, 8443]
+            success_msg: "firewalld: a lost reload is retried."
+
+        - name: (f4) an explicit firewalld that does not run
+          block:
+            - name: Run against a stopped firewalld
+              include_tasks: firewall_run.yml
+              vars:
+                _fw_listed: "{{ _listed_a }}"
+                fcp_firewall_backend: firewalld
+                _case_state: "{{ _host_bare }}"
+            - name: (f4) Unreached
+              assert:
+                that: [false]
+                fail_msg: "A stopped firewalld was written to."
+          rescue:
+            - name: (f4) it fails closed, nothing started
+              assert:
+                that:
+                  - "'firewalld is not running' in (ansible_failed_result.msg | default(''))"
+                  - not (lookup('file', _fw_state_file) | from_json).firewalld.running
+                  - (lookup('file', _fw_state_file) | from_json).calls | map('join', ' ')
+                    | select('match', '^firewall-cmd --(reload|permanent)') | list | length == 0
+                success_msg: "firewalld: not running, the play stops."
+
+        # === nftables ==============================================================
+        - name: (n1) auto, nftables.service with the set wired in
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {'freesocks_fcp': []}, 'chains': _operator_chains}}}}, recursive=true) }}
+        - name: (n1) the file is checked and written, the set moves in one transaction
+          assert:
+            that:
+              - _fw_backend == 'nftables'
+              - "'elements = { 443, 8443 }' in lookup('file', fcp_firewall_nftables_file)"
+              - "'nft -c -f /dev/stdin' in _new_calls"
+              - _fake.nft_transactions | length == 1
+              - "'flush set inet filter freesocks_fcp' in _fake.nft_transactions[0]"
+              - "'add element inet filter freesocks_fcp { 443, 8443 }' in _fake.nft_transactions[0]"
+              - _fake.nft.tables['inet filter'].sets.freesocks_fcp == [443, 8443]
+              - _fake.nft.tables['inet filter'].chains == _operator_chains
+              - _fw_open == [443, 8443]
+              - _fw_report.ports | length == 2
+            success_msg: "nftables: the role's set only, in one transaction."
+
+        - name: (n2) the same list again
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+        - name: (n2) nothing changes
+          assert:
+            that:
+              - not (_fw_changed | bool)
+              - "'nft -f /dev/stdin' not in _new_calls"
+            success_msg: "nftables: idempotent."
+
+        - name: (n3) FCP lists 8443 only
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+        - name: (n3) 443 leaves the set
+          assert:
+            that:
+              - "'elements = { 8443 }' in lookup('file', fcp_firewall_nftables_file)"
+              - _fake.nft.tables['inet filter'].sets.freesocks_fcp == [8443]
+              - _fake.nft.tables['inet filter'].chains == _operator_chains
+              - _fw_open == [8443]
+            success_msg: "nftables: pruning."
+
+        - name: (n4) an explicit nftables whose ruleset does not use the set
+          block:
+            - name: Run against an unwired ruleset
+              include_tasks: firewall_run.yml
+              vars:
+                _fw_listed: "{{ _listed_a }}"
+                fcp_firewall_backend: nftables
+                _case_state: >-
+                  {{ _host_bare | combine({'nft': {'tables': {'inet filter':
+                     {'sets': {}, 'chains': _operator_chains_unwired}}}}, recursive=true) }}
+            - name: (n4) Unreached
+              assert:
+                that: [false]
+                fail_msg: "An unwired set was taken for open."
+          rescue:
+            - name: (n4) it fails closed with the file in place
+              assert:
+                that:
+                  - "'no set freesocks_fcp' in (ansible_failed_result.msg | default(''))"
+                  - "'elements = { 443, 8443 }' in lookup('file', fcp_firewall_nftables_file)"
+                success_msg: "nftables: unwired, the play stops and says how to wire it."
+
+        - name: (n5) auto, nftables.service whose ruleset does not use the set
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {}, 'chains': _operator_chains_unwired}}}}, recursive=true) }}
+        - name: (n5) the role's rules are not in effect, nothing is claimed
+          assert:
+            that:
+              - _fw_backend == 'nftables'
+              - not (_fw_effective | bool)
+              - _fw_open == []
+              - _fw_report is none
+            success_msg: "nftables: not in effect under auto, the report says nothing."
+
+        - name: (n6) the set is in the table, only a drop rule mentions it
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {'freesocks_fcp': []}, 'chains': [{'name': 'input', 'hook': 'input', 'type': 'filter',
+                  'rules': ['tcp dport @freesocks_fcp drop']}]}}}}, recursive=true) }}
+        - name: (n6) not wired
+          assert:
+            that:
+              - not (_fw_effective | bool)
+              - _fw_report is none
+            success_msg: "nftables: a mention of the set is not an accept."
+
+        - name: (n7) the accept is in a chain off the input hook
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {'freesocks_fcp': []}, 'chains': _operator_chains_unwired
+                  + [{'name': 'fcp', 'rules': ['tcp dport @freesocks_fcp accept']}]}}}}, recursive=true) }}
+        - name: (n7) not wired
+          assert:
+            that:
+              - not (_fw_effective | bool)
+              - _fw_report is none
+            success_msg: "nftables: an accept only counts on the input hook."
+
+        - name: (n8) the accept with a counter, on the input hook
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {'freesocks_fcp': []}, 'chains': [{'name': 'input', 'hook': 'input', 'type': 'filter',
+                  'rules': ['tcp dport @freesocks_fcp counter accept']}]}}}}, recursive=true) }}
+        - name: (n8) wired
+          assert:
+            that:
+              - _fw_effective | bool
+              - _fw_open == [443, 8443]
+            success_msg: "nftables: a counter on the accept is fine."
+
+        # === none ==================================================================
+        - name: (x1) auto, no firewall active
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            _case_state: "{{ _host_bare }}"
+        - name: (x1) no rule, no report
+          assert:
+            that:
+              - _fw_backend == 'none'
+              - _fw_report is none
+              - _new_calls | reject('match', '^(systemctl is-active|ufw status)') | list | length == 0
+            success_msg: "none: nothing written, nothing claimed."
+
+        - name: (x2) none, the operator vouches for every port
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: true
+        - name: (x2) every listed port is reported, nothing run
+          assert:
+            that:
+              - _fw_backend == 'none'
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}, {'port': 8443, 'protocol': 'tcp'}]}"
+              - _new_calls | length == 0
+            success_msg: "none + assume-open: reported."
+
+        - name: (x3) none, the operator vouches for 443 only
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: [443]
+        - name: (x3) the pending port is not reported
+          assert:
+            that:
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}]}"
+            success_msg: "none + a list: only those ports."
+
+        - name: (x3b) the same list as -e passes it
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: "443"
+        - name: (x3b) a string of ports vouches for those
+          assert:
+            that:
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}]}"
+            success_msg: "none + '443': only 443."
+
+        - name: (x4) ufw behind a provider firewall, 8443 vouched for
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: ufw
+            fcp_firewall_provider_filter: true
+            fcp_firewall_assume_open: [8443]
+            _case_state: >-
+              {{ _host_bare | combine({'ufw': {'installed': true, 'enabled': true,
+                 'rules': _operator_ufw_rules}}, recursive=true) }}
+        - name: (x4) the role opens both, reports what is vouched for
+          assert:
+            that:
+              - _fw_open == [443, 8443]
+              - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
+            success_msg: "provider filter: only what is vouched for."
+
+        - name: (x5) the same, nothing vouched for
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: ufw
+            fcp_firewall_provider_filter: true
+        - name: (x5) no report at all
+          assert:
+            that:
+              - _fw_report is none
+            success_msg: "provider filter, nothing vouched: the report says nothing."
+
+        # === switching backends ======================================================
+        - name: (s1) ufw holds the role's rules
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: ufw
+            _case_state: >-
+              {{ _host_bare | combine({'ufw': {'installed': true, 'enabled': true, 'rules': _operator_ufw_rules},
+                 'firewalld': {'running': true}}, recursive=true) }}
+        - name: (s1) recorded
+          assert:
+            that:
+              - lookup('file', _marker).splitlines() == ['ufw']
+              - "'ports=443,8443/tcp' in lookup('file', _profile)"
+
+        - name: (s2) the node moves to firewalld; FCP lists 8443
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+            fcp_firewall_backend: firewalld
+        - name: (s2) the old ufw object loses 443 and gains nothing
+          assert:
+            that:
+              - _fw_backend == 'firewalld'
+              - "'ports=8443/tcp' in lookup('file', _profile)"
+              - _new_calls | select('match', '^ufw allow') | list | length == 0
+              - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
+              - _fw_open == [8443]
+              - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
+              - lookup('file', _marker).splitlines() == ['firewalld', 'ufw']
+            success_msg: "switching: the old backend is pruned, not added to."
+
+        - name: (s3) FCP lists 9443 only
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 9443, protocol: tcp, reason: serving }]
+            fcp_firewall_backend: firewalld
+        - name: (s3) the old ufw object is gone and forgotten
+          assert:
+            that:
+              - "'ufw allow freesocks-fcp' not in _fake.ufw.rules"
+              - not (_profile is exists)
+              - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
+              - lookup('file', _marker).splitlines() == ['firewalld']
+            success_msg: "switching: an emptied old backend is forgotten."
+
+        - name: (s4) the operator turns to none
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 9443, protocol: tcp, reason: serving }]
+            fcp_firewall_backend: none
+        - name: (s4) the firewalld object keeps what FCP still lists, nothing is claimed
+          assert:
+            that:
+              - "'port=\"9443\"' in lookup('file', _service)"
+              - _fw_report is none
+              - lookup('file', _marker).splitlines() == ['firewalld']
+            success_msg: "switching to none: nothing still listed is closed."
+
+        - name: (s5) the node is wiped
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: []
+            _fw_wipe: true
+            fcp_firewall_backend: none
+        - name: (s5) the old object is emptied and the record gone
+          assert:
+            that:
+              - "'port=' not in lookup('file', _service)"
+              - not (_marker is exists)
+            success_msg: "a wipe empties every backend the role used."
+
+        - name: (s6) the role's firewalld service, firewalld stopped
+          copy:
+            dest: "{{ _marker }}"
+            content: "firewalld\n"
+        - name: (s6) a run on another backend
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_b }}"
+            fcp_firewall_backend: none
+            _keep_marker: true
+            _case_state: "{{ _host_bare }}"
+        - name: (s6) firewalld is remembered for later
+          assert:
+            that:
+              - lookup('file', _marker).splitlines() == ['firewalld']
+              - _new_calls | select('match', '^firewall-cmd --(reload|permanent|zone)') | list | length == 0
+            success_msg: "a stopped firewalld is pruned once it runs again."
+      always:
+        - name: Remove the fake host
+          file:
+            path: "{{ _dir }}"
+            state: absent

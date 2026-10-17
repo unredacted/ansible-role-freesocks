@@ -1,0 +1,48 @@
+---
+# tasks/setup/firewall/desired.yml - the ports the role's object should let in,
+# from what FCP lists and what the object holds now (_fw_owned_before, read by
+# the backend's own file):
+#   - every listed port;
+#   - a protected port the object already holds (SSH, the node API port) stays,
+#     listed or not: the role never closes those on FCP's account;
+#   - an EMPTY list is not "close everything" (a node always serves something,
+#     so it is a gap in what FCP knows): the object is kept as it is;
+#   - in a backend the role no longer uses (_fw_prune_only, setup/firewall/
+#     retire.yml) nothing is added: a port leaves once FCP stops listing it;
+#   - on a wipe (_fw_wipe) only the protected ports stay.
+
+- name: Work out the ports the role's rules should let in
+  set_fact:
+    _fw_desired: >-
+      {{ ((_fw_owned_before | intersect(_fw_protected))
+            if (_fw_wipe | default(false) | bool)
+          else _fw_owned_before if (_fw_listed_ports | length == 0)
+          else (_fw_owned_before | intersect(_fw_listed_ports | union(_fw_protected)))
+            if (_fw_prune_only | default(false) | bool)
+          else (_fw_listed_ports | union(_fw_owned_before | intersect(_fw_protected))))
+         | map('int') | unique | sort }}
+
+- name: Work out what leaves the role's rules
+  set_fact:
+    _fw_closing: "{{ _fw_owned_before | difference(_fw_desired) | sort }}"
+    _fw_kept_protected: >-
+      {{ _fw_desired | difference(_fw_listed_ports) | intersect(_fw_protected) | sort
+         if (_fw_listed_ports | length > 0 and not (_fw_prune_only | default(false) | bool)) else [] }}
+
+- name: Note an empty list from FCP
+  debug:
+    msg: >-
+      FCP lists no port for {{ node_name }}: the role keeps what its rules let in
+      ({{ _fw_owned_before | join(', ') }}) rather than closing it.
+  when:
+    - not (_fw_wipe | default(false) | bool)
+    - _fw_listed_ports | length == 0
+    - _fw_owned_before | length > 0
+
+- name: Note the ports FCP no longer lists
+  debug:
+    msg: >-
+      {% if _fw_closing %}No longer let in for FCP{{ (" by the role's " ~ (_fw_old_backend | default('')) ~ " rules") if (_fw_prune_only | default(false) | bool) else '' }}: {{ _fw_closing | join(', ') }}. {% endif %}
+      {%- if _fw_kept_protected %}Kept although FCP does not list them (SSH, the node API
+      port or fcp_firewall_protected_ports): {{ _fw_kept_protected | join(', ') }}.{% endif %}
+  when: (_fw_closing | length > 0) or (_fw_kept_protected | length > 0)

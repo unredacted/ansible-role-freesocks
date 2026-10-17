@@ -9,7 +9,9 @@
 #   (c) a mode that differs from the persisted one is refused;
 #   (d) a fresh machine persists its NAME only: the mode is persisted once FCP
 #       has accepted it, so a refused mode is corrected by running again;
-#   (e) a purpose no mode is mapped to stops the play with what to pass.
+#   (e) a purpose no mode is mapped to stops the play with what to pass;
+#   (f) a node FCP renamed: an inventory that still says a former name resolves
+#       to the current one the machine carries; a name it never had does not.
 #
 # Each case is its own play so the facts of the previous one are cleared.
 #
@@ -251,6 +253,71 @@
                   - "'fcp_legacy_purpose_modes' in (ansible_failed_result.msg | default(''))"
                   - "'node_mode' in (ansible_failed_result.msg | default(''))"
                 success_msg: "an unmapped purpose asks for an explicit mode."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: (f) an inventory that says a former name follows the rename
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-f"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: ""
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        node_name: "quiet-falcon-nest"
+        node_mode: ""
+
+    - block:
+        - name: Prepare the machine directory
+          file:
+            path: "{{ _dir }}"
+            state: directory
+
+        - name: A machine FCP renamed
+          copy:
+            content: "{{ item.value }}\n"
+            dest: "{{ _dir }}/{{ item.file }}"
+          loop:
+            - { file: ".node_name", value: "calm-river-delta" }
+            - { file: ".node_mode", value: "privacy-reality" }
+            - { file: ".node_former_names", value: "quiet-falcon-nest" }
+
+        - name: Resolve the identity
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the current name was taken
+          assert:
+            that:
+              - node_name == 'calm-river-delta'
+              - lookup('file', _dir ~ '/.node_name') | trim == 'calm-river-delta'
+            success_msg: "a former name in the inventory resolves to the current one."
+
+        - name: A name the machine never had
+          set_fact:
+            node_name: "other-name-here"
+
+        - name: Resolve the identity again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert a name the machine never had is not rewritten
+          assert:
+            that:
+              - node_name == 'other-name-here'
+            success_msg: "only a former name is followed."
       always:
         - name: Clean up
           file:

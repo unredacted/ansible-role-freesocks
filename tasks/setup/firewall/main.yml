@@ -1,0 +1,176 @@
+---
+# tasks/setup/firewall/main.yml - let in the ports FCP lists for this node and
+# work out what the applied report may claim (FCP docs/servers.md "Firewall
+# acknowledgement"): every listed port is let in (TCP, from anywhere) BEFORE the
+# report, and the report names only ports the role can stand behind.
+#
+# The role keeps ONE object in the host firewall (fcp_firewall_backend) and
+# never touches anything else. A port it let in earlier that FCP no longer lists
+# leaves that object; SSH and the node API port never do (_fw_protected). The
+# backends that hold something of the role's are recorded on the machine
+# (.firewall_backends), so an object left in a backend the role no longer uses
+# is pruned too (setup/firewall/retire.yml).
+#
+# Include vars:
+#   _fw_listed   FCP's `firewall.ports` ([{port, protocol, reason}])
+#   _fw_wipe     true when the node is retired: the object is emptied
+# Facts published:
+#   _fw_backend    ufw | firewalld | nftables | none (what `auto` resolved to)
+#   _fw_effective  the role's object takes effect on this host
+#   _fw_open       the ports the role's object lets in, read back from the host
+#   _fw_report     the applied report's `firewall` ({ports: [{port, protocol}]}),
+#                  or none when the role can claim nothing (the field is left out)
+#   _fw_changed    whether this pass changed the host
+
+- name: Take the ports FCP lists
+  set_fact:
+    _fw_listed_ports: >-
+      {{ _fw_listed | default([], true) | selectattr('protocol', 'equalto', 'tcp')
+         | map(attribute='port') | map('int') | unique | sort }}
+    _fw_pending_ports: >-
+      {{ _fw_listed | default([], true) | selectattr('protocol', 'equalto', 'tcp')
+         | selectattr('reason', 'equalto', 'pending')
+         | map(attribute='port') | map('int') | unique | sort }}
+    _fw_protected: >-
+      {{ ([22, ansible_port | default(22), _fcp_bootstrap.nodePort | default(2222)]
+          + (fcp_firewall_protected_ports | default([])))
+         | map('int') | unique | sort }}
+    _fw_owned_before: []
+    _fw_desired: []
+    _fw_open: []
+    _fw_effective: false
+    _fw_changed: false
+
+- name: Refuse a port that is not one
+  assert:
+    that:
+      - _fw_listed_ports | select('lt', 1) | list | length == 0
+      - _fw_listed_ports | select('gt', 65535) | list | length == 0
+    fail_msg: "FCP listed a port outside 1-65535: {{ _fw_listed_ports | join(', ') }}"
+    quiet: true
+
+- name: Resolve the firewall backend
+  include_tasks: setup/firewall/detect.yml
+
+- name: Read which backends hold the role's rules
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.firewall_backends"
+  register: _fw_marker
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take them
+  set_fact:
+    _fw_held_before: >-
+      {{ (_fw_marker.content | default('') | b64decode).splitlines() | map('trim')
+         | select('in', ['ufw', 'firewalld', 'nftables']) | unique | list }}
+    _fw_held_after: []
+    _fw_changed_any: false
+
+- name: Prune the role's rules in a backend it no longer uses
+  include_tasks: setup/firewall/retire.yml
+  loop: "{{ _fw_held_before | difference([_fw_backend]) }}"
+  loop_control:
+    loop_var: _fw_old_backend
+
+- name: Start the selected backend from a clean slate
+  set_fact:
+    _fw_owned_before: []
+    _fw_desired: []
+    _fw_open: []
+    _fw_effective: false
+    _fw_changed: false
+
+- name: Keep the role's rules in the host firewall
+  include_tasks: "setup/firewall/{{ _fw_backend }}.yml"
+  when: _fw_backend != 'none'
+
+- name: Take what this pass did
+  set_fact:
+    _fw_changed: "{{ (_fw_changed | bool) or (_fw_changed_any | bool) }}"
+    _fw_held_now: >-
+      {{ (_fw_held_after + ([_fw_backend] if (_fw_backend != 'none' and _fw_desired | length > 0) else []))
+         | unique | sort }}
+
+- name: Record which backends hold the role's rules
+  copy:
+    # Double-quoted: YAML turns each \n into a newline (a block scalar would
+    # hand Jinja the two characters).
+    content: "{{ _fw_held_now | join('\n') }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.firewall_backends"
+    mode: '0640'
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_held_now | length > 0
+
+- name: Forget the record once nothing is held
+  file:
+    path: "{{ remnawave_node_install_dir }}/.firewall_backends"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_held_now | length == 0
+
+# --- what the report may claim -------------------------------------------------
+# A port is claimed when everything that could drop it is accounted for: the
+# role's own rule took effect and no firewall the role cannot see sits in front,
+# or the operator vouches for it (fcp_firewall_assume_open). With nothing to
+# stand behind at all, the `firewall` field is left out: FCP then confirms
+# nothing and a port change keeps waiting on this node.
+
+- name: Work out what the report may claim
+  when: not (_fw_wipe | default(false) | bool)
+  block:
+    - name: Take what the operator vouches for
+      set_fact:
+        # true, a list of ports, or (from -e) a comma-separated string of them.
+        _fw_vouched: >-
+          {{ (fcp_firewall_assume_open | map('int') | list)
+               if (fcp_firewall_assume_open is iterable and fcp_firewall_assume_open is not string
+                   and fcp_firewall_assume_open is not mapping)
+             else ((fcp_firewall_assume_open | string).split(',') | map('trim') | select | map('int') | list)
+               if (fcp_firewall_assume_open is string and fcp_firewall_assume_open is match('^[0-9][0-9, ]*$'))
+             else (_fw_listed_ports if (fcp_firewall_assume_open | bool) else []) }}
+        _fw_host_claims: "{{ (_fw_effective | bool) and not (fcp_firewall_provider_filter | bool) }}"
+
+    - name: Work out the ports to report
+      set_fact:
+        _fw_report_ports: >-
+          {{ _fw_listed_ports
+             | select('in', _fw_vouched + (_fw_open if (_fw_host_claims | bool) else []))
+             | list }}
+        _fw_can_claim: "{{ (_fw_host_claims | bool) or (_fw_vouched | length > 0) }}"
+        _fw_report_items: []
+
+    - name: Shape the report
+      set_fact:
+        _fw_report_items: "{{ _fw_report_items + [{'port': item | int, 'protocol': 'tcp'}] }}"
+      loop: "{{ _fw_report_ports }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Keep the report
+      set_fact:
+        _fw_report: "{{ {'ports': _fw_report_items} if (_fw_can_claim | bool) else none }}"
+
+    - name: Say what the firewall lets in for FCP
+      debug:
+        msg: >-
+          Firewall ({{ _fw_backend }}{{ '' if (_fw_effective | bool) or _fw_backend == 'none' else ', not in effect' }}):
+          FCP lists {{ _fw_listed_ports | join(', ') if _fw_listed_ports else 'nothing' }};
+          the role's rules let in {{ _fw_open | join(', ') if _fw_open else 'nothing' }};
+          the report {{ ('names ' ~ (_fw_report_ports | join(', ') if _fw_report_ports else 'no port'))
+                        if (_fw_can_claim | bool) else 'says nothing about the firewall' }}.
+
+    - name: Say why a port change waits on this node
+      debug:
+        msg: >-
+          A port change waits on {{ node_name }}: FCP asks for {{ _fw_pending_ports | difference(_fw_report_ports) | join(', ') }}
+          and this run cannot report {{ 'it' if (_fw_pending_ports | difference(_fw_report_ports) | length == 1) else 'them' }}
+          open:
+          {% if _fw_backend == 'none' %}the role keeps no rule here ({{ 'no firewall it manages is active' if fcp_firewall_backend == 'auto' else 'fcp_firewall_backend is none' }}), and a firewall it cannot see may still drop the port.
+          {%- elif not (_fw_effective | bool) %}its {{ _fw_backend }} rules are not in effect (see above).
+          {%- else %}a provider firewall filters this machine (fcp_firewall_provider_filter).
+          {%- endif %}
+          Open the port wherever it is filtered, vouch for it (fcp_firewall_assume_open)
+          and run the role again. Until then FCP keeps the change waiting and its Servers
+          page names this node.
+      when: _fw_pending_ports | difference(_fw_report_ports) | length > 0

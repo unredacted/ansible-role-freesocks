@@ -1,0 +1,89 @@
+---
+# tasks/providers/fcp/rename.yml - FCP renamed this node (FCP docs/servers.md
+# "Renaming a node"). The by-name routes keep answering under the old name, and
+# the view's `name` is the current one. The role follows it: the rest of the run
+# goes on under the new name, and the machine carries it (.node_name) with the
+# old one kept in .node_former_names, so an inventory that still says the old
+# name resolves to the new one (setup/identity.yml).
+#
+# FCP adds the new name to the boundary of a token bounded to this backend
+# alone; a token spanning several backends keeps acting under the old name only.
+# Such a token is told apart by asking under the new name first: refused, the
+# run goes on under the old name and the machine keeps it.
+#
+# Input: _fcp_current_name (the view's name).
+
+- name: Validate the name FCP answered
+  assert:
+    that:
+      - _fcp_current_name is match('^[A-Za-z0-9 ._-]{3,30}$')
+    fail_msg: "FCP answered a node name the role cannot use: '{{ _fcp_current_name }}'"
+    quiet: true
+
+- name: Ask under the new name
+  uri:
+    url: "{{ fcp_api_url }}/api/v1/admin/servers/{{ fcp_remnawave_panel_slug }}/nodes/by-name/{{ _fcp_current_name | urlencode }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200, 403]
+    return_content: yes
+    timeout: 30
+  register: _fcp_rename_probe
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+
+- name: Tell a token confined to the old name apart
+  set_fact:
+    _fcp_rename_bounded: >-
+      {{ (_fcp_rename_probe.status | default(0)) == 403
+         and (_fcp_rename_probe.json.error.code | default('')) == 'servers.registration_boundary' }}
+
+- name: Fail closed when FCP cannot be asked under the new name
+  fail:
+    msg: >-
+      FCP renamed {{ node_name }} to {{ _fcp_current_name }}, and answered
+      {{ (_fcp_rename_probe.json.error.code if (_fcp_rename_probe.json is defined and _fcp_rename_probe.json.error is defined) else ('HTTP ' ~ (_fcp_rename_probe.status | default('unreachable')))) }}
+      under the new name.
+  when:
+    - _fcp_rename_probe.status | default(0) != 200
+    - not (_fcp_rename_bounded | bool)
+
+- name: Go on under the old name (the token may not act under the new one)
+  debug:
+    msg: >-
+      FCP renamed {{ node_name }} to {{ _fcp_current_name }}. This token may act
+      only under the old name, which FCP keeps answering: the run goes on under it.
+      Give the role a token bounded to {{ _fcp_current_name }} (or the fleet token)
+      and the next run switches to the new name.
+  when: _fcp_rename_bounded | bool
+
+- name: Follow the rename
+  when: _fcp_rename_probe.status | default(0) == 200
+  block:
+    - name: Keep the old name on the machine
+      lineinfile:
+        path: "{{ remnawave_node_install_dir }}/.node_former_names"
+        line: "{{ node_name }}"
+        create: yes
+        mode: '0640'
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: Persist the current name
+      copy:
+        content: "{{ _fcp_current_name }}\n"
+        dest: "{{ remnawave_node_install_dir }}/.node_name"
+        mode: '0640'
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: Note the rename
+      debug:
+        msg: >-
+          FCP renamed {{ node_name }} to {{ _fcp_current_name }}: the machine now
+          carries the new name. Change the inventory when convenient (the old name
+          keeps working).
+
+    - name: Go on under the new name
+      set_fact:
+        _fcp_node_url: "{{ fcp_api_url }}/api/v1/admin/servers/{{ fcp_remnawave_panel_slug }}/nodes/by-name/{{ _fcp_current_name | urlencode }}"
+        node_name: "{{ _fcp_current_name }}"

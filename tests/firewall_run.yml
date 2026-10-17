@@ -1,0 +1,53 @@
+---
+# tests/firewall_run.yml - one pass of the role's firewall step against the fake
+# host firewall (tests/fake_firewall.py), for tests/test_firewall.yml.
+#
+# Include vars: _case_state (optional: a fresh host's state to start from, the
+# role's files removed; omitted, the host stays as the last pass left it), plus
+# whatever the role reads (_fw_listed, fcp_firewall_backend,
+# fcp_firewall_assume_open, ...).
+# Facts published: _fake (the host's state after the pass) and _new_calls (the
+# tool calls the pass made, one string each).
+
+- name: Start from a host without the role's files
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ _profile }}"
+    - "{{ _dir }}/ufw/user.rules"
+    - "{{ _service }}"
+    - "{{ fcp_firewall_nftables_file }}"
+  when: _case_state is defined
+
+- name: Start from a host whose role record is gone too
+  file:
+    path: "{{ remnawave_node_install_dir }}/.firewall_backends"
+    state: absent
+  when:
+    - _case_state is defined
+    - not (_keep_marker | default(false) | bool)
+
+- name: Write the fake host's state
+  copy:
+    content: "{{ _case_state | to_nice_json }}"
+    dest: "{{ _fw_state_file }}"
+    mode: '0644'
+  when: _case_state is defined
+
+- name: Count the tool calls so far
+  set_fact:
+    _calls_before: "{{ (lookup('file', _fw_state_file) | from_json).calls | default([]) | length }}"
+
+- name: Run the role's firewall step
+  include_role:
+    name: ansible-role-freesocks
+    tasks_from: setup/firewall/main.yml
+
+- name: Read the fake host back
+  set_fact:
+    _fake: "{{ lookup('file', _fw_state_file) | from_json }}"
+
+- name: Take the calls this pass made
+  set_fact:
+    _new_calls: "{{ _fake.calls[(_calls_before | int):] | map('join', ' ') | list }}"

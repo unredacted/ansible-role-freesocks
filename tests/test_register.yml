@@ -2,18 +2,36 @@
 # tests/test_register.yml
 #
 # Offline test of the bootstrap contract v2 against tests/mock_fcp.py:
-#   (a) a direct node enrolls, gets its configuration and secret, reports
-#       applied and reaches machine_ready; the secret is in no fact FCP could
-#       read back and only the bootstrap answer carried it;
+#   (a) a direct node enrolls, gets its configuration and secret, lets its
+#       listed port in, reports applied (with the firewall) and reaches
+#       machine_ready; the secret is in no fact FCP could read back and only
+#       the bootstrap answer carried it;
 #   (b) a second run is observations only (the mock's generation moves, the
-#       mode stays);
+#       mode stays); (b2) a mode FCP does not know leaves nothing behind;
 #   (c) a blocked registration fails the play closed;
 #   (d) an FCP that is not set up fails the play closed;
 #   (e) a stale revision fails the play closed;
 #   (f) a register-only token outside its boundary is refused;
 #   (g) a front node gets the ingress routes and the origin hostname;
 #   (h) a node FCP blocks while verifying the applied machine fails the play
-#       closed after the applied report.
+#       closed after the applied report;
+#   (i) a port change staged after the bootstrap answer: a run that cannot
+#       vouch for the port reports without `firewall` and the change keeps
+#       waiting; a run that can reports it and the change is confirmed;
+#       reporting again is idempotent;
+#   (j) once the change is sent, the run reports the new port only;
+#   (k) a malformed firewall report is refused;
+#   (l) an FCP that predates the firewall acknowledgement: no list, no claim;
+#   (m) the status gate passes a healthy node, and fails on a port change
+#       waiting on it and on a node that never reached machine_ready;
+#   (n) FCP's scope rules: a write-only fleet token reads; a manage-only token
+#       is refused on every verb, bootstrap included; a register token outside
+#       its node names is refused; a read-only token cannot write;
+#   (o) a renamed node with a token spanning several backends: the run goes on
+#       under the old name and the machine keeps it;
+#   (p) a node FCP renamed: the run follows it under the new name and the
+#       machine carries it, the old one kept as a former name;
+#   (q) the role never called the deleted edges routes.
 #
 # Run: ansible-playbook tests/test_register.yml
 - hosts: localhost
@@ -21,6 +39,7 @@
   gather_facts: false
   vars:
     _port: 8827
+    _mock: "http://127.0.0.1:8827"
     fcp_api_url: "http://127.0.0.1:8827"
     fcp_api_token: "fsv1_test_token_for_the_mock"
     fcp_remnawave_panel_slug: "panel-a"
@@ -28,6 +47,11 @@
     fcp_registration_retries: 3
     fcp_registration_delay: 0
     fcp_wait_machine_ready: true
+    fcp_status_gate_retries: 2
+    fcp_status_gate_delay: 0
+    # No host firewall here: the operator vouches for the ports instead.
+    fcp_firewall_backend: none
+    fcp_firewall_assume_open: true
     node_mode: privacy-reality
     node_name: "quiet-falcon-nest"
     node_label: ""
@@ -38,7 +62,7 @@
     remnawave_node_address_effective: "100.100.64.7"
     _public_v4: "203.0.113.10"
     _public_v6: ""
-    _tasks: "{{ playbook_dir | dirname }}/tasks/providers/fcp"
+    _node_url: "http://127.0.0.1:8827/api/v1/admin/servers/panel-a/nodes/by-name"
   tasks:
     - name: Start the mock FCP
       command: python3 {{ playbook_dir }}/mock_fcp.py {{ _port }}
@@ -47,7 +71,7 @@
 
     - name: Wait for the mock
       uri:
-        url: "http://127.0.0.1:{{ _port }}/__state"
+        url: "{{ _mock }}/__state"
         status_code: 200
       register: _up
       until: _up.status == 200
@@ -62,7 +86,9 @@
 
         # (a) the happy path
         - name: Enroll, bootstrap
-          include_tasks: "{{ _tasks }}/register_node.yml"
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
 
         - name: Assert the bootstrap answer
           assert:
@@ -70,20 +96,30 @@
               - _fcp_bootstrap.machineRevision | int == 1
               - _fcp_bootstrap.nodePort | int == 2222
               - _fcp_bootstrap.ingress is none
+              - "_fcp_bootstrap.firewall == [{'port': 443, 'protocol': 'tcp', 'reason': 'serving'}]"
               - remnawave_panel_secret_key == 'mock-panel-node-secret'
             success_msg: "enrolled, bootstrapped."
           no_log: true
 
+        - name: Let in what FCP lists
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/firewall/main.yml
+          vars:
+            _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+
         - name: Report applied
-          include_tasks: "{{ _tasks }}/applied.yml"
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
 
         - name: Read the mock's state
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__state"
+            url: "{{ _mock }}/__state"
             return_content: yes
           register: _state
 
-        - name: Assert the stage, the persisted mode and that the secret travelled once
+        - name: Assert the stage, the persisted mode, the firewall and that the secret travelled once
           assert:
             that:
               - _fcp_view.json.stage == 'machine_ready'
@@ -91,14 +127,17 @@
               - "(_state.json.requests | selectattr('method', 'equalto', 'PUT') | list | length) == 1"
               - lookup('file', remnawave_node_install_dir ~ '/.applied_revision') | trim == '1'
               - lookup('file', remnawave_node_install_dir ~ '/.node_mode') | trim == 'privacy-reality'
-            success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine."
+              - _state.json.applied_reports[-1].firewall == [443]
+            success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine, 443 reported."
 
         # (b) observations only on a rerun
         - name: Enroll again (observations)
-          include_tasks: "{{ _tasks }}/register_node.yml"
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
         - name: Read the mock's state
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__state"
+            url: "{{ _mock }}/__state"
             return_content: yes
           register: _state
         - name: Assert the rerun changed only the observations
@@ -114,7 +153,9 @@
         - name: Enroll with a mode FCP does not know
           block:
             - name: Enroll a node for an unknown mode
-              include_tasks: "{{ _tasks }}/register_node.yml"
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/register_node.yml
               vars:
                 node_mode: privacy-realit
                 node_name: "typo-node-one"
@@ -134,14 +175,16 @@
         # (c) blocked
         - name: Scenario blocked
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            url: "{{ _mock }}/__scenario"
             method: POST
             body_format: json
             body: { name: blocked }
         - name: A blocked registration must stop the play
           block:
             - name: Enroll a node FCP blocks
-              include_tasks: "{{ _tasks }}/register_node.yml"
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/register_node.yml
               vars:
                 node_name: "blocked-node-one"
             - name: (c) Unreached
@@ -160,13 +203,13 @@
         # (d) not set up
         - name: Scenario not_set_up
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            url: "{{ _mock }}/__scenario"
             method: POST
             body_format: json
             body: { name: not_set_up }
         - name: Enroll against a panel that is not set up
           uri:
-            url: "http://127.0.0.1:{{ _port }}/api/v1/admin/servers/panel-a/nodes/by-name/another-node-x"
+            url: "{{ _node_url }}/another-node-x"
             method: PUT
             headers: { Authorization: "Bearer {{ fcp_api_token }}" }
             body_format: json
@@ -183,7 +226,7 @@
               - _nsu.json.error.code == 'servers.panel_not_set_up'
         - name: Scenario plain
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            url: "{{ _mock }}/__scenario"
             method: POST
             body_format: json
             body: { name: plain }
@@ -191,7 +234,7 @@
         # (e) stale revision
         - name: Report a stale revision
           uri:
-            url: "http://127.0.0.1:{{ _port }}/api/v1/admin/servers/panel-a/nodes/by-name/quiet-falcon-nest/applied"
+            url: "{{ _node_url }}/quiet-falcon-nest/applied"
             method: POST
             headers: { Authorization: "Bearer {{ fcp_api_token }}" }
             body_format: json
@@ -207,7 +250,7 @@
         # (f) boundary
         - name: Mint a register-only token bound to another panel
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__mint"
+            url: "{{ _mock }}/__mint"
             method: POST
             body_format: json
             body:
@@ -216,7 +259,7 @@
               boundary: { backendSlugs: ["panel-b"] }
         - name: Read with the bound token
           uri:
-            url: "http://127.0.0.1:{{ _port }}/api/v1/admin/servers/panel-a/nodes/by-name/quiet-falcon-nest"
+            url: "{{ _node_url }}/quiet-falcon-nest"
             headers: { Authorization: "Bearer fsv1_bound_elsewhere" }
             status_code: [403]
             return_content: yes
@@ -228,7 +271,9 @@
 
         # (g) a front node
         - name: Enroll a WebSocket node (FCP answers an ingress)
-          include_tasks: "{{ _tasks }}/register_node.yml"
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
           vars:
             node_mode: freedom-ws
             node_name: "bright-harbor-lane"
@@ -239,19 +284,22 @@
               - _fcp_bootstrap.ingress.routes | length == 1
               - _fcp_bootstrap.ingress.routes[0].path == '/ws'
               - _fcp_bootstrap.ingress.routes[0].port == 8443
-            success_msg: "front node: origin hostname and routes from FCP."
+              - _fcp_bootstrap.firewall | map(attribute='port') | list == [443]
+            success_msg: "front node: origin hostname and routes from FCP; its Caddy's port is listed, the loopback one is not."
 
         # (h) blocked while verifying the machine
         - name: Scenario blocked_later
           uri:
-            url: "http://127.0.0.1:{{ _port }}/__scenario"
+            url: "{{ _mock }}/__scenario"
             method: POST
             body_format: json
             body: { name: blocked_later }
         - name: A node blocked after the applied report must stop the play
           block:
             - name: Report applied for the WebSocket node
-              include_tasks: "{{ _tasks }}/applied.yml"
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/applied.yml
               vars:
                 node_mode: freedom-ws
                 node_name: "bright-harbor-lane"
@@ -265,6 +313,411 @@
                 that:
                   - "'servers.node_offline' in (ansible_failed_result.msg | default(''))"
                 success_msg: "blocked while verifying: the play stops with FCP's code."
+        - name: Scenario plain
+          uri:
+            url: "{{ _mock }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: plain }
+
+        # (i) a port change staged after the bootstrap answer
+        - name: Run again for the direct node (bootstrap, firewall)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+        - name: Let in what the bootstrap answer lists
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/firewall/main.yml
+          vars:
+            _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+            fcp_firewall_assume_open: false
+        - name: An admin stages a port change (443 -> 8443)
+          uri:
+            url: "{{ _mock }}/__port_change"
+            method: POST
+            body_format: json
+            body: { slug: panel-a, name: quiet-falcon-nest, port: 8443 }
+            return_content: yes
+          register: _change
+        - name: Report applied, nothing vouched for
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
+          vars:
+            fcp_firewall_assume_open: false
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the report said nothing and the change waits
+          assert:
+            that:
+              - _fcp_report_view.json.firewall.ports | selectattr('reason', 'equalto', 'pending') | map(attribute='port') | list == [8443]
+              - _state.json.applied_reports[-1].firewall is none
+              - (_state.json.port_changes | selectattr('id', 'equalto', _change.json.id) | first).state == 'waiting'
+              - _state.json.confirmations | length == 0
+            success_msg: "no vouching, no claim: the change keeps waiting."
+
+        - name: The next run (bootstrap)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+        - name: Let in what the bootstrap answer lists (8443 pending)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/firewall/main.yml
+          vars:
+            _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+        - name: Report applied
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
+        - name: Report the same revision again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the change was confirmed once, by this node's report
+          assert:
+            that:
+              - _state.json.applied_reports[-2].firewall == [443, 8443]
+              - _state.json.applied_reports[-1].firewall == [443, 8443]
+              - (_state.json.port_changes | selectattr('id', 'equalto', _change.json.id) | first).state == 'confirmed'
+              - _state.json.confirmations | length == 1
+              - _state.json.confirmations[0].port == 8443
+              - _fw_reported_ports == [443, 8443]
+            success_msg: "the pending port is reported and confirmed; a re-report is idempotent."
+
+        # (j) the change was sent
+        - name: FCP sends the change
+          uri:
+            url: "{{ _mock }}/__settle"
+            method: POST
+            body_format: json
+            body: { id: "{{ _change.json.id }}" }
+        - name: The next run (bootstrap)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+        - name: Let in what the bootstrap answer lists
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/firewall/main.yml
+          vars:
+            _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+        - name: Report applied
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the run reports the new port only
+          assert:
+            that:
+              - "_fcp_bootstrap.firewall == [{'port': 8443, 'protocol': 'tcp', 'reason': 'serving'}]"
+              - _state.json.applied_reports[-1].firewall == [8443]
+            success_msg: "after the change, 8443 serves and is reported."
+
+        # (k) a malformed firewall report
+        - name: Report a firewall FCP cannot use
+          uri:
+            url: "{{ _node_url }}/quiet-falcon-nest/applied"
+            method: POST
+            headers: { Authorization: "Bearer {{ fcp_api_token }}" }
+            body_format: json
+            body: "{{ item }}"
+            status_code: [400]
+            return_content: yes
+          register: _bad
+          loop:
+            - { appliedRevision: 1, nodeStarted: true, firewall: { ports: [{ port: 8443, protocol: udp }] } }
+            - { appliedRevision: 1, nodeStarted: true, firewall: { ports: [{ port: 0, protocol: tcp }] } }
+            - { appliedRevision: 1, nodeStarted: true, firewall: {} }
+        - name: Assert each was refused as a validation error
+          assert:
+            that:
+              - _bad.results | map(attribute='json.error.code') | unique | list == ['validation']
+
+        # (l) an FCP that predates the firewall acknowledgement
+        - name: Scenario old_fcp
+          uri:
+            url: "{{ _mock }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: old_fcp }
+        - name: A run against it (bootstrap)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+        - name: Start this run without an earlier firewall pass (as a fresh run would)
+          set_fact:
+            _fw_report: null
+        - name: Report applied
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert no list and no claim
+          assert:
+            that:
+              - _fcp_bootstrap.firewall is none
+              - _state.json.applied_reports[-1].firewall is none
+            success_msg: "an older FCP: the role leaves the firewall alone and claims nothing."
+        - name: Scenario plain
+          uri:
+            url: "{{ _mock }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: plain }
+
+        # (m) the status gate
+        - name: The gate on a healthy node
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/status_gate.yml
+          vars:
+            _fcp_gate_slug: panel-a
+        - name: Assert the gate passed
+          assert:
+            that:
+              - _fcp_gate_problems == []
+              - _fcp_gate_view.json.stage == 'machine_ready'
+
+        - name: An admin stages another port change, not reported yet
+          uri:
+            url: "{{ _mock }}/__port_change"
+            method: POST
+            body_format: json
+            body: { slug: panel-a, name: quiet-falcon-nest, port: 9443 }
+        - name: The gate with a change waiting on the node
+          block:
+            - name: Gate
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/status_gate.yml
+              vars:
+                _fcp_gate_slug: panel-a
+            - name: (m) Unreached
+              assert:
+                that: [false]
+                fail_msg: "The gate passed a node a port change waits on."
+          rescue:
+            - name: Assert the gate named the waiting port
+              assert:
+                that:
+                  - "'a port change waits on this node for 9443' in (ansible_failed_result.msg | default(''))"
+                success_msg: "the gate fails on a port change waiting on the node."
+
+        - name: Scenario not_ready
+          uri:
+            url: "{{ _mock }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: not_ready }
+        - name: A node FCP never finds ready
+          block:
+            - name: Enroll, bootstrap
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/register_node.yml
+              vars:
+                node_name: "still-water-ridge"
+            - name: Let in what FCP lists
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/firewall/main.yml
+              vars:
+                _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+                node_name: "still-water-ridge"
+            - name: Report applied without waiting
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/applied.yml
+              vars:
+                node_name: "still-water-ridge"
+                fcp_wait_machine_ready: false
+            - name: Gate
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: providers/fcp/status_gate.yml
+              vars:
+                _fcp_gate_slug: panel-a
+                node_name: "still-water-ridge"
+            - name: (m2) Unreached
+              assert:
+                that: [false]
+                fail_msg: "The gate passed a node that never reached machine_ready."
+          rescue:
+            - name: Assert the gate named the stage
+              assert:
+                that:
+                  - "'stage machine_applied (not yet machine_ready)' in (ansible_failed_result.msg | default(''))"
+                success_msg: "the gate fails on a node short of machine_ready."
+        - name: Scenario plain
+          uri:
+            url: "{{ _mock }}/__scenario"
+            method: POST
+            body_format: json
+            body: { name: plain }
+
+        # (n) FCP's scope rules on the node role's routes
+        - name: Mint the tokens
+          uri:
+            url: "{{ _mock }}/__mint"
+            method: POST
+            body_format: json
+            body: "{{ item }}"
+          loop:
+            - { token: "fsv1_fleet_write", scopes: ["admin:servers:write"] }
+            - { token: "fsv1_manage_only", scopes: ["admin:servers:manage"] }
+            - token: "fsv1_register_other_node"
+              scopes: ["admin:edges:register"]
+              boundary: { backendSlugs: ["panel-a"], nodeNames: ["some-other-node"] }
+            - { token: "fsv1_read_only", scopes: ["admin:servers:read"] }
+        - name: A write-only fleet token reads the view
+          uri:
+            url: "{{ _node_url }}/quiet-falcon-nest"
+            headers: { Authorization: "Bearer fsv1_fleet_write" }
+            status_code: [200]
+        - name: A manage-only token on every verb
+          uri:
+            url: "{{ _node_url }}/quiet-falcon-nest{{ item.verb }}"
+            method: "{{ item.method }}"
+            headers: { Authorization: "Bearer fsv1_manage_only" }
+            body_format: json
+            body: "{{ item.body | default({}) }}"
+            status_code: [403]
+            return_content: yes
+          register: _manage
+          loop:
+            - { method: GET, verb: "" }
+            - method: PUT
+              verb: ""
+              body: { roleContractVersion: 2, mode: privacy-reality, observed: { management: { address: "192.0.2.1", port: 2222 } } }
+            - { method: POST, verb: "/bootstrap" }
+            - { method: POST, verb: "/applied", body: { appliedRevision: 1, nodeStarted: true } }
+            - { method: POST, verb: "/wiped" }
+            - { method: DELETE, verb: "" }
+        - name: A register token outside its node names
+          uri:
+            url: "{{ _node_url }}/quiet-falcon-nest"
+            headers: { Authorization: "Bearer fsv1_register_other_node" }
+            status_code: [403]
+            return_content: yes
+          register: _other_node
+        - name: A read-only token writes
+          uri:
+            url: "{{ _node_url }}/quiet-falcon-nest/bootstrap"
+            method: POST
+            headers: { Authorization: "Bearer fsv1_read_only" }
+            body_format: json
+            body: {}
+            status_code: [401]
+        - name: Assert the scope rules
+          assert:
+            that:
+              - _manage.results | map(attribute='json.error.code') | unique | list == ['servers.registration_boundary']
+              - _other_node.json.error.code == 'servers.registration_boundary'
+            success_msg: "write reads; manage alone reaches no node, not even its secret; boundaries hold."
+
+        # (o) a renamed node, a token spanning several backends
+        - name: Mint a register token spanning two backends
+          uri:
+            url: "{{ _mock }}/__mint"
+            method: POST
+            body_format: json
+            body:
+              token: "fsv1_two_backends"
+              scopes: ["admin:edges:register"]
+              boundary: { backendSlugs: ["panel-a", "panel-b"], nodeNames: ["amber-meadow-gate"] }
+        - name: Its machine
+          file:
+            path: "{{ playbook_dir }}/.reg-two"
+            state: directory
+        - name: Enroll the node with that token
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+          vars:
+            fcp_api_token: "fsv1_two_backends"
+            node_name: "amber-meadow-gate"
+            remnawave_node_install_dir: "{{ playbook_dir }}/.reg-two"
+        - name: An admin renames it
+          uri:
+            url: "{{ _mock }}/__rename"
+            method: POST
+            body_format: json
+            body: { slug: panel-a, from: amber-meadow-gate, to: steady-cedar-path }
+        - name: A run under the old name with that token
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+          vars:
+            fcp_api_token: "fsv1_two_backends"
+            node_name: "amber-meadow-gate"
+            remnawave_node_install_dir: "{{ playbook_dir }}/.reg-two"
+        - name: Assert the run went on under the old name
+          assert:
+            that:
+              - _fcp_node_url is search('/by-name/amber-meadow-gate$')
+              - _fcp_rename_bounded | bool
+              - _fcp_view.json.name == 'steady-cedar-path'
+              - not (lookup('file', playbook_dir ~ '/.reg-two/.node_former_names', errors='ignore') | default('', true) | length > 0)
+              - _fcp_bootstrap.machineRevision | int == 1
+            success_msg: "a token confined to the old name keeps acting under it."
+
+        # (p) a node FCP renamed (last: the run sets node_name to the new name)
+        - name: An admin renames the direct node
+          uri:
+            url: "{{ _mock }}/__rename"
+            method: POST
+            body_format: json
+            body: { slug: panel-a, from: quiet-falcon-nest, to: calm-river-delta }
+        - name: A run under the old name
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+          vars:
+            node_name: "quiet-falcon-nest"
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the run followed the rename
+          assert:
+            that:
+              - _fcp_node_url is search('/by-name/calm-river-delta$')
+              - lookup('file', remnawave_node_install_dir ~ '/.node_name') | trim == 'calm-river-delta'
+              - "'quiet-falcon-nest' in lookup('file', remnawave_node_install_dir ~ '/.node_former_names')"
+              - (_state.json.requests | selectattr('path', 'search', '/bootstrap$') | list | last).path is search('/calm-river-delta/bootstrap$')
+              - _fcp_view.json.name == 'calm-river-delta'
+            success_msg: "renamed: the run goes on under the new name, the machine carries it."
+
+        # (q) the deleted edges routes
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the role never called an edges route
+          assert:
+            that:
+              - _state.json.requests | selectattr('path', 'search', '^/api/v1/admin/edges') | list | length == 0
+            success_msg: "nothing under /api/v1/admin/edges/ was ever called."
       always:
         - name: Stop the mock
           shell: "pkill -f '[m]ock_fcp.py {{ _port }}' || true"
@@ -275,3 +728,4 @@
           loop:
             - "{{ remnawave_node_install_dir }}"
             - "{{ playbook_dir }}/.reg-typo"
+            - "{{ playbook_dir }}/.reg-two"

@@ -1,16 +1,19 @@
 ---
 # tasks/providers/fcp/status_gate.yml
 #
-# Post-deploy health gate (opt-in via fcp_status_gate): poll FCP's shared
-# status endpoint until THIS backend row reports healthy. Complements the
-# test-connection probe: that proves FCP *can* reach the backend on demand;
-# this proves FCP's own healthcheck CRON has observed it (the same freshness
-# signal issuance's pool scoring uses). The cron runs every ~10 minutes, so a
-# fresh registration can legitimately take that long to turn healthy — the
-# defaults poll for up to ~15 min.
+# Post-deploy health gate (opt-in via fcp_status_gate), in two parts:
 #
-# Scope: admin:status:read (add it to the fsv1_ token when enabling the gate).
-# The caller passes _fcp_gate_slug (the backend-servers slug to wait for).
+#   1. THIS node, from its own view (GET {slug}/nodes/by-name/{name}, the role's
+#      token): nothing blocked (no registration code), not retiring, the applied
+#      revision the current machine revision, the stage at machine_ready or past
+#      it, and no port change waiting on this node that this run did not report.
+#      A healthy backend row says nothing about a node, so this comes first.
+#   2. The backend row in FCP's shared status (GET /api/v1/admin/status, which
+#      needs admin:status:read on the token too): FCP's healthcheck cron has seen
+#      the backend healthy. The cron runs every ~10 minutes, so the defaults poll
+#      for up to ~15 min.
+#
+# The caller passes _fcp_gate_slug (the backend server's slug).
 
 - name: Validate FCP status-gate prerequisites
   assert:
@@ -18,10 +21,85 @@
       - fcp_api_url is defined and fcp_api_url | length > 0
       - fcp_api_token is defined and fcp_api_token | length > 0
       - _fcp_gate_slug is defined and _fcp_gate_slug | length > 0
+      - _fcp_node_url is defined
     fail_msg: >-
       The FCP status gate requires fcp_api_url, fcp_api_token (with
-      admin:status:read), and _fcp_gate_slug from the caller.
+      admin:status:read), _fcp_gate_slug from the caller, and a node the run
+      enrolled.
   no_log: true
+
+# --- 1. the node -------------------------------------------------------------------
+
+- name: Wait for this node to settle in FCP's view
+  uri:
+    url: "{{ _fcp_node_url }}"
+    method: GET
+    headers: "{{ _fcp_headers }}"
+    status_code: [200]
+    return_content: yes
+    timeout: 30
+  register: _fcp_gate_view
+  delegate_to: localhost
+  no_log: true
+  failed_when: false
+  # Retries running out may fail the task whatever failed_when says (it depends
+  # on the ansible-core release): the next steps say what keeps the node from
+  # healthy either way.
+  ignore_errors: true
+  retries: "{{ fcp_status_gate_retries | default(45) }}"
+  delay: "{{ fcp_status_gate_delay | default(20) }}"
+  until: >-
+    _fcp_gate_view.status | default(0) == 200 and (
+      _fcp_gate_view.json.registration.state != 'ready'
+      or _fcp_gate_view.json.registration.code is not none
+      or _fcp_gate_view.json.retirement is not none
+      or (_fcp_gate_view.json.stage not in ['registered', 'bootstrap_available', 'machine_applied']
+          and _fcp_gate_view.json.appliedRevision == _fcp_gate_view.json.machineRevision))
+
+- name: Take the node's view
+  set_fact:
+    _fcp_gate_v: "{{ _fcp_gate_view.json | default({}) if (_fcp_gate_view.status | default(0)) == 200 else {} }}"
+
+- name: Take the ports a change waits for that this run did not report
+  set_fact:
+    _fcp_gate_waiting: >-
+      {{ (_fcp_gate_v.firewall.ports | default([]) | selectattr('reason', 'equalto', 'pending')
+          | map(attribute='port') | map('int') | list)
+         | difference(_fw_reported_ports | default([])) | sort }}
+
+- name: Work out what keeps the node from healthy
+  set_fact:
+    _fcp_gate_problems: >-
+      {{ ([('FCP answered HTTP ' ~ (_fcp_gate_view.status | default('unreachable')))]
+            if (_fcp_gate_view.status | default(0)) != 200 else [])
+         + ([('registration ' ~ _fcp_gate_v.registration.state
+              ~ ((': ' ~ _fcp_gate_v.registration.code) if _fcp_gate_v.registration.code else ''))]
+            if (_fcp_gate_v.registration is defined
+                and (_fcp_gate_v.registration.state != 'ready' or _fcp_gate_v.registration.code)) else [])
+         + ([('retirement ' ~ _fcp_gate_v.retirement.stage)]
+            if (_fcp_gate_v.retirement | default(none)) is not none else [])
+         + ([('applied revision ' ~ _fcp_gate_v.appliedRevision ~ ', machine revision ' ~ _fcp_gate_v.machineRevision)]
+            if (_fcp_gate_v.machineRevision is defined
+                and _fcp_gate_v.appliedRevision != _fcp_gate_v.machineRevision) else [])
+         + ([('stage ' ~ _fcp_gate_v.stage ~ ' (not yet machine_ready)')]
+            if (_fcp_gate_v.stage is defined
+                and _fcp_gate_v.stage in ['registered', 'bootstrap_available', 'machine_applied']) else [])
+         + ([('a port change waits on this node for ' ~ (_fcp_gate_waiting | join(', '))
+              ~ ', which this run did not report open')]
+            if _fcp_gate_waiting | length > 0 else []) }}
+
+- name: Fail closed on what the node's view says
+  fail:
+    msg: >-
+      FCP's view of {{ node_name }} is not healthy: {{ _fcp_gate_problems | join('; ') }}.
+      Look at the node in Admin -> Servers.
+  when: _fcp_gate_problems | length > 0
+
+- name: Note the node's gate
+  debug:
+    msg: "{{ node_name }}: stage {{ _fcp_gate_view.json.stage }}, revision {{ _fcp_gate_view.json.appliedRevision }}, delivery {{ _fcp_gate_view.json.delivery }}."
+
+# --- 2. the backend row -----------------------------------------------------------------
 
 - name: Wait for FCP to report this backend healthy (healthcheck cron ~10 min)
   uri:

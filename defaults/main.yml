@@ -18,9 +18,12 @@ operation_mode: ""
 
 # --- FCP ---------------------------------------------------------------------
 fcp_api_url: ""
-# An `fsv1_` token with admin:servers:write (the fleet token), or one with
-# admin:edges:register minted with a registration boundary for this backend
-# server and this node name (docs/edges.md "Node role contract"). Vault it.
+# An `fsv1_` token for the node's own routes (FCP docs/servers.md "Node
+# registration (contract v2)"): either the fleet token (admin:servers:write,
+# which reads the node's view too), or an admin:edges:register token minted
+# with a registration boundary (this backend server and, better, this node
+# name). admin:servers:manage is no role token: FCP bounds it like the register
+# scope, so on its own it never reaches the node secret. Vault it.
 fcp_api_token: ""
 # The panel's slug in FCP (Admin -> Backend servers).
 fcp_remnawave_panel_slug: "remnawave-primary"
@@ -31,10 +34,50 @@ fcp_registration_retries: 60
 fcp_registration_delay: 5
 # Wait for FCP to verify the machine after the applied report (machine_ready).
 fcp_wait_machine_ready: true
-# Optional: poll GET /api/v1/admin/status until healthy at the end (admin:status:read).
+# Optional, at the end of a run: wait until the node's own view is healthy
+# (machine_ready or later, the applied revision current, nothing blocked or
+# retiring, no port change waiting on this node), then until the backend row is
+# healthy in GET /api/v1/admin/status (that part needs admin:status:read too).
 fcp_status_gate: false
 fcp_status_gate_retries: 45
 fcp_status_gate_delay: 20
+
+# --- the firewall (FCP docs/servers.md "Firewall acknowledgement") -------------
+# FCP moves a transport to another port only once every node serving it says
+# its firewall lets the new port in. On every deploy/update run the role lets
+# in each port FCP lists for this node (TCP, from anywhere) before it reports,
+# and tells FCP which ports are open.
+#
+# Where the role keeps its rules. It owns ONE object there and never touches
+# anything else: never a rule of yours, never a default policy, never enabling
+# or reloading a firewall that is off.
+#   auto       firewalld if it runs, else ufw if it is active, else nftables if
+#              nftables.service is active, else none
+#   ufw        an application profile `freesocks-fcp` and the one rule allowing it
+#   firewalld  a service `freesocks-fcp` in fcp_firewall_firewalld_zone (a change
+#              to it reloads firewalld)
+#   nftables   a set `freesocks_fcp` in fcp_firewall_nftables_file, which YOUR
+#              ruleset includes inside the table of its input chain and lets in:
+#                include "/etc/nftables.d/freesocks-fcp.nft"
+#                tcp dport @freesocks_fcp accept
+#   none       the role writes no rule
+fcp_firewall_backend: auto
+# What you vouch is open that the role did not open itself: `true` (every port
+# FCP lists), a list of ports, or `false`. With `none` (or nothing found by
+# `auto`) the role reports only these: a firewall it cannot see, such as a
+# provider's, may still drop the rest, so a port change waits on this node
+# until you say so.
+fcp_firewall_assume_open: false
+# A firewall in front of the machine that the role cannot reach (a cloud
+# provider's security group) filters it too. The role still opens its own
+# rules, but reports only what fcp_firewall_assume_open vouches for.
+fcp_firewall_provider_filter: false
+# Never closed on the role's account, even once FCP stops listing them: SSH
+# (22 and ansible_port) and the node API port are always kept; add more here.
+fcp_firewall_protected_ports: []
+fcp_firewall_firewalld_zone: ""          # empty = the default zone
+fcp_firewall_nftables_table: "inet filter"
+fcp_firewall_nftables_file: "/etc/nftables.d/freesocks-fcp.nft"
 
 # --- the node ------------------------------------------------------------------
 # The connection MODE this node serves: one of the modes the backend was set up

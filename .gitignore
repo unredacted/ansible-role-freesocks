@@ -10,5 +10,8 @@ HANDOFF-cdn-transports.md
 
 # Offline test scratch (tests/run.sh cleans these up; belt and braces)
 tests/.reg/
+tests/.reg-*/
+tests/.fw/
+tests/.identity-*/
 tests/.caddyfile.rendered
 tests/.compose.rendered
