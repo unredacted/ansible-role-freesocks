@@ -103,6 +103,10 @@ fcp_legacy_purpose_modes:
 # the first FCP call, so a run that stops halfway resumes against the same node.
 node_name: ""
 node_name_word_count: 3
+# The machine's own name, sent at enrollment so FCP shows operators which
+# machine a node is (Admin -> Servers, next to the node; the Nodes filter
+# matches it). Operator-only: members only ever see node_name. Empty = not sent.
+node_machine_name: "{{ inventory_hostname }}"
 # The DNS label of a managed origin name (front nodes). Empty = derived from the name.
 node_label: ""
 # The country is FCP's (the node's Settings in Admin -> Servers), not reported here.

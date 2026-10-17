@@ -54,6 +54,7 @@
     fcp_firewall_assume_open: true
     node_mode: privacy-reality
     node_name: "quiet-falcon-nest"
+    node_machine_name: "machine-1.example.org"
     node_label: ""
     node_origin_hostname: ""
     node_publish_ipv6: false
@@ -128,7 +129,8 @@
               - lookup('file', remnawave_node_install_dir ~ '/.applied_revision') | trim == '1'
               - lookup('file', remnawave_node_install_dir ~ '/.node_mode') | trim == 'privacy-reality'
               - _state.json.applied_reports[-1].firewall == [443]
-            success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine, 443 reported."
+              - _state.json.put_bodies[-1].machineName == 'machine-1.example.org'
+            success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine, 443 reported, the machine name sent."
 
         # (b) observations only on a rerun
         - name: Enroll again (observations)

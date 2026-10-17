@@ -41,7 +41,8 @@
              'publicIps': {'v4': _public_v4} | combine({'v6': _public_v6} if (_public_v6 | length > 0) else {}),
              'capabilities': {'caddy': true, 'ipv6': _public_v6 | length > 0},
            },
-         } | combine({'label': node_label} if (node_label | length > 0) else {}) }}
+         } | combine({'label': node_label} if (node_label | length > 0) else {})
+           | combine({'machineName': node_machine_name} if (node_machine_name | default('') | length > 0) else {}) }}
 
 - name: Enroll the node (or report this run's observations)
   uri:

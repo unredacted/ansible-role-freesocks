@@ -141,6 +141,7 @@ A role that predates this release sends no `firewall` in its applied report, and
 | `node_mode`                           | persisted              | The connection mode it serves (set up in FCP); taken at the first deploy   |
 | `fcp_legacy_purpose_modes`            | the built-in modes     | The mode a machine's `direct`/`front`/`relay` purpose becomes              |
 | `node_name`                           | generated              | The panel node name (3 to 30 plain characters); persisted in `.node_name` |
+| `node_machine_name`                   | `inventory_hostname`   | Sent at enrollment so FCP shows operators which machine a node is; never shown to members; empty = not sent |
 | `node_label`                          | from the name          | The DNS label of a managed origin name (WebSocket)                        |
 | `node_address_interface`              |                        | The interface whose address the panel dials (e.g. `tailscale0`)           |
 | `node_management_address`             |                        | Or the name the panel dials                                               |
