@@ -94,6 +94,7 @@ STATE = {
     "port_changes": [],  # [{id, key, port, state: waiting|confirmed|settled}]
     "applied_reports": [],  # [{name, firewall}]
     "confirmations": [],  # [{id, name, port}]
+    "put_bodies": [],  # [{name, machineName}] (what each enrollment PUT carried)
 }
 
 
@@ -283,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
         mgmt = obs.get("management") or {}
         if not mgmt.get("address") or not isinstance(mgmt.get("port"), int):
             return self._error(400, "validation", "observed.management")
+        STATE["put_bodies"].append({"name": name, "machineName": body.get("machineName")})
         i, key = _find(slug, name)
         if i:
             if i["mode"]["slug"] != body.get("mode"):
