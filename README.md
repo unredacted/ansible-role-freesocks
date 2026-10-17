@@ -109,9 +109,11 @@ table inet filter {
 }
 ```
 
-An explicit `nftables` whose ruleset does not use the set stops the run and says how to wire it; under `auto` the role reports nothing for it instead.
+The set counts as wired only when a chain on the input hook of that table holds exactly `tcp dport @freesocks_fcp accept` (a counter allowed); a mention anywhere else (a drop, a chain off the hook) does not. An explicit `nftables` whose ruleset does not use the set stops the run and says how to wire it; under `auto` the role reports nothing for it instead.
 
 **Closing.** A port FCP no longer lists (the old port once a change is sent) leaves the role's object. SSH (22 and `ansible_port`), the node API port and `fcp_firewall_protected_ports` never do, and an empty list from FCP is taken as a gap, not as "close everything". `wipe` empties the object (protected ports kept).
+
+**Switching backends.** The machine records which backends hold the role's rules (`/opt/remnanode/.firewall_backends`). When the backend changes (you set another, or `auto` now finds another firewall), the object in the old one is pruned on every run as FCP stops listing its ports, never added to, and forgotten once empty; `wipe` empties it too. A stopped firewalld is remembered and pruned once it runs again.
 
 **What the report claims.** A listed port is reported open when the role's own rule took effect, or when you vouch for it (`fcp_firewall_assume_open`). With `none` (or nothing found by `auto`) the role opened nothing, and a firewall it cannot see, such as a provider's, may still drop a port: it reports only what you vouch for, and otherwise leaves `firewall` out of the report and says that the change waits on this node. Behind a provider firewall that filters (a cloud security group) set `fcp_firewall_provider_filter: true`: the role still opens its own rules but reports only what `fcp_firewall_assume_open` vouches for. A change staged while a run reports waits for the next run, which the run says.
 
@@ -158,7 +160,7 @@ A role that predates this release sends no `firewall` in its applied report, and
 
 ## What the role writes on the machine
 
-`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
+`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
 
 ## Testing
 

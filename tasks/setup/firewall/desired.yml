@@ -7,6 +7,8 @@
 #     listed or not: the role never closes those on FCP's account;
 #   - an EMPTY list is not "close everything" (a node always serves something,
 #     so it is a gap in what FCP knows): the object is kept as it is;
+#   - in a backend the role no longer uses (_fw_prune_only, setup/firewall/
+#     retire.yml) nothing is added: a port leaves once FCP stops listing it;
 #   - on a wipe (_fw_wipe) only the protected ports stay.
 
 - name: Work out the ports the role's rules should let in
@@ -15,6 +17,8 @@
       {{ ((_fw_owned_before | intersect(_fw_protected))
             if (_fw_wipe | default(false) | bool)
           else _fw_owned_before if (_fw_listed_ports | length == 0)
+          else (_fw_owned_before | intersect(_fw_listed_ports | union(_fw_protected)))
+            if (_fw_prune_only | default(false) | bool)
           else (_fw_listed_ports | union(_fw_owned_before | intersect(_fw_protected))))
          | map('int') | unique | sort }}
 
@@ -23,7 +27,7 @@
     _fw_closing: "{{ _fw_owned_before | difference(_fw_desired) | sort }}"
     _fw_kept_protected: >-
       {{ _fw_desired | difference(_fw_listed_ports) | intersect(_fw_protected) | sort
-         if (_fw_listed_ports | length > 0) else [] }}
+         if (_fw_listed_ports | length > 0 and not (_fw_prune_only | default(false) | bool)) else [] }}
 
 - name: Note an empty list from FCP
   debug:
@@ -38,7 +42,7 @@
 - name: Note the ports FCP no longer lists
   debug:
     msg: >-
-      {% if _fw_closing %}No longer let in for FCP: {{ _fw_closing | join(', ') }}. {% endif %}
+      {% if _fw_closing %}No longer let in for FCP{{ (" by the role's " ~ (_fw_old_backend | default('')) ~ " rules") if (_fw_prune_only | default(false) | bool) else '' }}: {{ _fw_closing | join(', ') }}. {% endif %}
       {%- if _fw_kept_protected %}Kept although FCP does not list them (SSH, the node API
       port or fcp_firewall_protected_ports): {{ _fw_kept_protected | join(', ') }}.{% endif %}
   when: (_fw_closing | length > 0) or (_fw_kept_protected | length > 0)

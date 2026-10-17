@@ -1,0 +1,76 @@
+---
+# tasks/setup/firewall/retire.yml - the role's object in a backend it no
+# longer uses (fcp_firewall_backend changed, or `auto` now finds another
+# firewall). Left as it was, a port FCP stops listing would stay let in there
+# and come back whenever that firewall is in force again. So it is pruned like
+# the current one, but never added to: a port leaves once FCP stops listing it
+# (protected ports stay), and once nothing is left the backend is forgotten.
+# A wipe empties it like the current one.
+#
+# Loop var: _fw_old_backend. Appends to _fw_held_after the backends that still
+# hold something of the role's, and to _fw_changed_any.
+
+- name: Can the role reach its {{ _fw_old_backend }} rules
+  command: "{{ {'ufw': 'ufw status', 'firewalld': 'firewall-cmd --state', 'nftables': 'nft --version'}[_fw_old_backend] }}"
+  register: _fw_old_probe
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+# A ufw or nft that cannot be run any more enforces nothing of the role's.
+- name: Forget a backend that is gone
+  debug:
+    msg: >-
+      The role kept rules in {{ _fw_old_backend }}, which can no longer be run
+      here: nothing of the role's is in force there, and it is forgotten.
+  when:
+    - (_fw_old_probe.rc | default(1)) != 0
+    - _fw_old_backend != 'firewalld'
+
+# A stopped firewalld loads its permanent configuration when it starts, the
+# role's service with it: kept, and pruned once firewalld runs again.
+- name: Keep a stopped firewalld for later
+  when:
+    - (_fw_old_probe.rc | default(1)) != 0
+    - _fw_old_backend == 'firewalld'
+  block:
+    - name: Remember it
+      set_fact:
+        _fw_held_after: "{{ _fw_held_after + ['firewalld'] }}"
+
+    - name: Note it
+      debug:
+        msg: >-
+          The role kept a firewalld service, and firewalld is not running: the
+          role prunes it the next time a run finds firewalld running.
+
+- name: Prune the role's rules there
+  when: (_fw_old_probe.rc | default(1)) == 0
+  block:
+    - name: Prune the role's {{ _fw_old_backend }} rules
+      include_tasks: "setup/firewall/{{ _fw_old_backend }}.yml"
+      vars:
+        _fw_prune_only: true
+
+    - name: Remember a backend that still holds something
+      set_fact:
+        _fw_held_after: "{{ _fw_held_after + ([_fw_old_backend] if (_fw_desired | length > 0) else []) }}"
+        _fw_changed_any: "{{ (_fw_changed_any | bool) or (_fw_changed | bool) }}"
+
+    - name: Note what the old backend still holds
+      debug:
+        msg: >-
+          The role no longer keeps its rules in {{ _fw_old_backend }} (it uses
+          {{ _fw_backend }}). {{ ('What it left there still lets in ' ~ (_fw_desired | join(', '))
+          ~ ', until FCP stops listing it.') if (_fw_desired | length > 0)
+          else "Nothing of the role's is left there." }}
+  rescue:
+    - name: Remember it, to prune it on a later run
+      set_fact:
+        _fw_held_after: "{{ _fw_held_after + [_fw_old_backend] }}"
+
+    - name: Note the failure
+      debug:
+        msg: >-
+          The role could not prune its rules in {{ _fw_old_backend }}
+          ({{ ansible_failed_result.msg | default('unknown') }}): a later run tries again.

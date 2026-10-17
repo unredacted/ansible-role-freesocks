@@ -6,7 +6,10 @@
 #
 # The role keeps ONE object in the host firewall (fcp_firewall_backend) and
 # never touches anything else. A port it let in earlier that FCP no longer lists
-# leaves that object; SSH and the node API port never do (_fw_protected).
+# leaves that object; SSH and the node API port never do (_fw_protected). The
+# backends that hold something of the role's are recorded on the machine
+# (.firewall_backends), so an object left in a backend the role no longer uses
+# is pruned too (setup/firewall/retire.yml).
 #
 # Include vars:
 #   _fw_listed   FCP's `firewall.ports` ([{port, protocol, reason}])
@@ -49,9 +52,62 @@
 - name: Resolve the firewall backend
   include_tasks: setup/firewall/detect.yml
 
+- name: Read which backends hold the role's rules
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.firewall_backends"
+  register: _fw_marker
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take them
+  set_fact:
+    _fw_held_before: >-
+      {{ (_fw_marker.content | default('') | b64decode).splitlines() | map('trim')
+         | select('in', ['ufw', 'firewalld', 'nftables']) | unique | list }}
+    _fw_held_after: []
+    _fw_changed_any: false
+
+- name: Prune the role's rules in a backend it no longer uses
+  include_tasks: setup/firewall/retire.yml
+  loop: "{{ _fw_held_before | difference([_fw_backend]) }}"
+  loop_control:
+    loop_var: _fw_old_backend
+
+- name: Start the selected backend from a clean slate
+  set_fact:
+    _fw_owned_before: []
+    _fw_desired: []
+    _fw_open: []
+    _fw_effective: false
+    _fw_changed: false
+
 - name: Keep the role's rules in the host firewall
   include_tasks: "setup/firewall/{{ _fw_backend }}.yml"
   when: _fw_backend != 'none'
+
+- name: Take what this pass did
+  set_fact:
+    _fw_changed: "{{ (_fw_changed | bool) or (_fw_changed_any | bool) }}"
+    _fw_held_now: >-
+      {{ (_fw_held_after + ([_fw_backend] if (_fw_backend != 'none' and _fw_desired | length > 0) else []))
+         | unique | sort }}
+
+- name: Record which backends hold the role's rules
+  copy:
+    # Double-quoted: YAML turns each \n into a newline (a block scalar would
+    # hand Jinja the two characters).
+    content: "{{ _fw_held_now | join('\n') }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.firewall_backends"
+    mode: '0640'
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_held_now | length > 0
+
+- name: Forget the record once nothing is held
+  file:
+    path: "{{ remnawave_node_install_dir }}/.firewall_backends"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+  when: _fw_held_now | length == 0
 
 # --- what the report may claim -------------------------------------------------
 # A port is claimed when everything that could drop it is accounted for: the

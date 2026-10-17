@@ -71,11 +71,29 @@
   register: _fw_fwd_written
   become: "{{ _fcp_become | default(true) }}"
 
-- name: Load the role's service (a new or changed definition)
+# What firewalld runs, not only what the file says: a run that wrote the file
+# and stopped before the reload (or a reload that failed) leaves the old
+# definition loaded, and the next run must still reload.
+- name: Read the service as firewalld runs it now
+  command: firewall-cmd --info-service=freesocks-fcp
+  register: _fw_fwd_info_before
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take the ports firewalld runs it with
+  set_fact:
+    _fw_fwd_loaded: >-
+      {{ ((_fw_fwd_info_before.stdout | default('') | regex_search('(?m)^ *ports:.*$') | default('', true)
+           | regex_replace('^ *ports:', '')).split(' '))
+         | select('match', '^[0-9]+/tcp$') | map('regex_replace', '/tcp$', '') | map('int') | unique | sort
+         if (_fw_fwd_info_before.rc | default(1)) == 0 else none }}
+
+- name: Load the role's service (a new, changed or not yet loaded definition)
   command: firewall-cmd --reload
   register: _fw_fwd_reload
   become: "{{ _fcp_become | default(true) }}"
-  when: _fw_fwd_written is changed
+  when: (_fw_fwd_written is changed) or (_fw_fwd_loaded != _fw_desired)
 
 - name: Is the service in the zone (permanent)
   command: firewall-cmd --permanent --zone={{ _fw_zone }} --query-service=freesocks-fcp
@@ -88,7 +106,9 @@
   command: firewall-cmd --permanent --zone={{ _fw_zone }} --add-service=freesocks-fcp
   register: _fw_fwd_perm_add
   become: "{{ _fcp_become | default(true) }}"
-  when: _fw_fwd_perm.rc == 1
+  when:
+    - _fw_fwd_perm.rc == 1
+    - not (_fw_prune_only | default(false) | bool)
 
 - name: Is the service in the zone (runtime)
   command: firewall-cmd --zone={{ _fw_zone }} --query-service=freesocks-fcp
@@ -101,7 +121,9 @@
   command: firewall-cmd --zone={{ _fw_zone }} --add-service=freesocks-fcp
   register: _fw_fwd_run_add
   become: "{{ _fcp_become | default(true) }}"
-  when: _fw_fwd_run.rc == 1
+  when:
+    - _fw_fwd_run.rc == 1
+    - not (_fw_prune_only | default(false) | bool)
 
 # --- read back -------------------------------------------------------------------
 

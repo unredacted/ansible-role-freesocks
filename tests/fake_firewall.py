@@ -15,7 +15,8 @@ State:
                (`dir` holds applications.d/ and user.rules, as /etc/ufw does)
   firewalld    {running, default_zone, dir, known: {service: [ports]},
                 permanent: {zone: {services, ports}}, runtime: {...}}
-  nft          {tables: {"inet filter": {sets: {name: [ports]}, rules: [text]}}}
+  nft          {tables: {"inet filter": {sets: {name: [ports]},
+                chains: [{name, hook?, type?, rules: [text]}]}}}
 
 Usage: fake_firewall.py <tool> [args...]
 """
@@ -176,6 +177,8 @@ def firewall_cmd(state, args):
     if args == ["--get-default-zone"]:
         out(f["default_zone"])
     if args == ["--reload"]:
+        if f.get("fail_reload"):
+            out(err="Error: COMMAND_FAILED", rc=1)
         try:
             f["known"] = {**f.get("builtin", {}), **firewalld_load_services(f)}
         except Exception as e:  # noqa: BLE001 - firewalld refuses the reload
@@ -234,6 +237,38 @@ def nft_check_set_file(path):
     return [int(p) for p in m.group(1).split(", ")] if m.group(1) else []
 
 
+def nft_rule_expr(text):
+    """A rule as `nft -j` lists it, for the few forms the tests write."""
+    m = re.match(r"^tcp dport (\S+)( counter)? (accept|drop)$", text)
+    if not m:
+        return [{"xt": {"text": text}}]
+    right = m.group(1) if m.group(1).startswith("@") else int(m.group(1))
+    expr = [{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": right}}]
+    if m.group(2):
+        expr.append({"counter": {"packets": 0, "bytes": 0}})
+    expr.append({m.group(3): None})
+    return expr
+
+
+def nft_list_table_json(table, t):
+    fam, name = table.split(" ")
+    items = [{"metainfo": {"version": "1.1.3", "json_schema_version": 1}}, {"table": {"family": fam, "name": name, "handle": 1}}]
+    for c in t.get("chains", []):
+        chain = {"family": fam, "table": name, "name": c["name"], "handle": 1}
+        if c.get("hook"):
+            chain.update({"type": c.get("type", "filter"), "hook": c["hook"], "prio": 0, "policy": "accept"})
+        items.append({"chain": chain})
+    for sname, elems in t.get("sets", {}).items():
+        s = {"family": fam, "name": sname, "table": name, "type": "inet_service", "handle": 3}
+        if elems:
+            s["elem"] = sorted(elems)
+        items.append({"set": s})
+    for c in t.get("chains", []):
+        for r in c.get("rules", []):
+            items.append({"rule": {"family": fam, "table": name, "chain": c["name"], "handle": 4, "expr": nft_rule_expr(r)}})
+    return {"nftables": items}
+
+
 def nft(state, args):
     n = state["nft"]
     stdin = sys.stdin.read() if args[-2:] == ["-f", "/dev/stdin"] else ""
@@ -271,12 +306,12 @@ def nft(state, args):
         if s:
             body["elem"] = sorted(s)
         out(json.dumps({"nftables": [{"metainfo": {"version": "1.0.9", "json_schema_version": 1}}, {"set": body}]}))
-    if len(args) == 4 and args[:2] == ["list", "table"]:
-        table = f"{args[2]} {args[3]}"
+    if len(args) == 5 and args[:3] == ["-j", "list", "table"]:
+        table = f"{args[3]} {args[4]}"
         t = n["tables"].get(table)
         if t is None:
             out(err="Error: No such file or directory", rc=1)
-        out(f"table {table} {{\n" + "\n".join("\t" + r for r in t.get("rules", [])) + "\n}")
+        out(json.dumps(nft_list_table_json(table, t)))
     out(err="fake nft: unsupported " + " ".join(args), rc=2)
 
 

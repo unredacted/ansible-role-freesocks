@@ -89,6 +89,7 @@
   when:
     - _fw_desired | length > 0
     - not (_fw_ufw_rule | bool)
+    - not (_fw_prune_only | default(false) | bool)
 
 # Also when a run stopped between writing the profile and this step.
 - name: Bring the role's rule to the profile

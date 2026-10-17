@@ -20,6 +20,14 @@
     - "{{ fcp_firewall_nftables_file }}"
   when: _case_state is defined
 
+- name: Start from a host whose role record is gone too
+  file:
+    path: "{{ remnawave_node_install_dir }}/.firewall_backends"
+    state: absent
+  when:
+    - _case_state is defined
+    - not (_keep_marker | default(false) | bool)
+
 - name: Write the fake host's state
   copy:
     content: "{{ _case_state | to_nice_json }}"
