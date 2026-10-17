@@ -153,7 +153,7 @@ A role that predates this release sends no `firewall` in its applied report, and
 | `fcp_status_gate`                     | `false`                | At the end, wait for the node's own view to be healthy, then the backend row (`admin:status:read`) |
 | `fcp_firewall_*`                      |                        | See [Firewall](#firewall)                                                  |
 | `fcp_registration_retries` / `_delay` | `60` / `5`             | Polling the node's view                                                   |
-| `remnawave_node_image`                | `remnawave/node:3.4.1` | The node container                                                        |
+| `remnawave_node_image`                | `remnawave/node:3.4.2` | The node container                                                        |
 | `remnawave_caddy_email`               |                        | ACME registration (a mode that runs Caddy)                                |
 | `remnawave_caddy_listen_port`         | `443`                  |                                                                           |
 | `remnawave_decoy_root`                | `/var/www/decoy`       |                                                                           |

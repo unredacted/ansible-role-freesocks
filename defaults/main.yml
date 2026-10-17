@@ -123,7 +123,7 @@ node_publish_ipv6: false
 node_origin_hostname: ""
 
 # --- the remnanode container ------------------------------------------------
-remnawave_node_image: "remnawave/node:3.4.1"
+remnawave_node_image: "remnawave/node:3.4.2"
 remnawave_node_install_dir: "/opt/remnanode"
 remnawave_log_dir: "/var/log/remnanode"
 # The 3.x node's nftables plugins log client IPs by default: kept OFF (no-log posture).
