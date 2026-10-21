@@ -133,6 +133,29 @@ No firewall rule the role writes logs anything (the no-log posture of `remnawave
 
 A role that predates this release sends no `firewall` in its applied report, and FCP confirms nothing from such a report. So **until every node serving a transport runs this release, an FCP port change on that transport waits**, and the Servers page ("Port changes") names the node it waits on. Run `deploy` (or `update`) with this release on those nodes before changing a port; a node no role runs (adopted) is confirmed by an admin on the Servers page. Against an FCP that predates the firewall acknowledgement (no `firewall` in its answers) the role leaves the host firewall alone and reports nothing about it.
 
+## Members' addresses
+
+A member's address never reaches the node's Xray. On a node whose mode runs Caddy, every route's `reverse_proxy` removes each request header in `remnawave_caddy_strip_request_headers` before the request goes to the loopback inbound, WebSocket upgrades included: Caddy proxies the upgrade request like any other and applies `header_up` to it. The default list holds every header an edge or a client may put the address in (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `True-Client-IP`, the edges' own client-IP headers, and the like). An edge strips what it can, but some add a header their own configuration cannot remove, so Caddy is the last place to drop it. A new name is one more line in the list; the render test fails if the default loses one it requires.
+
+`X-Forwarded-For` goes too, including the one Caddy sets itself (the edge server's address: the Caddyfile trusts no proxy), so Xray sees every member as `127.0.0.1`. `X-Forwarded-Proto`, `X-Forwarded-Host` and `Via` stay; they carry no address. The Caddyfile sets no `trusted_proxies` or `client_ip_headers`, and even with them nothing would pass: `header_up` runs after Caddy sets its `X-Forwarded-*` headers. Caddy itself still receives the headers (it ends TLS), and writes no access log on a node (the Caddyfile has no `log` directive).
+
+**Checking a node.** On the node, capture what reaches the transport's loopback port (the `reverse_proxy` port in `/etc/caddy/Caddyfile`, 8443 here):
+
+```sh
+tcpdump -i lo -A -s 0 -l 'tcp dst port 8443'
+```
+
+From another machine, send a WebSocket upgrade through the edge to the transport's path, with an address header of your own on top (192.0.2.1). curl prints `101`, then times out (it does not speak WebSocket):
+
+```sh
+curl -s --http1.1 --max-time 5 -o /dev/null -w '%{http_code}\n' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'X-Real-IP: 192.0.2.1' \
+  https://front.example.org/ws
+```
+
+The capture shows the `GET /ws` upgrade with `Host`, `Upgrade`, `Connection`, `Sec-WebSocket-*`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Via` and whatever the edge adds that carries no address, and no header with an address in it: not your public address, not 192.0.2.1, no `X-Forwarded-For`. A capture without the `GET` is on the wrong port.
+
 ## Variables
 
 | Variable                              | Default                | What                                                                      |
@@ -158,6 +181,7 @@ A role that predates this release sends no `firewall` in its applied report, and
 | `remnawave_caddy_email`               |                        | ACME registration (a mode that runs Caddy)                                |
 | `remnawave_caddy_listen_port`         | `443`                  |                                                                           |
 | `remnawave_decoy_root`                | `/var/www/decoy`       |                                                                           |
+| `remnawave_caddy_strip_request_headers` | the client-address headers | Request headers Caddy removes before a route reaches Xray, one name per line; see [Members' addresses](#members-addresses) |
 
 ## What the role writes on the machine
 
@@ -169,7 +193,7 @@ A role that predates this release sends no `firewall` in its applied report, and
 tests/run.sh
 ```
 
-Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile and compose renders, the management address resolution. CI runs the same.
+Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed) and the compose render, the management address resolution. CI runs the same, with Caddy installed.
 
 ## License
 
