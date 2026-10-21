@@ -139,3 +139,29 @@ remnawave_docker_apt_suite: ""
 remnawave_caddy_email: ""
 remnawave_caddy_listen_port: 443
 remnawave_decoy_root: "/var/www/decoy"
+# Members' addresses never reach Xray: Caddy removes these request headers
+# (`header_up -<name>`, WebSocket upgrades included) on every route before it
+# proxies to the loopback inbound. Every header an edge or a client may use to
+# carry the member's address; an edge strips what it can, but some add one
+# their own configuration cannot remove, so Caddy is the last place to drop
+# it. X-Forwarded-For also removes the one Caddy sets itself (the edge
+# server's address); the Caddyfile sets no trusted_proxies. One name per line.
+remnawave_caddy_strip_request_headers:
+  - X-Forwarded-For
+  - Forwarded
+  - X-Forwarded
+  - Forwarded-For
+  - X-Real-IP
+  - X-Client-IP
+  - Client-IP
+  - X-Cluster-Client-IP
+  - True-Client-IP
+  - Fastly-Client-IP
+  - Fastly-WAF-Client-IP
+  - Fastly-Temp-XFF
+  - CF-Connecting-IP
+  - CF-Connecting-IPv6
+  - CF-Pseudo-IPv4
+  - CloudFront-Viewer-Address
+  - X-Azure-ClientIP
+  - X-Azure-SocketIP

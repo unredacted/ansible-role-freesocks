@@ -10,6 +10,11 @@
    and the catch-all routes the foreign Host. Nothing makes that certificate
    valid FOR the foreign name; which provider modes that suits is recorded in
    FCP (docs/edges.md "Node role contract (Ansible)").
+
+   Members' addresses never reach Xray: each reverse_proxy removes the
+   headers in remnawave_caddy_strip_request_headers, its own X-Forwarded-For
+   included (header_up runs after Caddy sets the X-Forwarded-* headers, and on
+   WebSocket upgrades too). Never set trusted_proxies or client_ip_headers here.
 #}
 {
     email {{ remnawave_caddy_email }}
@@ -20,7 +25,11 @@
 {% for r in caddy_routes %}
     @r{{ loop.index }} path {{ r.path }}
     handle @r{{ loop.index }} {
-        reverse_proxy 127.0.0.1:{{ r.port }}
+        reverse_proxy 127.0.0.1:{{ r.port }} {
+{% for h in remnawave_caddy_strip_request_headers %}
+            header_up -{{ h }}
+{% endfor %}
+        }
     }
 {% endfor %}
     handle {
