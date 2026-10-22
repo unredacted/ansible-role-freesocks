@@ -135,6 +135,41 @@ remnawave_node_nftables_logging: false
 force_reinstall_remnawave: false
 remnawave_docker_apt_suite: ""
 
+# --- pulling the node image ----------------------------------------------------
+# Docker Hub limits anonymous pulls per IPv4 address and per IPv6 /64, and a
+# node often shares its /64 with its neighbours: the pull can be refused (429
+# toomanyrequests) over IPv6 while the machine's own IPv4 still has plenty. An
+# image already on the machine is not pulled again (update and
+# force_reinstall_remnawave do pull it). Otherwise the role tries, in order:
+# the mirror (when set), the registry (logged in when Docker Hub credentials
+# are set) with a wait before each retry while it answers 429, and, as a last
+# resort, Docker Hub over IPv4.
+#
+# A Docker Hub account: pulls then count against its own, higher limit, not
+# the address's. Its username and an access token (read-only, public
+# repositories), both or neither; vault the token. For the pull only, they go
+# to a Docker config under /run (tmpfs), which is removed afterwards; root's
+# own Docker config is never touched.
+remnawave_docker_hub_username: ""
+remnawave_docker_hub_token: ""
+# A pull-through cache of Docker Hub, as an image prefix: host[:port][/path],
+# e.g. "mirror.example.org" or "registry.example.org/dockerhub". An image on
+# Docker Hub is pulled through it first (anonymously, or with root's own
+# `docker login` for it) and tagged under its own name, so compose finds it.
+# When the mirror fails, Docker Hub is asked instead.
+remnawave_docker_hub_mirror: ""
+# Seconds to wait before each retry while the registry answers 429, one retry
+# per entry. Any other failure stops the run at once.
+remnawave_node_image_pull_backoff: [10, 30, 60]
+# The last resort, when Docker Hub still answers 429 after the retries: one
+# more pull with these names pinned to their IPv4 addresses in /etc/hosts. The
+# pin is removed right after, whether the pull worked or not; a run stopped in
+# between leaves it to the next run (or wipe) to remove.
+remnawave_docker_hub_ipv4_fallback: true
+remnawave_docker_hub_ipv4_names:
+  - registry-1.docker.io
+  - auth.docker.io
+
 # --- Caddy (front nodes) ---------------------------------------------------------
 remnawave_caddy_email: ""
 remnawave_caddy_listen_port: 443

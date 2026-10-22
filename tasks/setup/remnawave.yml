@@ -35,12 +35,10 @@
     mode: '0644'
   become: yes
 
+# Through a mirror, logged in, retried while Docker Hub rate-limits, and over
+# IPv4 as a last resort (image_pull.yml).
 - name: Pull the node image
-  community.docker.docker_image:
-    name: "{{ remnawave_node_image }}"
-    source: pull
-    force_source: "{{ (force_reinstall_remnawave | bool) or (operation_mode == 'update') }}"
-  become: yes
+  include_tasks: setup/image_pull.yml
 
 - name: Bring up the node container
   community.docker.docker_compose_v2:

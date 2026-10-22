@@ -1,2 +1,11 @@
 ---
-# vars file for ansible-role-freesocks
+# vars file for ansible-role-freesocks: the role's own constants, not settings.
+
+# tasks/setup/image_pull.yml (and wipe.yml, which removes what a stopped pull
+# left): the Docker config that carries the Docker Hub login for one pull (on
+# tmpfs), the hosts file and the marker of the IPv4 pin, and what a registry
+# says when it rate-limits a pull.
+_image_pull_config_dir: "{{ _fcp_run_dir | default('/run') }}/remnanode-docker"
+_image_pull_hosts_file: "{{ _fcp_hosts_file | default('/etc/hosts') }}"
+_image_pull_pin_marker: "# {mark} remnanode image pull: Docker Hub over IPv4 (temporary)"
+_image_pull_rate_limited: "toomanyrequests|too many requests"
