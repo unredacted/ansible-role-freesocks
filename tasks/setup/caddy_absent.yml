@@ -6,7 +6,9 @@
 # A machine that ran a mode with an ingress before still has Caddy installed,
 # enabled and holding that port, and the node would fail to bind it while the
 # role still reported the revision as applied. Stop it, disable it and remove
-# its configuration; the package is left installed.
+# its configuration; the package is left installed, and with it Caddy's home
+# (/var/lib/caddy: the ACME account, certificates). A later mode with an
+# ingress makes any of Caddy's directories that went missing (caddy.yml).
 
 - name: Look for an installed Caddy
   stat:

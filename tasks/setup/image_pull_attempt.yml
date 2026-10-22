@@ -1,0 +1,34 @@
+---
+# tasks/setup/image_pull_attempt.yml - one attempt of image_pull.yml: wait
+# _pull_pause seconds, then pull the node image, unless an earlier attempt got
+# it. A 429 (toomanyrequests) leaves _pull_rate_limited set for the next
+# attempt; any other failure stops the run here.
+
+- name: Pull the node image (one attempt)
+  when: not (_pull_done | bool)
+  block:
+    # wait_for, not pause: pause runs once for all hosts, on the first one's terms.
+    - name: Wait before asking again (the registry answered 429)
+      wait_for:
+        timeout: "{{ _pull_pause | int }}"
+      when: _pull_pause | int > 0
+
+    - name: Pull {{ remnawave_node_image }}
+      community.docker.docker_image:
+        name: "{{ remnawave_node_image }}"
+        source: pull
+        force_source: "{{ _pull_force | bool }}"
+      environment: "{{ {'DOCKER_CONFIG': _image_pull_config_dir} if (_pull_with_login | bool) else {} }}"
+      register: _pull
+      failed_when:
+        - _pull is failed
+        - not (_pull.msg | default('') is search(_image_pull_rate_limited, ignorecase=true))
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: Note the attempt
+      set_fact:
+        _pull_rate_limited: "{{ _limited | bool }}"
+        _pull_done: "{{ not (_limited | bool) }}"
+        _pull_error: "{{ _pull.msg | default('') }}"
+      vars:
+        _limited: "{{ _pull.msg | default('') is search(_image_pull_rate_limited, ignorecase=true) }}"

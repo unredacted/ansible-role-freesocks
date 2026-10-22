@@ -156,6 +156,25 @@ curl -s --http1.1 --max-time 5 -o /dev/null -w '%{http_code}\n' \
 
 The capture shows the `GET /ws` upgrade with `Host`, `Upgrade`, `Connection`, `Sec-WebSocket-*`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Via` and whatever the edge adds that carries no address, and no header with an address in it: not your public address, not 192.0.2.1, no `X-Forwarded-For`. A capture without the `GET` is on the wrong port.
 
+## Pulling the node image
+
+Docker Hub limits anonymous pulls per IPv4 address and per IPv6 /64, and a machine often shares its /64 with its neighbours: the pull can be refused (`429 toomanyrequests`) over IPv6 while the machine's own IPv4 still has plenty. An image already on the machine is not pulled again (`update` and `force_reinstall_remnawave` do pull it). Otherwise the role tries, in order:
+
+1. **A mirror** (`remnawave_docker_hub_mirror`), when set: a pull-through cache of Docker Hub, given as an image prefix (`mirror.example.org`, `registry.example.org/dockerhub`). The image is pulled through it and tagged under its own name, so compose finds it; the mirror's name is not kept. A mirror that fails hands over to Docker Hub. It is asked anonymously, or with root's own `docker login` for it.
+2. **The registry**, logged in when `remnawave_docker_hub_username` and `remnawave_docker_hub_token` are set (a Docker Hub access token, read-only and public repositories only, vaulted): pulls then count against the account's own, higher limit. While the registry answers 429 the role waits `remnawave_node_image_pull_backoff` (10, 30, then 60 seconds) before each retry; any other failure (a wrong token, a tag that does not exist) stops the run at once.
+3. **Docker Hub over IPv4**, the last resort (`remnawave_docker_hub_ipv4_fallback`): still 429 after the retries, the role pins `registry-1.docker.io` and `auth.docker.io` to their IPv4 addresses in `/etc/hosts` and pulls once more. The pin is removed right after, whether the pull worked or not.
+
+If all of that fails, the run stops and says what to set. The login is written, for the pull only, to a Docker config under `/run` (tmpfs, `0600` in a `0700` directory) that is removed afterwards; root's own Docker config is never touched, and the token never appears in the output. A run stopped in the middle of a pull leaves the pin or that config behind for the next run (or `wipe`) to remove before anything else. The mirror, the login and the pin are Docker Hub's: an image on another registry is pulled with the retries alone.
+
+| Variable                            | Default                                | What                                                                                    |
+| ----------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
+| `remnawave_docker_hub_username`     |                                        | A Docker Hub account for the pull; set together with the token                          |
+| `remnawave_docker_hub_token`        |                                        | Its access token (vault)                                                                |
+| `remnawave_docker_hub_mirror`       |                                        | A pull-through cache of Docker Hub, as an image prefix: `host[:port][/path]`            |
+| `remnawave_node_image_pull_backoff` | `[10, 30, 60]`                         | Seconds to wait before each retry while the registry answers 429, one retry per entry   |
+| `remnawave_docker_hub_ipv4_fallback`| `true`                                 | Last resort: pull once more with Docker Hub pinned to IPv4                              |
+| `remnawave_docker_hub_ipv4_names`   | `registry-1.docker.io`, `auth.docker.io` | The names the IPv4 pin covers                                                          |
+
 ## Variables
 
 | Variable                              | Default                | What                                                                      |
@@ -178,6 +197,7 @@ The capture shows the `GET /ws` upgrade with `Host`, `Upgrade`, `Connection`, `S
 | `fcp_firewall_*`                      |                        | See [Firewall](#firewall)                                                  |
 | `fcp_registration_retries` / `_delay` | `60` / `5`             | Polling the node's view                                                   |
 | `remnawave_node_image`                | `remnawave/node:3.4.2` | The node container                                                        |
+| `remnawave_docker_hub_*`, `remnawave_node_image_pull_backoff` |  | See [Pulling the node image](#pulling-the-node-image)                 |
 | `remnawave_caddy_email`               |                        | ACME registration (a mode that runs Caddy)                                |
 | `remnawave_caddy_listen_port`         | `443`                  |                                                                           |
 | `remnawave_decoy_root`                | `/var/www/decoy`       |                                                                           |
@@ -185,7 +205,7 @@ The capture shows the `GET /ws` upgrade with `Host`, `Upgrade`, `Connection`, `S
 
 ## What the role writes on the machine
 
-`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile` and the decoy under `/var/www/decoy`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
+`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile`, the decoy under `/var/www/decoy`, and Caddy's state, data and config directories (`/var/lib/caddy`, its `.local/share/caddy` and `.config/caddy`, owned by `caddy`), made before Caddy starts in case an earlier install left the `caddy` user without its home; for the length of a pull only, the Docker Hub login under `/run/remnanode-docker` and the IPv4 pin in `/etc/hosts`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
 
 ## Testing
 
@@ -193,7 +213,7 @@ The capture shows the `GET /ws` upgrade with `Host`, `Upgrade`, `Connection`, `S
 tests/run.sh
 ```
 
-Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed) and the compose render, the management address resolution. CI runs the same, with Caddy installed.
+Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed) and the compose render, the management address resolution, the image pull against a mock Docker API (`test_image_pull.yml`, `tests/mock_docker.py`: the mirror, the login, the retries while the registry answers 429, the IPv4 pin and its removal, a failure that stops at once). The image pull test needs `community.docker` (`requirements.yml`) and the `requests` library in the Python that runs Ansible. CI runs the same, with Caddy installed.
 
 ## License
 
