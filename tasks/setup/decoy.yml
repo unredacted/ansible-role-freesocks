@@ -2,17 +2,42 @@
 # tasks/setup/decoy.yml
 #
 # Create the decoy/camouflage web root and a plausible static landing page.
-# Caddy serves this on every non-transport path (see remnanode-caddyfile.j2),
-# so a probe of https://<host>/ sees an innocuous "maintenance" site rather than
-# a bare proxy or an error. Idempotent. The page embeds the node's name so it
-# is not byte-identical across nodes.
+# Caddy serves this on every non-transport path and every Host, edge hostnames
+# included (see remnanode-caddyfile.j2), so a probe of https://<host>/ sees an
+# innocuous "maintenance" site rather than a bare proxy or an error. Idempotent.
+#
+# The page carries nothing of the node's name: names may follow the operator's
+# scheme and say what the node is, and even a hash of one could be matched
+# against that scheme's candidates. So that the page is not byte-identical
+# across nodes, it carries a reference picked at random once per machine and
+# kept in .decoy_ref: the same on every run and after a rename.
 
 - name: Create decoy web root
   file:
     path: "{{ remnawave_decoy_root }}"
     state: directory
     mode: '0755'
-  become: yes
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Read the decoy's reference
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/.decoy_ref"
+  register: _decoy_ref_file
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Take it, or pick one for a machine that has none
+  set_fact:
+    _decoy_ref: "{{ _kept if _kept is match('^[0-9a-f]{8}$') else '%08x' | format(4294967296 | random) }}"
+  vars:
+    _kept: "{{ _decoy_ref_file.content | default('') | b64decode | trim }}"
+
+- name: Persist the decoy's reference
+  copy:
+    content: "{{ _decoy_ref }}\n"
+    dest: "{{ remnawave_node_install_dir }}/.decoy_ref"
+    mode: '0640'
+  become: "{{ _fcp_become | default(true) }}"
 
 - name: Render decoy index page
   template:
@@ -20,5 +45,5 @@
     dest: "{{ remnawave_decoy_root }}/index.html"
     mode: '0644'
   vars:
-    random_hostname: "{{ node_name }}"
-  become: yes
+    decoy_ref: "{{ _decoy_ref }}"
+  become: "{{ _fcp_become | default(true) }}"
