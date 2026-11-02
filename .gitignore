@@ -13,5 +13,6 @@ tests/.reg/
 tests/.reg-*/
 tests/.fw/
 tests/.identity-*/
+tests/.pull/
 tests/.caddyfile.rendered
 tests/.compose.rendered

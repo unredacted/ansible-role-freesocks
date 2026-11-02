@@ -1,0 +1,201 @@
+---
+# tasks/setup/image_pull.yml - pull the node image (remnawave_node_image).
+#
+# Docker Hub limits anonymous pulls per IPv4 address and per IPv6 /64, and a
+# node often shares its /64 with its neighbours: the pull can be refused (429
+# toomanyrequests) over IPv6 while the machine's own IPv4 still has plenty.
+# So, unless the image is here already (update and force_reinstall_remnawave
+# pull it again):
+#   1. through remnawave_docker_hub_mirror, when set and the image is on Docker
+#      Hub: pulled from the pull-through cache and tagged under its own name,
+#      so compose finds it; a mirror that fails hands over to Docker Hub;
+#   2. from the registry, logged in when Docker Hub credentials are set,
+#      waiting remnawave_node_image_pull_backoff before each retry while it
+#      answers 429 (any other failure stops the run);
+#   3. Docker Hub still answering 429: once more with its registry names pinned
+#      to their IPv4 addresses in /etc/hosts, the pin removed whatever happens.
+# The login goes to a Docker config under /run (tmpfs) for these pulls only,
+# never to root's own, and is removed with it.
+
+- name: Assert the Docker Hub credentials come together
+  assert:
+    that:
+      - (remnawave_docker_hub_username | length > 0) == (remnawave_docker_hub_token | length > 0)
+      - "'$ANSIBLE_VAULT;' not in (remnawave_docker_hub_token | string)"
+    fail_msg: >-
+      remnawave_docker_hub_username and remnawave_docker_hub_token (an access
+      token, vaulted) are set together or not at all; a raw vault blob needs
+      --ask-vault-pass or a vault id.
+
+# Only a run that stopped in the middle of a pull leaves these.
+- name: Remove the IPv4 pin of an interrupted pull
+  blockinfile:
+    path: "{{ _image_pull_hosts_file }}"
+    marker: "{{ _image_pull_pin_marker }}"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Remove the Docker Hub login of an interrupted pull
+  file:
+    path: "{{ _image_pull_config_dir }}"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Look for the node image
+  community.docker.docker_image_info:
+    name: "{{ remnawave_node_image }}"
+  register: _node_image
+  become: "{{ _fcp_become | default(true) }}"
+
+# Where the image lives decides what applies: the mirror, the login and the
+# IPv4 pin are Docker Hub's; a digest cannot be tagged, so it skips the mirror.
+- name: Work out how to pull the node image
+  set_fact:
+    _pull_force: "{{ (force_reinstall_remnawave | bool) or (operation_mode == 'update') }}"
+    _pull_hub: "{{ _hub | bool }}"
+    _pull_with_login: "{{ (_hub | bool) and (remnawave_docker_hub_username | length > 0) }}"
+    _pull_mirror_ref: >-
+      {{ (remnawave_docker_hub_mirror | regex_replace('/+$', '')) ~ '/' ~ (_path if '/' in _path else 'library/' ~ _path)
+         if (_hub | bool) and (remnawave_docker_hub_mirror | length > 0) and ('@' not in remnawave_node_image) else '' }}
+    _pull_done: false
+    _pull_rate_limited: false
+    _pull_error: ""
+  vars:
+    _parts: "{{ remnawave_node_image.split('/', 1) }}"
+    _explicit: "{{ _parts | length == 2 and (_parts[0] is search('[.:]') or _parts[0] == 'localhost') }}"
+    _path: "{{ _parts[1] if _explicit | bool else remnawave_node_image }}"
+    _hub: "{{ not (_explicit | bool) or _parts[0] in ['docker.io', 'index.docker.io', 'registry-1.docker.io'] }}"
+
+- name: Pull the node image
+  when: (_pull_force | bool) or (_node_image.images | length == 0)
+  block:
+    # 1. The mirror. What changes is the image under its own name, so only the
+    # tag reports a change; the mirror's own name is not kept.
+    - name: Pull the node image through the mirror
+      community.docker.docker_image:
+        name: "{{ _pull_mirror_ref }}"
+        source: pull
+        force_source: "{{ _pull_force | bool }}"
+      register: _pull_mirror
+      changed_when: false
+      ignore_errors: true
+      when: _pull_mirror_ref | length > 0
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: Note a mirror that failed
+      debug:
+        msg: "The mirror did not serve {{ _pull_mirror_ref }}; asking the registry instead."
+      when: _pull_mirror is failed
+
+    - name: Tag the mirror's image under its own name
+      when: _pull_mirror is not skipped and _pull_mirror is succeeded
+      become: "{{ _fcp_become | default(true) }}"
+      block:
+        - name: Tag the mirror's image as {{ remnawave_node_image }}
+          community.docker.docker_image:
+            name: "{{ _pull_mirror_ref }}"
+            repository: "{{ remnawave_node_image }}"
+            source: local
+            force_tag: true
+
+        - name: Drop the mirror's name
+          community.docker.docker_image:
+            name: "{{ _pull_mirror_ref }}"
+            state: absent
+          changed_when: false
+
+        - name: Note the pull through the mirror
+          set_fact:
+            _pull_done: true
+
+    # 2. and 3. The registry itself. Ansible checks a block's condition again
+    # for every task in it, its `always` too, so nothing here may depend on a
+    # condition the pull itself changes (_pull_done, _pull_rate_limited) once
+    # that has changed: the cleanup sits with the outer block, whose condition
+    # the pull cannot change.
+    - name: Write the Docker Hub login for this pull
+      when:
+        - not (_pull_done | bool)
+        - _pull_with_login | bool
+      become: "{{ _fcp_become | default(true) }}"
+      block:
+        - name: Create the pull's Docker config directory (tmpfs)
+          file:
+            path: "{{ _image_pull_config_dir }}"
+            state: directory
+            mode: '0700'
+
+        - name: Write the pull's Docker config
+          copy:
+            content: "{{ {'auths': {'https://index.docker.io/v1/': {'auth': (remnawave_docker_hub_username ~ ':' ~ remnawave_docker_hub_token) | b64encode}}} | to_json }}"
+            dest: "{{ _image_pull_config_dir }}/config.json"
+            mode: '0600'
+          no_log: true # the Docker Hub token
+
+    # One include per entry: a first attempt, then one after each wait.
+    - name: Pull the node image, waiting while the registry answers 429
+      include_tasks: setup/image_pull_attempt.yml
+      loop: "{{ [0] + remnawave_node_image_pull_backoff }}"
+      loop_control:
+        loop_var: _pull_pause
+      when: not (_pull_done | bool)
+
+    - name: Pull over IPv4 (Docker Hub still answers 429)
+      when:
+        - _pull_rate_limited | bool
+        - _pull_hub | bool
+        - remnawave_docker_hub_ipv4_fallback | bool
+      block:
+        - name: Look up Docker Hub's IPv4 addresses
+          command: "getent ahostsv4 {{ item }}"
+          loop: "{{ remnawave_docker_hub_ipv4_names }}"
+          register: _pull_hub_v4
+          changed_when: false
+
+        - name: Pin Docker Hub to its IPv4 addresses
+          blockinfile:
+            path: "{{ _image_pull_hosts_file }}"
+            marker: "{{ _image_pull_pin_marker }}"
+            block: |-
+              {% for r in _pull_hub_v4.results %}
+              {% for address in r.stdout_lines | map('split') | map('first') | unique %}
+              {{ address }} {{ r.item }}
+              {% endfor %}
+              {% endfor %}
+          become: "{{ _fcp_become | default(true) }}"
+
+        # dockerd resolves names with Go's resolver, which reads the hosts
+        # file again only once its copy is 5 seconds old.
+        - name: Let the Docker daemon see the pin
+          wait_for:
+            timeout: 6
+
+        # Last in this block: the attempt clears _pull_rate_limited.
+        - name: Pull the node image over IPv4
+          include_tasks: setup/image_pull_attempt.yml
+          vars:
+            _pull_pause: 0
+
+    - name: Stop when the registry still refuses the pull
+      fail:
+        msg: >-
+          {{ remnawave_node_image }} could not be pulled: the registry still answers
+          429 toomanyrequests ({{ _pull_error }}). Docker Hub counts anonymous pulls
+          per IPv4 address and per IPv6 /64: set remnawave_docker_hub_username and
+          remnawave_docker_hub_token (an account's own limit) or
+          remnawave_docker_hub_mirror, or run again later.
+      when: not (_pull_done | bool)
+  always:
+    # Whatever happened above, neither the pin nor the login outlives the pull.
+    - name: Remove the IPv4 pin
+      blockinfile:
+        path: "{{ _image_pull_hosts_file }}"
+        marker: "{{ _image_pull_pin_marker }}"
+        state: absent
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: Remove the pull's Docker config
+      file:
+        path: "{{ _image_pull_config_dir }}"
+        state: absent
+      become: "{{ _fcp_become | default(true) }}"

@@ -46,7 +46,8 @@ jobs:
           done
 
   # The offline tests: the bootstrap contract against the mock FCP, the
-  # retirement contract, the Caddyfile and compose renders, address resolution.
+  # retirement contract, the Caddyfile and compose renders, address resolution,
+  # the image pull against the mock Docker API.
   unit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -54,6 +55,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install ansible-core
         run: pipx install 'ansible-core~=2.21.2'
+      # The image pull test runs community.docker's modules, which need
+      # requests in the Python that runs Ansible.
+      - name: Install the role's collections
+        run: |
+          pipx inject ansible-core requests
+          ansible-galaxy collection install -r requirements.yml
       # So the Caddyfile render test validates and adapts it too: from the apt
       # repository the role installs Caddy from on a node.
       - name: Install Caddy

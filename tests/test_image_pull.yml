@@ -1,0 +1,388 @@
+---
+# tests/test_image_pull.yml
+#
+# Offline test of tasks/setup/image_pull.yml against a mock Docker Engine API
+# (tests/mock_docker.py, reached through DOCKER_HOST), a fake getent on PATH
+# and a scratch hosts file:
+#   (a) the image is here: nothing is pulled; the IPv4 pin and the login an
+#       interrupted run left are removed;
+#   (b) not here: one anonymous pull from Docker Hub;
+#   (c) 429, then the rate limit as a stream error: retried, the third attempt
+#       gets it, nothing pinned;
+#   (d) 429 until pinned: every retry, then once more with Docker Hub's names
+#       pinned to their IPv4 addresses; the pin is gone afterwards and the rest
+#       of the hosts file is as it was;
+#   (e) 429 even pinned: the run stops with the rate-limit message, no pin left;
+#   (f) any other failure (manifest unknown): stops at once, no retry, no pin;
+#   (g) a Docker Hub login: every pull carries it (the mock checks the token),
+#       the pull's Docker config is gone afterwards; (g2) a wrong token stops
+#       at once;
+#   (h) a mirror: pulled through it, tagged under its own name, the mirror's
+#       name dropped, Docker Hub not asked; (h2) an official image goes
+#       through the mirror as library/<name>;
+#   (i) a mirror that is down: Docker Hub asked instead;
+#   (j) update: pulled again though it is here;
+#   (k) an image on another registry: no mirror, no login, no pin; still 429
+#       after the retries, the run stops.
+#
+# Run: ansible-playbook tests/test_image_pull.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _port: 8829
+    _mock: "http://127.0.0.1:8829"
+    _dir: "{{ playbook_dir }}/.pull"
+    # community.docker needs requests: the Python that runs ansible has it.
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    _fcp_become: false
+    _fcp_run_dir: "{{ playbook_dir }}/.pull/run"
+    _fcp_hosts_file: "{{ playbook_dir }}/.pull/hosts"
+    _config_dir: "{{ playbook_dir }}/.pull/run/remnanode-docker"
+    _hosts_base: "127.0.0.1 localhost\n::1 localhost ip6-localhost\n"
+    _pin_expected:
+      - "192.0.2.10 registry-1.docker.io"
+      - "192.0.2.11 registry-1.docker.io"
+      - "192.0.2.20 auth.docker.io"
+    _image: "remnawave/node:3.4.2"
+    operation_mode: deploy
+    # One short wait (the wait itself is exercised), one retry without.
+    remnawave_node_image_pull_backoff: [1, 0]
+  environment:
+    DOCKER_HOST: "tcp://127.0.0.1:8829"
+    # An empty Docker config: never the developer's own login.
+    DOCKER_CONFIG: "{{ playbook_dir }}/.pull/docker"
+    PATH: "{{ playbook_dir }}/.pull/bin:{{ lookup('env', 'PATH') }}"
+  tasks:
+    - name: Start from a clean scratch directory
+      file:
+        path: "{{ _dir }}"
+        state: absent
+
+    - name: Create the scratch directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: ["{{ _dir }}/bin", "{{ _dir }}/docker", "{{ _fcp_run_dir }}"]
+
+    - name: Write the empty Docker config
+      copy:
+        content: "{}\n"
+        dest: "{{ _dir }}/docker/config.json"
+        mode: '0600'
+
+    - name: Put a fake getent on PATH (documentation addresses)
+      copy:
+        dest: "{{ _dir }}/bin/getent"
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          [ "$1" = ahostsv4 ] || exit 2
+          case "$2" in
+            registry-1.docker.io) addresses="192.0.2.10 192.0.2.11" ;;
+            auth.docker.io) addresses="192.0.2.20" ;;
+            *) exit 2 ;;
+          esac
+          for a in $addresses; do
+            printf '%-15s STREAM %s\n%-15s DGRAM  \n%-15s RAW    \n' "$a" "$2" "$a" "$a"
+          done
+
+    - name: Write the hosts file
+      copy:
+        content: "{{ _hosts_base }}"
+        dest: "{{ _fcp_hosts_file }}"
+        mode: '0644'
+
+    - name: Start the mock Docker API
+      command: python3 {{ playbook_dir }}/mock_docker.py {{ _port }} {{ _fcp_hosts_file }}
+      async: 600
+      poll: 0
+
+    - name: Wait for the mock
+      uri:
+        url: "{{ _mock }}/__state"
+        status_code: 200
+      register: _up
+      until: _up.status == 200
+      retries: 20
+      delay: 1
+
+    - block:
+        # (a) here already; what an interrupted run left goes
+        - name: (a) The login an interrupted run left behind
+          file: { path: "{{ _config_dir }}", state: directory, mode: '0700' }
+        - name: (a) Its Docker config, and the pin
+          copy:
+            content: "{{ item.content }}"
+            dest: "{{ item.dest }}"
+            mode: '0600'
+          loop:
+            - dest: "{{ _config_dir }}/config.json"
+              content: "{}"
+            - dest: "{{ _fcp_hosts_file }}"
+              content: |
+                {{ _hosts_base }}# BEGIN remnanode image pull: Docker Hub over IPv4 (temporary)
+                192.0.2.10 registry-1.docker.io
+                # END remnanode image pull: Docker Hub over IPv4 (temporary)
+          loop_control:
+            label: "{{ item.dest }}"
+        - name: (a) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { images: ["{{ _image }}"] } }
+        - name: (a) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+        - name: (a) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (a) The config directory
+          stat: { path: "{{ _config_dir }}" }
+          register: _cfg
+        - name: (a) Assert nothing pulled, nothing left behind
+          assert:
+            that:
+              - _s.json.pulls == []
+              - lookup('file', _fcp_hosts_file) ~ '\n' == _hosts_base
+              - not _cfg.stat.exists
+              - _s.json.unknown == []
+
+        # (b) one anonymous pull
+        - name: (b) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: {} }
+        - name: (b) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+        - name: (b) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (b) Assert one anonymous pull from Docker Hub
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='kind') | list == ['hub']
+              - _s.json.pulls[0].ref == _image
+              - _s.json.pulls[0].user is none
+              - _s.json.images.values() | map(attribute='RepoTags') | flatten == [_image]
+              - _s.json.unknown == []
+
+        # (c) retried while rate-limited
+        - name: (c) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { hub: ["429", "429-stream", "ok"] } }
+        - name: (c) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+        - name: (c) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (c) Assert three attempts, nothing pinned
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='answer') | list == ['429', '429-stream', 'ok']
+              - _s.json.pulls | selectattr('pinned') | list == []
+              - _s.json.images | length == 1
+
+        # (d) the IPv4 fallback
+        - name: (d) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { hub: ["429-unpinned"] } }
+        - name: (d) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+        - name: (d) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (d) Assert the retries, then one pull over the pin, and the pin gone
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='answer') | list == ['429', '429', '429', 'ok']
+              - _s.json.pulls[:3] | selectattr('pinned') | list == []
+              - _s.json.pulls[3].pinned
+              - _s.json.pulls[3].hosts == _pin_expected
+              - lookup('file', _fcp_hosts_file) ~ '\n' == _hosts_base
+              - _s.json.images | length == 1
+
+        # (e) still rate-limited over IPv4
+        - name: (e) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { hub: ["429"] } }
+        - name: (e) Run the pull
+          block:
+            - include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+            - set_fact: { _failed: false }
+          rescue:
+            - set_fact: { _failed: true, _msg: "{{ ansible_failed_result.msg }}" }
+        - name: (e) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (e) Assert the run stopped with the rate limit, no pin left
+          assert:
+            that:
+              - _failed
+              - "'still answers 429' in _msg"
+              - "'toomanyrequests' in _msg"
+              - _s.json.pulls | length == 4
+              - _s.json.pulls[3].pinned
+              - lookup('file', _fcp_hosts_file) ~ '\n' == _hosts_base
+              - _s.json.images == {}
+
+        # (f) any other failure stops at once
+        - name: (f) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { hub: ["unknown"] } }
+        - name: (f) Run the pull
+          block:
+            - include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+            - set_fact: { _failed: false }
+          rescue:
+            - set_fact: { _failed: true, _msg: "{{ ansible_failed_result.msg }}" }
+        - name: (f) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (f) Assert one attempt, no fallback
+          assert:
+            that:
+              - _failed
+              - "'manifest unknown' in _msg"
+              - _s.json.pulls | length == 1
+              - lookup('file', _fcp_hosts_file) ~ '\n' == _hosts_base
+
+        # (g) a Docker Hub login
+        - name: (g) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { hub: ["429", "ok"], hub_token: "test-token-g" } }
+        - name: (g) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+          vars:
+            remnawave_docker_hub_username: "fs-test"
+            remnawave_docker_hub_token: "test-token-g"
+        - name: (g) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (g) The config directory
+          stat: { path: "{{ _config_dir }}" }
+          register: _cfg
+        - name: (g) Assert both attempts logged in, the login gone
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='user') | list == ['fs-test', 'fs-test']
+              - _s.json.pulls | map(attribute='token_ok') | list == [true, true]
+              - not _cfg.stat.exists
+              - _s.json.images | length == 1
+
+        - name: (g2) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { hub_token: "the-right-one" } }
+        - name: (g2) Run the pull
+          block:
+            - include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+              vars:
+                remnawave_docker_hub_username: "fs-test"
+                remnawave_docker_hub_token: "a-wrong-one"
+            - set_fact: { _failed: false }
+          rescue:
+            - set_fact: { _failed: true, _msg: "{{ ansible_failed_result.msg }}" }
+        - name: (g2) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (g2) The config directory
+          stat: { path: "{{ _config_dir }}" }
+          register: _cfg
+        - name: (g2) Assert a wrong token stops at once, the login gone
+          assert:
+            that:
+              - _failed
+              - "'incorrect username or password' in _msg"
+              - "'a-wrong-one' not in _msg"
+              - _s.json.pulls | length == 1
+              - not _cfg.stat.exists
+
+        # (h) a mirror
+        - name: (h) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: {} }
+        - name: (h) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+          vars:
+            remnawave_docker_hub_mirror: "mirror.example:5000/"
+        - name: (h) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (h) Assert pulled through the mirror, under its own name only
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='kind') | list == ['mirror']
+              - _s.json.pulls[0].ref == 'mirror.example:5000/' ~ _image
+              - _s.json.images.values() | map(attribute='RepoTags') | flatten == [_image]
+              - _s.json.unknown == []
+
+        - name: (h2) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: {} }
+        - name: (h2) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+          vars:
+            remnawave_node_image: "nginx:1.27"
+            remnawave_docker_hub_mirror: "mirror.example:5000"
+        - name: (h2) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (h2) Assert an official image goes through the mirror as library/
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='ref') | list == ['mirror.example:5000/library/nginx:1.27']
+              - _s.json.images.values() | map(attribute='RepoTags') | flatten == ['nginx:1.27']
+
+        # (i) a mirror that is down
+        - name: (i) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { mirror: ["down"] } }
+        - name: (i) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+          vars:
+            remnawave_docker_hub_mirror: "mirror.example:5000"
+        - name: (i) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (i) Assert Docker Hub asked after the mirror
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='kind') | list == ['mirror', 'hub']
+              - _s.json.images.values() | map(attribute='RepoTags') | flatten == [_image]
+
+        # (j) update pulls again
+        - name: (j) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { images: ["{{ _image }}"] } }
+        - name: (j) Run the pull
+          include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+          vars:
+            operation_mode: update
+        - name: (j) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (j) Assert pulled again
+          assert:
+            that:
+              - _s.json.pulls | map(attribute='kind') | list == ['hub']
+
+        # (k) another registry
+        - name: (k) Scenario
+          uri: { url: "{{ _mock }}/__scenario", method: POST, body_format: json, body: { other: ["429"] } }
+        - name: (k) Run the pull
+          block:
+            - include_role: { name: ansible-role-freesocks, tasks_from: setup/image_pull.yml }
+              vars:
+                remnawave_node_image: "registry.example.org/remnawave/node:3.4.2"
+                remnawave_docker_hub_mirror: "mirror.example:5000"
+                remnawave_docker_hub_username: "fs-test"
+                remnawave_docker_hub_token: "test-token-k"
+            - set_fact: { _failed: false }
+          rescue:
+            - set_fact: { _failed: true, _msg: "{{ ansible_failed_result.msg }}" }
+        - name: (k) Read back
+          uri: { url: "{{ _mock }}/__state", return_content: yes }
+          register: _s
+        - name: (k) Assert no mirror, no login, no pin
+          assert:
+            that:
+              - _failed
+              - "'still answers 429' in _msg"
+              - _s.json.pulls | map(attribute='kind') | list == ['other', 'other', 'other']
+              - _s.json.pulls | map(attribute='user') | select | list == []
+              - _s.json.pulls | selectattr('pinned') | list == []
+              - lookup('file', _fcp_hosts_file) ~ '\n' == _hosts_base
+            success_msg: "image pull: mirror, login, 429 back-off, IPv4 fallback and its cleanup."
+      always:
+        - name: Stop the mock
+          shell: "pkill -f '[m]ock_docker.py {{ _port }}' || true"
+
+        - name: Remove the scratch directory
+          file:
+            path: "{{ _dir }}"
+            state: absent

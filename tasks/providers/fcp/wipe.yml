@@ -105,6 +105,10 @@
   become: yes
   when: "'caddy.service' in (_caddy_unit.stdout | default(''))"
 
+# Caddy itself (the package, the caddy user, its home with the ACME account
+# and certificates) is left, as caddy_absent.yml leaves it; a later deploy
+# makes any of Caddy's directories that went missing (caddy.yml). The pull's
+# Docker config is only ever left by a run that stopped mid-pull.
 - name: Remove the machine's node files
   file:
     path: "{{ item }}"
@@ -116,6 +120,14 @@
     - /etc/logrotate.d/remnanode
     - /etc/caddy/Caddyfile
     - "{{ remnawave_decoy_root }}"
+    - "{{ _image_pull_config_dir }}"
+  become: yes
+
+- name: Remove the IPv4 pin of an interrupted image pull
+  blockinfile:
+    path: "{{ _image_pull_hosts_file }}"
+    marker: "{{ _image_pull_pin_marker }}"
+    state: absent
   become: yes
 
 # Only the role's own object: emptied (SSH and the node API port excepted),
