@@ -143,10 +143,35 @@
       ({{ remnawave_node_install_dir }}/.node_name): nothing to {{ operation_mode }}.
   when: operation_mode != 'deploy'
 
-- name: Generate a node name
-  # Role-relative: a bare sibling filename does not resolve from tasks/setup/.
-  include_tasks: setup/node_name.yml
-  when: node_name | length == 0
+# A new node is named after its inventory host. The name is taken once and
+# kept (.node_name), and FCP makes a DNS label of it (the origin name), so the
+# host name must already be one: it is refused, never rewritten, when it is not
+# (an address, a dotted name, uppercase, too long; localhost names no machine).
+# Defined on every run, so a second include in the same play never reads the
+# one before.
+- name: Note whether the name comes from the inventory host
+  set_fact:
+    _node_name_from_host: "{{ node_name | length == 0 }}"
+
+- name: Name a new node after its inventory host
+  set_fact:
+    node_name: "{{ inventory_hostname }}"
+  when: _node_name_from_host | bool
+
+- name: Refuse an inventory host name that cannot be a node name
+  assert:
+    that:
+      - node_name is match('^[a-z0-9]+(-[a-z0-9]+)*$')
+      - node_name | length >= 3
+      - node_name | length <= 30
+      - node_name != 'localhost'
+    fail_msg: >-
+      No node name was given and none is persisted on this machine, and the
+      inventory host name '{{ inventory_hostname }}' cannot be one: a node named
+      after its host needs 3 to 30 lowercase letters and digits, with single
+      hyphens between them (FCP makes a DNS label of it), and the role does not
+      rewrite it. Pass -e node_name=<name>, for example node1-relay-site.
+  when: _node_name_from_host | bool
 
 - name: Validate the node name
   assert:
