@@ -1,0 +1,122 @@
+---
+# tests/test_decoy.yml
+#
+# Offline test of tasks/setup/decoy.yml, the page Caddy serves on every
+# non-transport path:
+#   (a) the page carries no part of the node's name, in its title or anywhere
+#       else, and its reference is the one the machine keeps in .decoy_ref;
+#   (b) a second run leaves the page and the reference as they were;
+#   (c) after a rename the page is the same and does not carry the new name;
+#   (d) another machine picks another reference, so pages are not identical.
+#
+# Run: ansible-playbook tests/test_decoy.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.decoy"
+    remnawave_node_install_dir: "{{ _dir }}/a/node"
+    remnawave_decoy_root: "{{ _dir }}/a/www"
+    _fcp_become: false
+    node_name: "bright-harbor-lane"
+  tasks:
+    - block:
+        - name: Prepare the machine directory
+          file:
+            path: "{{ remnawave_node_install_dir }}"
+            state: directory
+
+        # (a) a fresh machine
+        - name: Set up the decoy
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/decoy.yml
+
+        - name: Read the page and the reference
+          set_fact:
+            _page: "{{ lookup('file', remnawave_decoy_root ~ '/index.html') }}"
+            _ref: "{{ lookup('file', remnawave_node_install_dir ~ '/.decoy_ref') | trim }}"
+
+        - name: Assert the page carries no part of the node's name
+          assert:
+            that:
+              - node_name not in _page
+              - node_name | replace('-', ' ') | title not in _page
+              - node_name.split('-') | select('in', _page | lower) | list | length == 0
+              - "'<title>Scheduled maintenance</title>' in _page"
+              - _ref is match('^[0-9a-f]{8}$')
+              - "'Ref: ' ~ _ref in _page"
+            fail_msg: "The decoy page shows the node's name: {{ _page }}"
+            success_msg: "the page carries a random reference ({{ _ref }}), not the name."
+
+        - name: Note the page
+          stat:
+            path: "{{ remnawave_decoy_root }}/index.html"
+          register: _first
+
+        # (b) the next run
+        - name: Set up the decoy again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/decoy.yml
+
+        - name: Note the page again
+          stat:
+            path: "{{ remnawave_decoy_root }}/index.html"
+          register: _second
+
+        - name: Assert nothing changed
+          assert:
+            that:
+              - _second.stat.checksum == _first.stat.checksum
+              - lookup('file', remnawave_node_install_dir ~ '/.decoy_ref') | trim == _ref
+            success_msg: "a second run keeps the page and its reference."
+
+        # (c) FCP renamed the node
+        - name: The machine's new name
+          set_fact:
+            node_name: "calm-river-delta"
+
+        - name: Set up the decoy after the rename
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/decoy.yml
+
+        - name: Note the page after the rename
+          stat:
+            path: "{{ remnawave_decoy_root }}/index.html"
+          register: _renamed
+
+        - name: Assert the rename left the page as it was
+          assert:
+            that:
+              - _renamed.stat.checksum == _first.stat.checksum
+              - node_name not in lookup('file', remnawave_decoy_root ~ '/index.html')
+            success_msg: "a rename does not show on the page."
+
+        # (d) another machine
+        - name: Prepare another machine's directory
+          file:
+            path: "{{ _dir }}/b/node"
+            state: directory
+
+        - name: Set up another machine's decoy
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/decoy.yml
+          vars:
+            remnawave_node_install_dir: "{{ _dir }}/b/node"
+            remnawave_decoy_root: "{{ _dir }}/b/www"
+
+        - name: Assert it picked another reference
+          assert:
+            that:
+              - lookup('file', _dir ~ '/b/node/.decoy_ref') | trim is match('^[0-9a-f]{8}$')
+              - lookup('file', _dir ~ '/b/node/.decoy_ref') | trim != _ref
+              - lookup('file', _dir ~ '/b/www/index.html') != _page
+            success_msg: "another machine's page differs from this one's."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent

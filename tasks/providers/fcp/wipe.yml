@@ -120,6 +120,7 @@
     - /etc/logrotate.d/remnanode
     - /etc/caddy/Caddyfile
     - "{{ remnawave_decoy_root }}"
+    - "{{ remnawave_node_install_dir }}/.decoy_ref"
     - "{{ _image_pull_config_dir }}"
   become: yes
 
