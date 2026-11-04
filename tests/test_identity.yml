@@ -11,9 +11,17 @@
 #       has accepted it, so a refused mode is corrected by running again;
 #   (e) a purpose no mode is mapped to stops the play with what to pass;
 #   (f) a node FCP renamed: an inventory that still says a former name resolves
-#       to the current one the machine carries; a name it never had does not.
+#       to the current one the machine carries; a name it never had does not;
+#   (g) a fresh machine with no name given is named after its inventory host,
+#       and a later run keeps the name the machine carries (FCP may have
+#       renamed it); update with nothing persisted still names nothing;
+#   (h) an inventory host name that is not a DNS label (an address, a dotted
+#       name, uppercase, too long, localhost) stops the play before anything is
+#       persisted and asks for -e node_name, which is then taken as given.
 #
-# Each case is its own play so the facts of the previous one are cleared.
+# Each case is its own play so the facts of the previous one are cleared. (g)
+# and (h) run against in-memory hosts (add_host), since the name comes from
+# inventory_hostname.
 #
 # Run: ansible-playbook tests/test_identity.yml
 
@@ -318,6 +326,168 @@
             that:
               - node_name == 'other-name-here'
             success_msg: "only a former name is followed."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: The in-memory hosts (g) and (h) run against
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Add the hosts
+      add_host:
+        name: "{{ item.name }}"
+        groups: "{{ item.group }}"
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      loop:
+        - { name: "node1-relay-site", group: "usable_names" }
+        - { name: "192.0.2.10", group: "unusable_names" }
+        - { name: "node1.example.org", group: "unusable_names" }
+        - { name: "Node1-Relay-Site", group: "unusable_names" }
+        - { name: "node1-relay-site-with-a-long-tail", group: "unusable_names" }
+        - { name: "node1--relay-site", group: "unusable_names" }
+
+- name: (g) a fresh machine is named after its inventory host
+  hosts: usable_names
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-g"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: "privacy-reality"
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        operation_mode: deploy
+        node_name: ""
+        node_mode: "privacy-reality"
+
+    - block:
+        - name: Resolve the identity of a machine that carries nothing
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the host name was taken and persisted
+          assert:
+            that:
+              - node_name == 'node1-relay-site'
+              - lookup('file', _dir ~ '/.node_name') | trim == 'node1-relay-site'
+            success_msg: "a new node is named after its inventory host."
+
+        - name: The machine now carries another name (FCP renamed the node)
+          copy:
+            content: "calm-river-delta\n"
+            dest: "{{ _dir }}/.node_name"
+
+        - name: A later run with no name given
+          set_fact:
+            node_name: ""
+
+        - name: Resolve the identity again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the name the machine carries won over the host name
+          assert:
+            that:
+              - node_name == 'calm-river-delta'
+              - lookup('file', _dir ~ '/.node_name') | trim == 'calm-river-delta'
+            success_msg: "a persisted name wins over the inventory host name."
+
+        - name: A machine that carries nothing, for an update
+          file:
+            path: "{{ _dir }}"
+            state: absent
+
+        - name: An update with no name given
+          set_fact:
+            operation_mode: update
+            node_name: ""
+
+        - name: It must stop the play
+          block:
+            - name: Resolve the identity for an update
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/identity.yml
+            - name: (g) Unreached
+              assert:
+                that: [false]
+                fail_msg: "An update named a machine that carries no name."
+          rescue:
+            - name: Assert the reason
+              assert:
+                that:
+                  - "'nothing to update' in (ansible_failed_result.msg | default(''))"
+                success_msg: "only a first deploy takes the inventory host name."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent
+    - meta: clear_facts
+
+- name: (h) a host name that is not a DNS label is refused, not rewritten
+  hosts: unusable_names:localhost
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.identity-h-{{ inventory_hostname | regex_replace('[^a-zA-Z0-9]', '_') }}"
+    operation_mode: deploy
+    remnawave_node_install_dir: "{{ _dir }}"
+    _fcp_become: false
+    node_name: ""
+    node_mode: "privacy-reality"
+  tasks:
+    - name: This case's inputs
+      set_fact:
+        operation_mode: deploy
+        node_name: ""
+        node_mode: "privacy-reality"
+
+    - block:
+        - name: It must stop the play
+          block:
+            - name: Resolve the identity of a machine that carries nothing
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/identity.yml
+            - name: (h) Unreached
+              assert:
+                that: [false]
+                fail_msg: "The host name {{ inventory_hostname }} was taken as a node name."
+          rescue:
+            - name: Assert the reason names the host and what to pass
+              assert:
+                that:
+                  - "inventory_hostname in (ansible_failed_result.msg | default(''))"
+                  - "'-e node_name=' in (ansible_failed_result.msg | default(''))"
+                  - not (_dir ~ '/.node_name') is exists
+                success_msg: "{{ inventory_hostname }} is refused before anything is persisted."
+
+        - name: The operator passes a name
+          set_fact:
+            node_name: "quiet-falcon-nest"
+
+        - name: Resolve the identity with the given name
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/identity.yml
+
+        - name: Assert the given name was taken
+          assert:
+            that:
+              - node_name == 'quiet-falcon-nest'
+              - lookup('file', _dir ~ '/.node_name') | trim == 'quiet-falcon-nest'
+            success_msg: "-e node_name works whatever the host is called."
       always:
         - name: Clean up
           file:

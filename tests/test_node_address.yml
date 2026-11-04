@@ -303,8 +303,6 @@
           # A purpose left by an earlier release is translated, not ignored.
           - "'fcp_legacy_purpose_modes' in _identity_src"
           - "'.node_purpose' in _identity_src"
-          # Same include gotcha as above, from tasks/setup/ this time.
-          - "'include_tasks: setup/node_name.yml' in _identity_src"
         success_msg: "the name is persisted before enrolling, the mode after FCP accepted it."
 
     # ------------------------------------------------------ (d2) STRUCTURAL

@@ -98,11 +98,14 @@ fcp_legacy_purpose_modes:
   direct: privacy-reality
   relay: freedom-reality
   front: freedom-ws
-# The node's name on the panel and in FCP. Empty = three dictionary words are
-# generated at the first deploy. Persisted on the machine (.node_name) BEFORE
-# the first FCP call, so a run that stops halfway resumes against the same node.
+# The node's name on the panel and in FCP. Empty = the inventory host name at
+# the first deploy, which must then be 3 to 30 lowercase letters and digits with
+# single hyphens between them (a DNS label): any other host name stops the run
+# and asks for -e node_name=..., the role never rewrites or invents one.
+# Persisted on the machine (.node_name) BEFORE the first FCP call, so a run that
+# stops halfway resumes against the same node; later runs use the persisted
+# name (or the one FCP renamed the node to).
 node_name: ""
-node_name_word_count: 3
 # The machine's own name, sent at enrollment so FCP shows operators which
 # machine a node is (Admin -> Servers, next to the node; the Nodes filter
 # matches it). Operator-only: members only ever see node_name. Empty = not sent.
