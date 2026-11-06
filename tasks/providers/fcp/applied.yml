@@ -49,7 +49,7 @@
     body_format: json
     body: >-
       {{ {'appliedRevision': _fcp_bootstrap.machineRevision | int, 'nodeStarted': true}
-         | combine({'caddy': {'certificateReady': _caddy_cert_ready | default(false) | bool}}
+         | combine({'caddy': {'certificateReady': _front_cert_ready | default(false) | bool}}
                    if (_fcp_bootstrap.ingress is mapping) else {})
          | combine({'firewall': _fw_report}
                    if (_fw_report is defined and _fw_report is mapping) else {}) }}

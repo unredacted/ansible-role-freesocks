@@ -4,7 +4,7 @@
 
 An Ansible role that bootstraps a [FreeSocks](https://freesocks.org/) proxy node (a Remnawave / Xray-core node) and enrolls it with the [FreeSocks Control Plane](https://freesocks.org/) (FCP).
 
-**Version 2 does one thing: the machine.** It installs Docker and the node container, Caddy and a decoy site when the mode wants one, lets in the ports FCP lists for the node, and tells FCP "here I am". FCP owns everything on the backend (the profile, its transports, the mode groups, the addresses), the origin DNS record of a WebSocket node, the fronting (Cloudflare, Fastly, L4 edges) and the release to members. The role never talks to the backend: the node secret comes from FCP with the machine configuration. This is the bootstrap contract v2 (FCP `docs/servers.md`, "Node lifecycle").
+**Version 2 does one thing: the machine.** It installs Docker and the node container, a front server (Caddy or nginx) and a decoy site when the mode wants one, lets in the ports FCP lists for the node, and tells FCP "here I am". FCP owns everything on the backend (the profile, its transports, the mode groups, the addresses), the origin DNS record of a WebSocket node, the fronting (Cloudflare, Fastly, L4 edges) and the release to members. The role never talks to the backend: the node secret comes from FCP with the machine configuration. This is the bootstrap contract v2 (FCP `docs/servers.md`, "Node lifecycle").
 
 Version 1 (Outline, hostname rotation, backend-to-backend migration, the role writing the backend) lives on the `v1` tag.
 
@@ -17,19 +17,19 @@ A node serves one **connection mode**: one of the modes the backend was set up f
 | `privacy-reality`   | REALITY on 443                                              | creates its addresses for members, tests, releases  |
 | `freedom-reality`   | REALITY on 443, reached through an L4 edge                  | an L4 edge in front of it                           |
 | `freedom-xhttp`     | XHTTP under REALITY on 443, reached through an L4 edge      | an L4 edge in front of it                           |
-| `freedom-ws`        | WebSocket on loopback behind Caddy (TLS for the origin name) | origin DNS record, an L7 edge (Cloudflare or Fastly) |
+| `freedom-ws`        | WebSocket on loopback behind the front server (TLS for the origin name) | origin DNS record, an L7 edge (Cloudflare or Fastly) |
 
 A node never reaches a member before an operator approves it in Admin -> Servers. A backend that already has nodes is adopted in FCP, never re-bootstrapped: the role is only ever run for a **new** machine.
 
 ## Requirements
 
-- Debian 12 or 13, Python 3, ports **80 and 443 free** on a node whose mode runs Caddy (HTTP-01 on 80, TLS on 443)
+- Debian 12 or 13, Python 3, ports **80 and 443 free** on a node whose mode runs a front server (HTTP-01 on 80, TLS on 443)
 - Controller: ansible-core >= 2.15 and the collections in `requirements.yml`:
   ```sh
   ansible-galaxy collection install -r requirements.yml
   ```
 - In FCP: the panel registered under Backend servers, **Set up this panel** done (Admin -> Servers), and a token for the role (below).
-- A host firewall the role can keep its rules in (ufw, firewalld or nftables), or none: see [Firewall](#firewall). SSH, the node API port (2222) and port 80 on a Caddy node stay yours to open.
+- A host firewall the role can keep its rules in (ufw, firewalld or nftables), or none: see [Firewall](#firewall). SSH, the node API port (2222) and port 80 on a front node stay yours to open.
 
 ## Quick start
 
@@ -65,7 +65,7 @@ ansible-playbook playbook.yml -e target=node3 -e operation_mode=deploy -e node_m
   -e node_address_interface=tailscale0 -e node_public_address=203.0.113.7
 ```
 
-The run persists the node's name on the machine first, enrolls the node, fetches its machine configuration and secret, lets in the ports FCP lists for it, starts the container (and Caddy when FCP declared an ingress, or takes an earlier run's Caddy out of the way when it declared none), reports the applied revision and which ports the firewall lets in, and waits for FCP to find the machine ready. Then, in FCP: **Edges -> Protect a node** for an edge-fronted mode, and **Servers -> the node -> Approve and activate**.
+The run persists the node's name on the machine first, enrolls the node, fetches its machine configuration and secret, lets in the ports FCP lists for it, starts the container (and the front server when FCP declared an ingress, taking the other one out of the way, or takes both out of the way when it declared none), reports the applied revision and which ports the firewall lets in, and waits for FCP to find the machine ready. Then, in FCP: **Edges -> Protect a node** for an edge-fronted mode, and **Servers -> the node -> Approve and activate**.
 
 A new node is named after its inventory host: the host `node1-relay-site` becomes the node `node1-relay-site` in FCP, unless `-e node_name=...` says otherwise. The name is taken as it is, never rewritten: a host name that is not 3 to 30 lowercase letters and digits with single hyphens between them (an address, a dotted name, uppercase, a longer one) stops the first run with a message asking for `-e node_name=...`. The role never makes a name up.
 
@@ -135,9 +135,37 @@ No firewall rule the role writes logs anything (the no-log posture of `remnawave
 
 A role that predates this release sends no `firewall` in its applied report, and FCP confirms nothing from such a report. So **until every node serving a transport runs this release, an FCP port change on that transport waits**, and the Servers page ("Port changes") names the node it waits on. Run `deploy` (or `update`) with this release on those nodes before changing a port; a node no role runs (adopted) is confirmed by an admin on the Servers page. Against an FCP that predates the firewall acknowledgement (no `firewall` in its answers) the role leaves the host firewall alone and reports nothing about it.
 
+## Front server: Caddy or nginx
+
+A mode with an ingress (`freedom-ws`) puts a front server on the node: it ends TLS for the origin name with a certificate it takes itself (HTTP-01 on port 80), proxies each route FCP declared to its loopback inbound, and serves the [decoy site](#decoy-site) on every other path and Host. `remnawave_front_server` picks it:
+
+- **`caddy`** (the default for now): Caddy from its apt repository, `/etc/caddy/Caddyfile`.
+- **`nginx`**: nginx and its ACME module (`nginx-module-acme`) from nginx.org's stable repository, pinned over Debian's and added to unattended-upgrades, so its security releases install by themselves. The role's configuration is its own file (`remnawave_nginx_conf`, `/etc/nginx/freesocks/nginx.conf`) and the unit reads it through a drop-in that also confines the service (no new privileges, a read-only system, only the capabilities it needs); the package's `/etc/nginx/nginx.conf` is never edited, so an upgrade never stops at a configuration question, and an upgrade swaps the binary without dropping open sessions. A reload starts new workers and lets the old ones finish their sessions for up to `remnawave_nginx_worker_shutdown_timeout`.
+
+Switching a node from one to the other stops the old one (its open sessions drop), starts the new one and takes a new certificate for the origin name (Let's Encrypt allows five for the same name a week). The one a node does not run is stopped and its configuration removed; nginx is also masked there, because its package starts a stopped nginx on every upgrade. Try nginx on one node (`remnawave_front_server: nginx` in its host vars) before the rest.
+
+**Sized for growth (nginx).** Every limit follows the machine, so more RAM or vCPUs raise them on the next run:
+
+- connections: 32 per MiB of RAM in all (about 1M on 32 GiB, half a million sessions), over one worker per vCPU with a quarter on top (`remnawave_nginx_max_connections` sets the total instead);
+- each session reaches Xray from one of `remnawave_nginx_loopback_sources` loopback addresses (64): from a single address the host's ephemeral port range caps one inbound at about 49k sessions whatever the machine has;
+- the kernel (`remnawave_front_kernel_tuning`, one drop-in `remnawave_front_sysctl_file` that only ever raises): listen and device backlogs, TIME_WAIT and orphan sockets, `tcp_mem` as shares of RAM (`remnawave_front_tcp_mem_percent`, 12.5/18.75/25 %) and the connection-tracking table (`remnawave_front_conntrack_per_mb`, 64 per MiB).
+
+**Certificate.** The ACME module answers HTTP-01 on port 80, keeps its account and certificates in `remnawave_nginx_acme_state_dir` (0700) and renews by itself. The applied report's `certificateReady` is whether the port serves a certificate for the origin name, looked for for up to a minute after a start.
+
+**Logs.** No access log; the error log only at `crit` (`remnawave_nginx_error_log_level`): below that nginx writes the client's address into its error lines.
+
+## Decoy site
+
+Every non-transport path and Host gets the decoy: what anyone who probes `https://<origin or edge name>/` sees. This repository is public, so it ships **no decoy of its own**: anything generated from code published here can be read and fingerprinted by the people it is meant to fool.
+
+- **No kit** (`remnawave_decoy_kit` empty, the default): the front server's own stock page, copied from its package (`/usr/share/nginx/html/index.html` with nginx, `/usr/share/caddy/index.html` with Caddy; `remnawave_decoy_stock_page` overrides). Countless fresh installs serve exactly that page.
+- **A kit**, kept in private inventory: `remnawave_decoy_kit` is a directory of templates on the controller, and the playbook provides a filter named `decoy_kit` (in the `filter_plugins` directory next to the playbook, which Ansible loads by itself). `'<reference>' | decoy_kit` returns `{site: {...}, pages: [{template, dest, vars}]}`; the role renders each `template` from the kit to `dest` under the web root, with `site` and `page` (that page's `vars`) in scope. `dest` must be a relative path inside the web root and the pages must include `index.html`; a `404.html` becomes nginx's not-found page. Don't name a page variable after a dict method (`items`, `keys`, `values`): Jinja's `page.items` is the method.
+
+The reference is picked at random once per machine and kept in `/opt/remnanode/.decoy_ref`, never derived from the node's name: the same site on every run and after a rename, another one on another machine (as far as the kit varies it). Files the site does not have (the maintenance page of earlier releases, another kit's pages) are removed.
+
 ## Members' addresses
 
-A member's address never reaches the node's Xray. On a node whose mode runs Caddy, every route's `reverse_proxy` removes each request header in `remnawave_caddy_strip_request_headers` before the request goes to the loopback inbound, WebSocket upgrades included: Caddy proxies the upgrade request like any other and applies `header_up` to it. The default list holds every header an edge or a client may put the address in (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `True-Client-IP`, the edges' own client-IP headers, and the like). An edge strips what it can, but some add a header their own configuration cannot remove, so Caddy is the last place to drop it. A new name is one more line in the list; the render test fails if the default loses one it requires.
+A member's address never reaches the node's Xray. With nginx in front, every route clears each header in `remnawave_caddy_strip_request_headers` (`proxy_set_header <name> ""`, `grpc_set_header` for gRPC) and nothing adds one, so Xray sees every member as a loopback address. On a node whose mode runs Caddy, every route's `reverse_proxy` removes each request header in `remnawave_caddy_strip_request_headers` before the request goes to the loopback inbound, WebSocket upgrades included: Caddy proxies the upgrade request like any other and applies `header_up` to it. The default list holds every header an edge or a client may put the address in (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `True-Client-IP`, the edges' own client-IP headers, and the like). An edge strips what it can, but some add a header their own configuration cannot remove, so Caddy is the last place to drop it. A new name is one more line in the list; the render test fails if the default loses one it requires.
 
 `X-Forwarded-For` goes too, including the one Caddy sets itself (the edge server's address: the Caddyfile trusts no proxy), so Xray sees every member as `127.0.0.1`. `X-Forwarded-Proto`, `X-Forwarded-Host` and `Via` stay; they carry no address. The Caddyfile sets no `trusted_proxies` or `client_ip_headers`, and even with them nothing would pass: `header_up` runs after Caddy sets its `X-Forwarded-*` headers. Caddy itself still receives the headers (it ends TLS), and writes no access log on a node (the Caddyfile has no `log` directive).
 
@@ -203,11 +231,22 @@ If all of that fails, the run stops and says what to set. The login is written, 
 | `remnawave_caddy_email`               |                        | ACME registration (a mode that runs Caddy)                                |
 | `remnawave_caddy_listen_port`         | `443`                  |                                                                           |
 | `remnawave_decoy_root`                | `/var/www/decoy`       |                                                                           |
-| `remnawave_caddy_strip_request_headers` | the client-address headers | Request headers Caddy removes before a route reaches Xray, one name per line; see [Members' addresses](#members-addresses) |
+| `remnawave_decoy_kit`                 |                        | A private decoy kit's template directory; empty: the stock page. See [Decoy site](#decoy-site) |
+| `remnawave_decoy_stock_page`          |                        | The page served without a kit; empty: the front server's own              |
+| `remnawave_caddy_strip_request_headers` | the client-address headers | Request headers the front server removes before a route reaches Xray, one name per line; see [Members' addresses](#members-addresses) |
+| `remnawave_front_server`              | `caddy`                | `caddy` or `nginx`; see [Front server](#front-server-caddy-or-nginx)       |
+| `remnawave_nginx_max_connections`     | 32 per MiB of RAM      | Connections nginx can hold in all                                         |
+| `remnawave_nginx_loopback_sources`    | `64`                   | Loopback addresses nginx reaches Xray from                                |
+| `remnawave_nginx_stream_timeout`      | `1h`                   | How long a proxied stream may stay silent                                 |
+| `remnawave_nginx_worker_shutdown_timeout` | `10m`              | How long old workers keep sessions after a reload or upgrade              |
+| `remnawave_nginx_error_log_level`     | `crit`                 | Lower levels write client addresses                                       |
+| `remnawave_nginx_*` (others)          |                        | Configuration path, signing key, ACME directory and state, resolvers, backlog |
+| `remnawave_front_kernel_tuning`       | `true`                 | Raise the kernel's connection limits on an nginx node                     |
+| `remnawave_front_tcp_mem_percent` / `_conntrack_per_mb` | `[12.5, 18.75, 25]` / `64` | `tcp_mem` and connection tracking from RAM          |
 
 ## What the role writes on the machine
 
-`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile`, the decoy under `/var/www/decoy` (a maintenance page that carries no part of the node's name, only a reference picked at random once per machine and kept in `/opt/remnanode/.decoy_ref`), and Caddy's state, data and config directories (`/var/lib/caddy`, its `.local/share/caddy` and `.config/caddy`, owned by `caddy`), made before Caddy starts in case an earlier install left the `caddy` user without its home; for the length of a pull only, the Docker Hub login under `/run/remnanode-docker` and the IPv4 pin in `/etc/hosts`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
+`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs a front server the decoy under `/var/www/decoy` (the stock page, or a kit's site from a reference picked at random once per machine and kept in `/opt/remnanode/.decoy_ref`, never from the node's name); with Caddy `/etc/caddy/Caddyfile` and and Caddy's state, data and config directories (`/var/lib/caddy`, its `.local/share/caddy` and `.config/caddy`, owned by `caddy`), made before Caddy starts in case an earlier install left the `caddy` user without its home; with nginx the nginx.org key, repository, pin (`/etc/apt/preferences.d/99freesocks-nginx`) and unattended-upgrades origin (`/etc/apt/apt.conf.d/52freesocks-nginx`), `/etc/nginx/freesocks/nginx.conf`, the unit drop-in `/etc/systemd/system/nginx.service.d/freesocks.conf`, the ACME state under `/var/lib/nginx-acme` and the kernel drop-in `/etc/sysctl.d/61-freesocks-front.conf`; for the length of a pull only, the Docker Hub login under `/run/remnanode-docker` and the IPv4 pin in `/etc/hosts`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
 
 ## Testing
 
@@ -215,7 +254,7 @@ If all of that fails, the run stops and says what to set. The login is written, 
 tests/run.sh
 ```
 
-Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a new node named after its inventory host (or refused when the host name is not a DNS label) and a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed) and the compose render, the decoy page (`test_decoy.yml`: no part of the node's name, the same page on every run and after a rename, another reference on another machine), the management address resolution, the image pull against a mock Docker API (`test_image_pull.yml`, `tests/mock_docker.py`: the mirror, the login, the retries while the registry answers 429, the IPv4 pin and its removal, a failure that stops at once). The image pull test needs `community.docker` (`requirements.yml`) and the `requests` library in the Python that runs Ansible. CI runs the same, with Caddy installed.
+Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a new node named after its inventory host (or refused when the host name is not a DNS label) and a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed), the nginx render (`test_nginx_conf_render.yml`: default server, ACME, routes and gRPC, the loopback spread, every client-address header cleared, no access log; `nginx -t` when nginx and its ACME module are installed) and the compose render, the decoy (`test_decoy.yml` with the test-only kit in `tests/decoy-kit` and `tests/filter_plugins`, `tests/decoy_site_check.py`: the stock page alone without a kit, the kit's pages with `site` and `page`, no part of the node's name, nothing from another host and no broken link, the same site on every run and after a rename, another on another machine, an earlier decoy's files removed, a page outside the web root refused), the front kernel limits against a fake `sysctl` (`test_front_sysctl.yml`, `tests/fake_sysctl.py`: raised from RAM, never lowered, applied once), the management address resolution, the image pull against a mock Docker API (`test_image_pull.yml`, `tests/mock_docker.py`: the mirror, the login, the retries while the registry answers 429, the IPv4 pin and its removal, a failure that stops at once). The image pull test needs `community.docker` (`requirements.yml`) and the `requests` library in the Python that runs Ansible. CI runs the same, with Caddy and nginx (with its ACME module) installed.
 
 ## License
 

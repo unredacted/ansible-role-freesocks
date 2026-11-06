@@ -1,0 +1,160 @@
+{# templates/nginx/freesocks-nginx.conf.j2
+   Rendered to {{ remnawave_nginx_conf }} (never /etc/nginx/nginx.conf: that
+   is the package's conffile, and an edited conffile makes unattended-upgrades
+   hold nginx back). The unit reads this file through CONFFILE in the role's
+   drop-in.
+
+   The same shape as the Caddyfile: one TLS site for the origin hostname that
+   is also the default server, so an edge that sends its OWN hostname as SNI
+   and Host is answered with the origin certificate (Caddy's fallback_sni plus
+   catch-all); each route FCP declared proxied to its loopback inbound; every
+   other path the decoy (decoy.yml: the stock page, or a kit's site, whose own
+   404.html is used when it has one; otherwise nginx's stock not-found page). HTTP-01 on port 80, everything else there
+   redirects to https.
+
+   Every connection to Xray leaves from one of remnawave_nginx_loopback_sources
+   loopback addresses (127.0.0.1, .2, ...), spread by split_clients: from a
+   single source the host's ephemeral port range caps the sessions one inbound
+   can hold (49k with 15000-64000), whatever RAM and vCPUs the node has.
+
+   Members' addresses never reach Xray: every route clears each header in
+   remnawave_caddy_strip_request_headers (an empty value is not sent), and
+   nothing adds X-Forwarded-For or X-Real-IP. Logs keep no addresses: no
+   access log, and the error log only at remnawave_nginx_error_log_level
+   (nginx writes the client's address into most error lines below crit).
+#}
+{% macro proxy_block(r) %}
+            proxy_pass http://127.0.0.1:{{ r.port }};
+            proxy_bind $freesocks_loopback_src;
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+{% for h in remnawave_caddy_strip_request_headers %}
+            proxy_set_header {{ h }} "";
+{% endfor %}
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_read_timeout {{ remnawave_nginx_stream_timeout }};
+            proxy_send_timeout {{ remnawave_nginx_stream_timeout }};
+{% endmacro %}
+# Managed by ansible-role-freesocks: changes here are overwritten.
+load_module modules/ngx_http_acme_module.so;
+
+user nginx;
+worker_processes auto;
+worker_rlimit_nofile {{ nginx_worker_rlimit_nofile }};
+worker_shutdown_timeout {{ remnawave_nginx_worker_shutdown_timeout }};
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log {{ remnawave_nginx_error_log_level }};
+
+events {
+    worker_connections {{ nginx_worker_connections }};
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    access_log off;
+    server_tokens off;
+    sendfile on;
+    tcp_nopush on;
+    keepalive_timeout 65s;
+
+    # The ACME module looks the directory up at runtime.
+    resolver {{ nginx_resolvers | join(' ') }} valid=300s{{ '' if nginx_ipv6 else ' ipv6=off' }};
+    resolver_timeout 10s;
+
+    acme_issuer freesocks {
+        uri {{ remnawave_nginx_acme_directory }};
+        contact {{ remnawave_caddy_email }};
+        state_path {{ remnawave_nginx_acme_state_dir }};
+        accept_terms_of_service;
+        challenge http-01;
+    }
+
+    split_clients "$remote_addr$remote_port$connection" $freesocks_loopback_src {
+{% set _n = remnawave_nginx_loopback_sources | int %}
+{% set _pct = ((10000 // _n) / 100) %}
+{% for i in range(1, _n) %}
+        {{ '%.2f' | format(_pct) }}% 127.0.0.{{ i }};
+{% endfor %}
+        * 127.0.0.{{ _n }};
+    }
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:32m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    server {
+        listen 80 default_server backlog={{ nginx_backlog }};
+{% if nginx_ipv6 %}
+        listen [::]:80 default_server backlog={{ nginx_backlog }};
+{% endif %}
+        server_name {{ origin_hostname }};
+
+        location / {
+            return 301 https://$host{{ '' if (nginx_listen_port | int) == 443 else ':' ~ nginx_listen_port }}$request_uri;
+        }
+    }
+
+    server {
+        listen {{ nginx_listen_port }} ssl default_server reuseport backlog={{ nginx_backlog }};
+{% if nginx_ipv6 %}
+        listen [::]:{{ nginx_listen_port }} ssl default_server reuseport backlog={{ nginx_backlog }};
+{% endif %}
+{% if nginx_routes | selectattr('upstream', 'defined') | selectattr('upstream', 'equalto', 'h2c') | list | length > 0 %}
+        http2 on;
+{% endif %}
+        server_name {{ origin_hostname }};
+
+        acme_certificate freesocks {{ origin_hostname }};
+        ssl_certificate $acme_certificate;
+        ssl_certificate_key $acme_certificate_key;
+        ssl_certificate_cache max=4;
+
+        root {{ remnawave_decoy_root }};
+        index index.html;
+{% if _decoy_has_404 | default(false) | bool %}
+        error_page 404 /404.html;
+{% endif %}
+
+{% for r in nginx_routes %}
+{% if r.upstream | default('') == 'h2c' %}
+        # route {{ loop.index }}: gRPC, its calls are {{ r.path }}/<method>
+        location ^~ {{ r.path }}/ {
+            grpc_pass grpc://127.0.0.1:{{ r.port }};
+            grpc_bind $freesocks_loopback_src;
+{% for h in remnawave_caddy_strip_request_headers %}
+            grpc_set_header {{ h }} "";
+{% endfor %}
+            grpc_read_timeout {{ remnawave_nginx_stream_timeout }};
+            grpc_send_timeout {{ remnawave_nginx_stream_timeout }};
+        }
+{% else %}
+        # route {{ loop.index }}: the path itself (WebSocket, HTTP Upgrade) and
+        # what lies under it (XHTTP)
+        location = {{ r.path }} {
+{{ proxy_block(r) }}        }
+        location ^~ {{ r.path }}/ {
+{{ proxy_block(r) }}        }
+{% endif %}
+{% endfor %}
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+{% if _decoy_has_404 | default(false) | bool %}
+        location = /404.html {
+            internal;
+        }
+{% endif %}
+    }
+}

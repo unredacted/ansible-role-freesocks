@@ -1,13 +1,23 @@
 ---
 # tests/test_decoy.yml
 #
-# Offline test of tasks/setup/decoy.yml, the page Caddy serves on every
-# non-transport path:
-#   (a) the page carries no part of the node's name, in its title or anywhere
-#       else, and its reference is the one the machine keeps in .decoy_ref;
-#   (b) a second run leaves the page and the reference as they were;
-#   (c) after a rename the page is the same and does not carry the new name;
-#   (d) another machine picks another reference, so pages are not identical.
+# Offline test of tasks/setup/decoy.yml. The role ships no decoy of its own
+# (this repository is public): with no kit it serves the front server's stock
+# page, with a kit (private inventory) the kit's site. The kit here is the
+# test-only tests/decoy-kit with its filter in tests/filter_plugins.
+#   (a) no kit: the stock page, alone; what an earlier decoy left (the old
+#       maintenance page, a stray file) is removed;
+#   (b) a kit: each of its pages rendered with `site` and `page`, its
+#       directories made, the stock page replaced; no part of the node's name
+#       anywhere, nothing from another host, every internal link resolves;
+#   (c) a second run, and a rename, leave every file as it was;
+#   (d) another machine picks another reference and gets another site;
+#   (e) back to no kit: the kit's pages go, the stock page comes back;
+#   (f) a kit page that would land outside the web root is refused.
+#
+# The node names use no word a kit is likely to: a real name may share a
+# common word with a decoy by chance (the decoy never reads the name), which
+# would make this check flaky, not prove a leak.
 #
 # Run: ansible-playbook tests/test_decoy.yml
 - hosts: localhost
@@ -17,104 +27,192 @@
     _dir: "{{ playbook_dir }}/.decoy"
     remnawave_node_install_dir: "{{ _dir }}/a/node"
     remnawave_decoy_root: "{{ _dir }}/a/www"
+    remnawave_decoy_stock_page: "{{ _dir }}/stock/index.html"
+    remnawave_decoy_kit: ""
+    _kit: "{{ playbook_dir }}/decoy-kit"
     _fcp_become: false
-    node_name: "bright-harbor-lane"
+    node_name: "quorvel-tamsik-brenn"
   tasks:
     - block:
-        - name: Prepare the machine directory
+        - name: Prepare the machine, the web root and a stock page
           file:
-            path: "{{ remnawave_node_install_dir }}"
+            path: "{{ item }}"
             state: directory
+          loop:
+            - "{{ remnawave_node_install_dir }}"
+            - "{{ remnawave_decoy_root }}/old"
+            - "{{ _dir }}/stock"
 
-        # (a) a fresh machine
-        - name: Set up the decoy
+        - name: Write the stock page, an earlier decoy's page and stray files
+          copy:
+            content: "{{ item.c }}"
+            dest: "{{ item.p }}"
+          loop:
+            - { p: "{{ remnawave_decoy_stock_page }}", c: "<title>Welcome to a web server!</title>\n" }
+            - { p: "{{ remnawave_decoy_root }}/index.html", c: "<title>Scheduled maintenance</title>" }
+            - { p: "{{ remnawave_decoy_root }}/old/page.html", c: "left over" }
+            - { p: "{{ remnawave_decoy_root }}/.hidden", c: "left over" }
+
+        # (a) no kit
+        - name: Set up the decoy without a kit
           include_role:
             name: ansible-role-freesocks
             tasks_from: setup/decoy.yml
 
-        - name: Read the page and the reference
-          set_fact:
-            _page: "{{ lookup('file', remnawave_decoy_root ~ '/index.html') }}"
-            _ref: "{{ lookup('file', remnawave_node_install_dir ~ '/.decoy_ref') | trim }}"
+        - name: Read the web root
+          command: python3 {{ playbook_dir }}/decoy_site_check.py {{ remnawave_decoy_root }} {{ node_name }}
+          register: _a
+          changed_when: false
 
-        - name: Assert the page carries no part of the node's name
+        - name: Assert the stock page, alone
           assert:
             that:
-              - node_name not in _page
-              - node_name | replace('-', ' ') | title not in _page
-              - node_name.split('-') | select('in', _page | lower) | list | length == 0
-              - "'<title>Scheduled maintenance</title>' in _page"
-              - _ref is match('^[0-9a-f]{8}$')
-              - "'Ref: ' ~ _ref in _page"
-            fail_msg: "The decoy page shows the node's name: {{ _page }}"
-            success_msg: "the page carries a random reference ({{ _ref }}), not the name."
+              - (_a.stdout | from_json).files == ['index.html']
+              - lookup('file', remnawave_decoy_root ~ '/index.html') == lookup('file', remnawave_decoy_stock_page)
+              - lookup('file', remnawave_node_install_dir ~ '/.decoy_ref') | trim is match('^[0-9a-f]{8}$')
+              - not (_decoy_has_404 | bool)
+            success_msg: "no kit: the stock page, and nothing an earlier decoy left."
 
-        - name: Note the page
-          stat:
-            path: "{{ remnawave_decoy_root }}/index.html"
-          register: _first
-
-        # (b) the next run
-        - name: Set up the decoy again
+        # (b) a kit
+        - name: Set up the decoy with the kit
           include_role:
             name: ansible-role-freesocks
             tasks_from: setup/decoy.yml
+          vars:
+            remnawave_decoy_kit: "{{ _kit }}"
 
-        - name: Note the page again
+        - name: Read the site
+          command: python3 {{ playbook_dir }}/decoy_site_check.py {{ remnawave_decoy_root }} {{ node_name }}
+          register: _b
+          changed_when: false
+
+        - name: Note what was found
+          set_fact:
+            _site: "{{ _b.stdout | from_json }}"
+            _ref: "{{ lookup('file', remnawave_node_install_dir ~ '/.decoy_ref') | trim }}"
+
+        - name: Note what the kit says this machine's site is
+          set_fact:
+            _model: "{{ _ref | decoy_kit }}"
+
+        - name: Assert the kit's site, rendered with site and page
+          assert:
+            that:
+              - _site.files == (_model.pages | map(attribute='dest') | sort | list)
+              - ('<title>' ~ _model.site.title ~ '</title>') in lookup('file', remnawave_decoy_root ~ '/index.html')
+              - _model.pages[2].vars.id in lookup('file', remnawave_decoy_root ~ '/' ~ _model.pages[2].dest)
+              - _decoy_has_404 | bool
+              - _site.name_parts | length == 0
+              - _site.external | length == 0
+              - _site.broken | length == 0
+            fail_msg: "files {{ _site.files }}, broken {{ _site.broken }}, external {{ _site.external }}, name {{ _site.name_parts }}"
+            success_msg: "kit: {{ _site.files | length }} pages, no name, nothing external, no broken link."
+
+        - name: Note every file's checksum
           stat:
-            path: "{{ remnawave_decoy_root }}/index.html"
+            path: "{{ remnawave_decoy_root }}/{{ item }}"
+          loop: "{{ _site.files }}"
+          register: _first
+
+        # (c) again, and after a rename
+        - name: Set up the decoy again, after a rename
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/decoy.yml
+          vars:
+            remnawave_decoy_kit: "{{ _kit }}"
+            node_name: "plinth-osvar-kettu"
+
+        - name: Note every file's checksum again
+          stat:
+            path: "{{ remnawave_decoy_root }}/{{ item }}"
+          loop: "{{ _site.files }}"
           register: _second
 
         - name: Assert nothing changed
           assert:
             that:
-              - _second.stat.checksum == _first.stat.checksum
+              - (_second.results | map(attribute='stat.checksum') | list) == (_first.results | map(attribute='stat.checksum') | list)
               - lookup('file', remnawave_node_install_dir ~ '/.decoy_ref') | trim == _ref
-            success_msg: "a second run keeps the page and its reference."
-
-        # (c) FCP renamed the node
-        - name: The machine's new name
-          set_fact:
-            node_name: "calm-river-delta"
-
-        - name: Set up the decoy after the rename
-          include_role:
-            name: ansible-role-freesocks
-            tasks_from: setup/decoy.yml
-
-        - name: Note the page after the rename
-          stat:
-            path: "{{ remnawave_decoy_root }}/index.html"
-          register: _renamed
-
-        - name: Assert the rename left the page as it was
-          assert:
-            that:
-              - _renamed.stat.checksum == _first.stat.checksum
-              - node_name not in lookup('file', remnawave_decoy_root ~ '/index.html')
-            success_msg: "a rename does not show on the page."
+            success_msg: "a second run and a rename keep the site and its reference."
 
         # (d) another machine
-        - name: Prepare another machine's directory
+        - name: Prepare another machine
           file:
             path: "{{ _dir }}/b/node"
             state: directory
 
-        - name: Set up another machine's decoy
+        - name: Set up another machine's decoy with the kit
           include_role:
             name: ansible-role-freesocks
             tasks_from: setup/decoy.yml
           vars:
             remnawave_node_install_dir: "{{ _dir }}/b/node"
             remnawave_decoy_root: "{{ _dir }}/b/www"
+            remnawave_decoy_kit: "{{ _kit }}"
 
-        - name: Assert it picked another reference
+        - name: Assert another reference and another site
           assert:
             that:
-              - lookup('file', _dir ~ '/b/node/.decoy_ref') | trim is match('^[0-9a-f]{8}$')
               - lookup('file', _dir ~ '/b/node/.decoy_ref') | trim != _ref
-              - lookup('file', _dir ~ '/b/www/index.html') != _page
-            success_msg: "another machine's page differs from this one's."
+              - lookup('file', _dir ~ '/b/www/index.html') != lookup('file', remnawave_decoy_root ~ '/index.html')
+            success_msg: "another machine, another site."
+
+        # (e) back to no kit
+        - name: Set up the decoy without a kit again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/decoy.yml
+
+        - name: Read the web root again
+          command: python3 {{ playbook_dir }}/decoy_site_check.py {{ remnawave_decoy_root }} {{ node_name }}
+          register: _e
+          changed_when: false
+
+        - name: Assert the kit's pages are gone
+          assert:
+            that:
+              - (_e.stdout | from_json).files == ['index.html']
+              - lookup('file', remnawave_decoy_root ~ '/index.html') == lookup('file', remnawave_decoy_stock_page)
+            success_msg: "back to the stock page."
+
+        # (f) a page outside the web root
+        - name: Prepare a machine whose kit page escapes the web root
+          file:
+            path: "{{ _dir }}/c/node"
+            state: directory
+
+        - name: Give it the reference the test kit escapes with
+          copy:
+            content: "deadbeef\n"
+            dest: "{{ _dir }}/c/node/.decoy_ref"
+
+        - name: Set it up
+          block:
+            - name: Set up the decoy with the escaping page
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/decoy.yml
+              vars:
+                remnawave_node_install_dir: "{{ _dir }}/c/node"
+                remnawave_decoy_root: "{{ _dir }}/c/www"
+                remnawave_decoy_kit: "{{ _kit }}"
+
+            - name: It should have stopped
+              set_fact:
+                _escaped: true
+          rescue:
+            - name: Note the refusal
+              set_fact:
+                _refused: "{{ ansible_failed_result.msg | default('') }}"
+
+        - name: Assert the escaping page was refused and nothing escaped
+          assert:
+            that:
+              - _escaped is not defined
+              - "'relative paths inside the web root' in _refused"
+              - not (_dir ~ '/c/escape.html') is exists
+            success_msg: "a page outside the web root is refused."
       always:
         - name: Clean up
           file:

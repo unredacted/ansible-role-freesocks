@@ -1,0 +1,105 @@
+---
+# tasks/setup/front_sysctl.yml - the kernel limits a front node running nginx
+# wants, in ONE drop-in of the role's (remnawave_front_sysctl_file), applied at
+# once and loaded again at boot. Every value is only RAISED: a larger one the
+# machine already has is written as it is.
+#
+#   net.core.somaxconn, net.ipv4.tcp_max_syn_backlog  the listen queues
+#       (nginx asks for remnawave_nginx_backlog; the kernel caps it here)
+#   net.core.netdev_max_backlog   packets queued per CPU before the stack
+#   net.ipv4.tcp_max_tw_buckets, tcp_max_orphans   closing sockets kept
+#   net.ipv4.tcp_mem   the kernel's TCP memory, as shares of RAM
+#       (remnawave_front_tcp_mem_percent): past "pressure" it shrinks every
+#       socket's buffers, past "high" it refuses memory. Each of the three is
+#       raised, and kept in order (low <= pressure <= high)
+#   net.netfilter.nf_conntrack_max   connection-tracking entries, per MiB of
+#       RAM (only where the module is loaded)
+#
+# Shares of RAM grow with the machine: more RAM raises them on the next run.
+# Separate keys from the node drop-in (QUIC buffers, BBR); nothing else in
+# /etc/sysctl.d is touched.
+
+- name: Read the kernel's connection limits
+  command: >-
+    sysctl -n net.core.somaxconn net.ipv4.tcp_max_syn_backlog
+    net.core.netdev_max_backlog net.ipv4.tcp_max_tw_buckets
+    net.ipv4.tcp_max_orphans net.ipv4.tcp_mem
+  register: _front_sysctl_now
+  changed_when: false
+
+- name: Is connection tracking loaded
+  stat:
+    path: "{{ _front_conntrack_proc | default('/proc/sys/net/netfilter/nf_conntrack_max') }}"
+  register: _front_conntrack
+
+- name: Read the connection-tracking limit
+  command: sysctl -n net.netfilter.nf_conntrack_max
+  register: _front_conntrack_now
+  changed_when: false
+  when: _front_conntrack.stat.exists
+
+- name: Work out the limits
+  vars:
+    _now: "{{ _front_sysctl_now.stdout_lines }}"
+    _mem_now: "{{ _now[5].split() | map('int') | list }}"
+    _pages: "{{ (ansible_memtotal_mb | int) * 256 }}"
+    _pct: "{{ remnawave_front_tcp_mem_percent | map('float') | list }}"
+    _mem_want: >-
+      {{ [((_pct[0] * (_pages | int) / 100) | int),
+          ((_pct[1] * (_pages | int) / 100) | int),
+          ((_pct[2] * (_pages | int) / 100) | int)] }}
+  set_fact:
+    _front_sysctl_settings: >-
+      {{ {'net.core.somaxconn': [_now[0] | int, remnawave_nginx_backlog | int] | max,
+          'net.ipv4.tcp_max_syn_backlog': [_now[1] | int, 65535] | max,
+          'net.core.netdev_max_backlog': [_now[2] | int, 16384] | max,
+          'net.ipv4.tcp_max_tw_buckets': [_now[3] | int, 2000000] | max,
+          'net.ipv4.tcp_max_orphans': [_now[4] | int, 262144] | max,
+          'net.ipv4.tcp_mem': ([_mem_now[0], _mem_want[0]] | max | string) ~ ' '
+                              ~ ([_mem_now[0], _mem_want[0], _mem_now[1], _mem_want[1]] | max | string) ~ ' '
+                              ~ ((_mem_now + _mem_want) | max | string)}
+         | combine({'net.netfilter.nf_conntrack_max':
+                      [_front_conntrack_now.stdout | int,
+                       (ansible_memtotal_mb | int) * (remnawave_front_conntrack_per_mb | int)] | max}
+                   if _front_conntrack.stat.exists else {}) }}
+    _front_sysctl_live: >-
+      {{ {'net.core.somaxconn': _now[0] | int,
+          'net.ipv4.tcp_max_syn_backlog': _now[1] | int,
+          'net.core.netdev_max_backlog': _now[2] | int,
+          'net.ipv4.tcp_max_tw_buckets': _now[3] | int,
+          'net.ipv4.tcp_max_orphans': _now[4] | int,
+          'net.ipv4.tcp_mem': _mem_now | map('string') | join(' ')}
+         | combine({'net.netfilter.nf_conntrack_max': _front_conntrack_now.stdout | int}
+                   if _front_conntrack.stat.exists else {}) }}
+
+- name: Assert tcp_mem's shares rise
+  assert:
+    that:
+      - remnawave_front_tcp_mem_percent | length == 3
+      - (remnawave_front_tcp_mem_percent | map('float') | list) == (remnawave_front_tcp_mem_percent | map('float') | sort)
+      - (remnawave_front_tcp_mem_percent | map('float') | max) <= 50
+    fail_msg: "remnawave_front_tcp_mem_percent must be three rising shares of RAM, at most 50"
+    quiet: true
+
+- name: Write the role's front sysctl drop-in
+  copy:
+    content: |
+      # Managed by ansible-role-freesocks: kernel limits for a front node
+      # (remnawave_front_kernel_tuning). Raised only; edits are overwritten.
+      {% for k, v in _front_sysctl_settings | dictsort %}
+      {{ k }} = {{ v }}
+      {% endfor %}
+    dest: "{{ remnawave_front_sysctl_file }}"
+    mode: '0644'
+  register: _front_sysctl_written
+  become: "{{ _fcp_become | default(true) }}"
+
+# What the kernel runs, not only what the file says: a run that wrote the file
+# and stopped before applying it applies it on the next run.
+- name: Apply the drop-in
+  command: sysctl -q -p {{ remnawave_front_sysctl_file }}
+  become: "{{ _fcp_become | default(true) }}"
+  when: >-
+    _front_sysctl_written is changed
+    or (_front_sysctl_settings | dictsort | map('join', '=') | list)
+       != (_front_sysctl_live | dictsort | map('join', '=') | list)
