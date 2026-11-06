@@ -30,69 +30,8 @@
     fail_msg: "remnawave_caddy_email is required on a node that runs a front server (ACME registration)"
 
 # === Install nginx from nginx.org ===
-- name: Ensure /etc/apt/keyrings exists
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
-  become: yes
-
-- name: Download the nginx.org signing key
-  get_url:
-    url: https://nginx.org/keys/nginx_signing.key
-    dest: /etc/apt/keyrings/nginx-archive-keyring.asc
-    mode: '0644'
-    force: no
-  become: yes
-
-# Only the fingerprint records of the PRIMARY keys (the `fpr` line right after
-# each `pub` line), field 10 exactly: a fingerprint written into a user ID or
-# another field never counts. Every primary key in the file must be one of
-# nginx.org's published keys, so an extra key added beside them is refused
-# too (APT would trust it for this repository).
-- name: Read the signing keys' fingerprints
-  shell: >-
-    set -o pipefail;
-    gpg --show-keys --with-colons /etc/apt/keyrings/nginx-archive-keyring.asc
-    | awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }'
-  args:
-    executable: /bin/bash
-  register: _nginx_key
-  changed_when: false
-
-- name: Assert they are nginx.org's keys, and only those
-  assert:
-    that:
-      - _nginx_key.stdout_lines | length > 0
-      - _nginx_key.stdout_lines | difference(remnawave_nginx_signing_key_fingerprints) | length == 0
-    fail_msg: >-
-      /etc/apt/keyrings/nginx-archive-keyring.asc holds keys that are not
-      nginx.org's published signing keys
-      ({{ _nginx_key.stdout_lines | difference(remnawave_nginx_signing_key_fingerprints) | join(', ') or 'none at all' }}):
-      remove it and run again, or compare it with
-      https://nginx.org/en/linux_packages.html.
-
-- name: Pin nginx.org over Debian's nginx
-  template:
-    src: nginx/apt-preferences.j2
-    dest: /etc/apt/preferences.d/99freesocks-nginx
-    mode: '0644'
-  become: yes
-
-- name: Add the nginx.org apt repository
-  apt_repository:
-    repo: "deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.asc] https://nginx.org/packages/debian {{ ansible_distribution_release }} nginx"
-    filename: nginx-org
-    state: present
-    update_cache: yes
-  become: yes
-
-- name: Let unattended-upgrades install nginx.org's releases
-  template:
-    src: nginx/unattended-upgrades.j2
-    dest: /etc/apt/apt.conf.d/52freesocks-nginx
-    mode: '0644'
-  become: yes
+- name: Add nginx.org's apt repository
+  include_tasks: nginx_repo.yml
 
 # Its postinst starts nginx straight away on a fresh install, with the
 # package's own configuration (port 80, the package's page). The unit is
