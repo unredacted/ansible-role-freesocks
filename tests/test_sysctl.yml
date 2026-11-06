@@ -8,7 +8,7 @@
 #       that wrote the file but never applied it applies on the next run;
 #   (d) a larger limit the machine already has is kept (raise only);
 #   (e) BBR (opt-in) adds fq + bbr and loads tcp_bbr at boot; (f) a kernel
-#       without BBR stops the run; (g) with both off the drop-in is removed.
+#       without BBR stops the run and leaves no boot file asking for it; (g) with both off the drop-in is removed.
 #
 # Run: ansible-playbook tests/test_sysctl.yml
 - hosts: localhost
@@ -186,7 +186,8 @@
               assert:
                 that:
                   - "'offers no BBR' in (ansible_failed_result.msg | default(''))"
-                success_msg: "no BBR: the run stops."
+                  - not (node_sysctl_modules_file is exists)
+                success_msg: "no BBR: the run stops and the boot file (left by (e)) is gone."
 
         - name: (g) both off
           include_role:

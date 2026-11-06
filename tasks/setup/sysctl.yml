@@ -34,10 +34,13 @@
     quiet: true
   when: node_quic_buffers | bool
 
+# The reads run with become too: sysctl lives in /usr/sbin, which a non-root
+# login's PATH may leave out.
 - name: Read the kernel's buffer limits
   command: sysctl -n net.core.rmem_max net.core.wmem_max
   register: _sysctl_buffers
   changed_when: false
+  become: "{{ _fcp_become | default(true) }}"
   when: node_quic_buffers | bool
 
 - name: Work out the settings
@@ -48,14 +51,6 @@
           if (node_quic_buffers | bool) else {})
          | combine({'net.core.default_qdisc': 'fq', 'net.ipv4.tcp_congestion_control': 'bbr'}
                    if (node_tcp_bbr | bool) else {}) }}
-
-- name: Load the BBR module at boot
-  copy:
-    content: "# Managed by ansible-role-freesocks (node_tcp_bbr).\ntcp_bbr\n"
-    dest: "{{ _sysctl_modules_file }}"
-    mode: '0644'
-  become: "{{ _fcp_become | default(true) }}"
-  when: node_tcp_bbr | bool
 
 - name: Load the BBR module now
   command: modprobe tcp_bbr
@@ -70,7 +65,21 @@
   register: _sysctl_cc
   changed_when: false
   failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
   when: node_tcp_bbr | bool
+
+- name: Note whether BBR can be used
+  set_fact:
+    _sysctl_bbr: "{{ (node_tcp_bbr | bool) and ('bbr' in ((_sysctl_cc.stdout | default('')).split())) }}"
+
+# The boot file is written only once BBR is known to be there, and removed
+# otherwise, so a machine never boots asking for a module it does not have.
+- name: Forget the BBR module
+  file:
+    path: "{{ _sysctl_modules_file }}"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+  when: not (_sysctl_bbr | bool)
 
 - name: Fail closed on a kernel without BBR
   fail:
@@ -80,14 +89,15 @@
       Turn node_tcp_bbr off, or run a kernel with tcp_bbr.
   when:
     - node_tcp_bbr | bool
-    - "'bbr' not in ((_sysctl_cc.stdout | default('')).split())"
+    - not (_sysctl_bbr | bool)
 
-- name: Forget the BBR module
-  file:
-    path: "{{ _sysctl_modules_file }}"
-    state: absent
+- name: Load the BBR module at boot
+  copy:
+    content: "# Managed by ansible-role-freesocks (node_tcp_bbr).\ntcp_bbr\n"
+    dest: "{{ _sysctl_modules_file }}"
+    mode: '0644'
   become: "{{ _fcp_become | default(true) }}"
-  when: not (node_tcp_bbr | bool)
+  when: _sysctl_bbr | bool
 
 - name: Write the role's sysctl drop-in
   copy:
@@ -117,6 +127,7 @@
   register: _sysctl_now
   changed_when: false
   failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
   when: _sysctl_settings | length > 0
 
 - name: Apply the role's sysctl drop-in
