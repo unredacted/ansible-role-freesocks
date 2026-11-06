@@ -7,7 +7,8 @@
 #   deploy   validate -> name and mode -> base packages, Docker ->
 #            resolve addresses -> enroll / report observations (PUT) ->
 #            fetch the machine configuration + node secret (POST bootstrap) ->
-#            let in the ports FCP lists (the role's own firewall rules) ->
+#            let in the ports FCP lists (the role's own firewall rules, TCP
+#            and UDP) -> kernel settings (QUIC buffers, optional BBR) ->
 #            [ingress] wait for the origin name to resolve, Caddy + decoy,
 #            [no ingress] take an earlier run's Caddy out of the way ->
 #            render compose, start the node -> report applied (and which
@@ -89,6 +90,11 @@
           FCP's bootstrap answer carries no firewall list (it predates the firewall
           acknowledgement): the role leaves the host firewall as it is.
       when: _fcp_bootstrap.firewall is none
+
+    # Before the node starts: a QUIC transport (Hysteria 2) opens its UDP
+    # sockets with the buffer limits the kernel has at that moment.
+    - name: Apply the node's kernel settings
+      include_tasks: setup/sysctl.yml
 
     # FCP's bootstrap answer says whether this mode wants Caddy in front of a
     # loopback transport (an ingress with routes); the role knows no shapes.

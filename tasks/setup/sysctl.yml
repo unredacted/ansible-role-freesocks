@@ -1,0 +1,137 @@
+---
+# tasks/setup/sysctl.yml - the kernel settings the node wants, in ONE drop-in
+# of the role's (node_sysctl_file), applied at once and loaded again at boot.
+#
+#   node_quic_buffers  (default on) raise net.core.rmem_max/wmem_max to
+#                      node_quic_buffer_bytes (16 MiB, quic-go's
+#                      recommendation): a QUIC transport (Hysteria 2) asks for
+#                      larger UDP socket buffers than the kernel allows by
+#                      default and drops datagrams under load without them.
+#                      Raise only: a larger limit the machine already has is
+#                      kept as it is.
+#   node_tcp_bbr       (default off) BBR congestion control with the fq qdisc.
+#                      fq applies to an interface's qdisc when it is created,
+#                      so an interface that is up keeps its own until a reboot
+#                      (BBR paces by itself meanwhile).
+#
+# Nothing else in /etc/sysctl.d is touched. With both off the drop-in is
+# removed; the kernel keeps what it was set to until the next boot.
+
+- name: Set the role's sysctl paths
+  set_fact:
+    _sysctl_file: "{{ node_sysctl_file }}"
+    _sysctl_modules_file: "{{ node_sysctl_modules_file }}"
+
+- name: Validate the buffer size
+  assert:
+    that:
+      - (node_quic_buffer_bytes | string) is match('^[0-9]+$')
+      - node_quic_buffer_bytes | int >= 212992
+      - node_quic_buffer_bytes | int <= 1073741824
+    fail_msg: >-
+      node_quic_buffer_bytes must be a number of bytes between 212992 (the
+      kernel's usual default) and 1 GiB (got '{{ node_quic_buffer_bytes }}')
+    quiet: true
+  when: node_quic_buffers | bool
+
+- name: Read the kernel's buffer limits
+  command: sysctl -n net.core.rmem_max net.core.wmem_max
+  register: _sysctl_buffers
+  changed_when: false
+  when: node_quic_buffers | bool
+
+- name: Work out the settings
+  set_fact:
+    _sysctl_settings: >-
+      {{ ({'net.core.rmem_max': [(_sysctl_buffers.stdout_lines[0] | int), (node_quic_buffer_bytes | int)] | max,
+           'net.core.wmem_max': [(_sysctl_buffers.stdout_lines[1] | int), (node_quic_buffer_bytes | int)] | max}
+          if (node_quic_buffers | bool) else {})
+         | combine({'net.core.default_qdisc': 'fq', 'net.ipv4.tcp_congestion_control': 'bbr'}
+                   if (node_tcp_bbr | bool) else {}) }}
+
+- name: Load the BBR module at boot
+  copy:
+    content: "# Managed by ansible-role-freesocks (node_tcp_bbr).\ntcp_bbr\n"
+    dest: "{{ _sysctl_modules_file }}"
+    mode: '0644'
+  become: "{{ _fcp_become | default(true) }}"
+  when: node_tcp_bbr | bool
+
+- name: Load the BBR module now
+  command: modprobe tcp_bbr
+  register: _sysctl_modprobe
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when: node_tcp_bbr | bool
+
+- name: Ask the kernel for BBR
+  command: sysctl -n net.ipv4.tcp_available_congestion_control
+  register: _sysctl_cc
+  changed_when: false
+  failed_when: false
+  when: node_tcp_bbr | bool
+
+- name: Fail closed on a kernel without BBR
+  fail:
+    msg: >-
+      node_tcp_bbr is on but this kernel offers no BBR
+      (available: {{ (_sysctl_cc.stdout | default('') | trim) or 'unknown' }}).
+      Turn node_tcp_bbr off, or run a kernel with tcp_bbr.
+  when:
+    - node_tcp_bbr | bool
+    - "'bbr' not in ((_sysctl_cc.stdout | default('')).split())"
+
+- name: Forget the BBR module
+  file:
+    path: "{{ _sysctl_modules_file }}"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+  when: not (node_tcp_bbr | bool)
+
+- name: Write the role's sysctl drop-in
+  copy:
+    content: |
+      # Managed by ansible-role-freesocks: kernel settings for the node
+      # (node_quic_buffers, node_tcp_bbr). Edits here are overwritten.
+      {% for k, v in _sysctl_settings | dictsort %}
+      {{ k }} = {{ v }}
+      {% endfor %}
+    dest: "{{ _sysctl_file }}"
+    mode: '0644'
+  register: _sysctl_written
+  become: "{{ _fcp_become | default(true) }}"
+  when: _sysctl_settings | length > 0
+
+- name: Remove the role's sysctl drop-in (nothing to set)
+  file:
+    path: "{{ _sysctl_file }}"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+  when: _sysctl_settings | length == 0
+
+# What the kernel runs, not only what the file says: a run that wrote the file
+# and stopped before applying it still applies on the next run.
+- name: Read the kernel's settings
+  command: sysctl -n {{ _sysctl_settings.keys() | sort | join(' ') }}
+  register: _sysctl_now
+  changed_when: false
+  failed_when: false
+  when: _sysctl_settings | length > 0
+
+- name: Apply the role's sysctl drop-in
+  command: sysctl -p {{ _sysctl_file }}
+  register: _sysctl_applied
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - _sysctl_settings | length > 0
+    - (_sysctl_written is changed)
+      or (_sysctl_now.stdout_lines | default([]) | map('trim') | list)
+         != (_sysctl_settings | dictsort | map('last') | map('string') | list)
+
+- name: Say what the kernel runs with
+  debug:
+    msg: >-
+      Kernel settings for {{ node_name }}:
+      {{ _sysctl_settings | dictsort | map('join', ' = ') | join(', ') if _sysctl_settings else 'none of the role' }}.
+  when: (_sysctl_written is changed) or (_sysctl_applied is changed)

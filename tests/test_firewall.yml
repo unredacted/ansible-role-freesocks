@@ -36,7 +36,21 @@
 #              object is pruned as FCP stops listing its ports (never added
 #              to) and forgotten once empty; (s4) with `none` the old object
 #              keeps what FCP still lists; (s5) a wipe empties it; (s6) a
-#              stopped firewalld is remembered for a later run.
+#              stopped firewalld is remembered for a later run;
+#   UDP        every port goes by (port, protocol): (du1) ufw: one profile entry
+#              per protocol, one tuple each; (du2) the UDP port leaves alone;
+#              (du3) 22/udp is not SSH's port: it closes, 22/tcp is kept;
+#              (df1) firewalld: <port protocol="udp">; (df2) a TCP-only list
+#              writes exactly the text of a TCP-only release (no fleet reload
+#              on upgrade); (dn1) nftables: both sets wired, one transaction;
+#              (dn2) a ruleset wired before the UDP set (auto): TCP goes on,
+#              UDP is neither touched nor reported; (dn3) explicit nftables
+#              fails closed only once FCP lists a UDP port (dn4); (dn5) a
+#              TCP-only set file of an older release is read as TCP;
+#              (dx1) a bare number vouches for TCP only; (dx2) {port, protocol}
+#              and '443/udp' vouch for UDP; (dx3) an entry FCP lists without a
+#              protocol is TCP; (dx4) a protocol the role cannot open is left
+#              out and never reported.
 #
 # Run: ansible-playbook tests/test_firewall.yml
 - hosts: localhost
@@ -60,6 +74,17 @@
       - { port: 8443, protocol: tcp, reason: pending }
     _listed_b:
       - { port: 8443, protocol: tcp, reason: serving }
+    # A node serving REALITY on 443/tcp gains Hysteria 2 on 443/udp.
+    _listed_u:
+      - { port: 443, protocol: tcp, reason: serving }
+      - { port: 443, protocol: udp, reason: pending }
+    _report_u: { ports: [{ port: 443, protocol: tcp }, { port: 443, protocol: udp }] }
+    _operator_chains_udp:
+      - name: input
+        hook: input
+        type: filter
+        rules: ["ct state established,related accept", "tcp dport 22 accept", "tcp dport @freesocks_fcp accept",
+                "udp dport @freesocks_fcp_udp accept"]
     _host_bare:
       active: []
       ufw: { installed: false, enabled: false, rules: [], dir: "{{ playbook_dir }}/.fw/ufw" }
@@ -124,7 +149,7 @@
               - "'ports=443,8443/tcp' in lookup('file', _profile)"
               - "'ufw allow freesocks-fcp' in _fake.ufw.rules"
               - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
-              - _fw_open == [443, 8443]
+              - _fw_open == ['443/tcp', '8443/tcp']
               - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}, {'port': 8443, 'protocol': 'tcp'}]}"
               - _fw_changed | bool
               - _new_calls | select('match', '^ufw delete') | list | length == 0
@@ -153,7 +178,7 @@
               - "'ufw app update freesocks-fcp' in _new_calls"
               - _new_calls | select('match', '^ufw delete') | list | length == 0
               - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
-              - _fw_open == [8443]
+              - _fw_open == ['8443/tcp']
               - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
             success_msg: "ufw: pruning touches the role's profile only."
 
@@ -169,8 +194,8 @@
           assert:
             that:
               - "'ports=22,8443/tcp' in lookup('file', _profile)"
-              - _fw_kept_protected == [22]
-              - _fw_open == [22, 8443]
+              - _fw_kept_protected == ['22/tcp']
+              - _fw_open == ['22/tcp', '8443/tcp']
               - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
             success_msg: "ufw: a protected port is never closed on FCP's account."
 
@@ -188,7 +213,7 @@
           assert:
             that:
               - "'ufw app update freesocks-fcp' in _new_calls"
-              - _fw_open == [22, 8443]
+              - _fw_open == ['22/tcp', '8443/tcp']
             success_msg: "ufw: a stale rule is brought to the profile."
 
         - name: (u6) FCP lists nothing
@@ -212,7 +237,7 @@
           assert:
             that:
               - "'ports=22/tcp' in lookup('file', _profile)"
-              - _fw_open == [22]
+              - _fw_open == ['22/tcp']
             success_msg: "ufw: a wipe empties the role's profile but for SSH."
 
         - name: (u8) an explicit ufw on a host without it
@@ -254,7 +279,7 @@
               - "'freesocks-fcp' in _fake.firewalld.runtime.public.services"
               - "'ssh' in _fake.firewalld.permanent.public.services"
               - _fake.firewalld.permanent.public.ports == ['443/tcp']
-              - _fw_open == [443, 8443]
+              - _fw_open == ['443/tcp', '8443/tcp']
               - _fw_report.ports | length == 2
             success_msg: "firewalld: the role's service, the zone's own entries untouched."
 
@@ -277,7 +302,7 @@
           assert:
             that:
               - "'port=\"443\"' not in lookup('file', _service)"
-              - _fw_open == [8443]
+              - _fw_open == ['8443/tcp']
               - _fake.firewalld.runtime.public.ports == ['443/tcp']
               - "'ssh' in _fake.firewalld.runtime.public.services"
               - _new_calls | select('match', '.*--remove-') | list | length == 0
@@ -315,7 +340,7 @@
           assert:
             that:
               - "'firewall-cmd --reload' in _new_calls"
-              - _fw_open == [443, 8443]
+              - _fw_open == ['443/tcp', '8443/tcp']
             success_msg: "firewalld: a lost reload is retried."
 
         - name: (f4) an explicit firewalld that does not run
@@ -359,7 +384,7 @@
               - "'add element inet filter freesocks_fcp { 443, 8443 }' in _fake.nft_transactions[0]"
               - _fake.nft.tables['inet filter'].sets.freesocks_fcp == [443, 8443]
               - _fake.nft.tables['inet filter'].chains == _operator_chains
-              - _fw_open == [443, 8443]
+              - _fw_open == ['443/tcp', '8443/tcp']
               - _fw_report.ports | length == 2
             success_msg: "nftables: the role's set only, in one transaction."
 
@@ -384,7 +409,7 @@
               - "'elements = { 8443 }' in lookup('file', fcp_firewall_nftables_file)"
               - _fake.nft.tables['inet filter'].sets.freesocks_fcp == [8443]
               - _fake.nft.tables['inet filter'].chains == _operator_chains
-              - _fw_open == [8443]
+              - _fw_open == ['8443/tcp']
             success_msg: "nftables: pruning."
 
         - name: (n4) an explicit nftables whose ruleset does not use the set
@@ -467,7 +492,7 @@
           assert:
             that:
               - _fw_effective | bool
-              - _fw_open == [443, 8443]
+              - _fw_open == ['443/tcp', '8443/tcp']
             success_msg: "nftables: a counter on the accept is fine."
 
         # === none ==================================================================
@@ -535,7 +560,7 @@
         - name: (x4) the role opens both, reports what is vouched for
           assert:
             that:
-              - _fw_open == [443, 8443]
+              - _fw_open == ['443/tcp', '8443/tcp']
               - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
             success_msg: "provider filter: only what is vouched for."
 
@@ -550,6 +575,290 @@
             that:
               - _fw_report is none
             success_msg: "provider filter, nothing vouched: the report says nothing."
+
+        # === UDP ===================================================================
+        - name: (du1) ufw, FCP lists 443/tcp and 443/udp
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            _case_state: >-
+              {{ _host_bare | combine({'ufw': {'installed': true, 'enabled': true,
+                 'rules': _operator_ufw_rules}}, recursive=true) }}
+        - name: (du1) one profile entry per protocol, one tuple each, both reported
+          assert:
+            that:
+              - "'ports=443/tcp|443/udp' in lookup('file', _profile)"
+              - "'### tuple ### allow tcp 443 ' in lookup('file', _dir ~ '/ufw/user.rules')"
+              - "'### tuple ### allow udp 443 ' in lookup('file', _dir ~ '/ufw/user.rules')"
+              - _fw_open == ['443/tcp', '443/udp']
+              - _fw_report == _report_u
+              - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
+            success_msg: "ufw: 443/udp beside 443/tcp."
+
+        - name: (du2) FCP lists 443/tcp only
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 443, protocol: tcp, reason: serving }]
+        - name: (du2) the UDP port leaves, the TCP one stays
+          assert:
+            that:
+              - "'ports=443/tcp\n' in lookup('file', _profile) ~ '\n'"
+              - "'ufw app update freesocks-fcp' in _new_calls"
+              - "'allow udp' not in lookup('file', _dir ~ '/ufw/user.rules')"
+              - _fw_open == ['443/tcp']
+              - _fw_closing == ['443/udp']
+            success_msg: "ufw: closing goes by protocol."
+
+        - name: (du3) FCP lists 22/udp for a while
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 22, protocol: tcp, reason: serving }, { port: 22, protocol: udp, reason: serving },
+                         { port: 443, protocol: tcp, reason: serving }]
+        - name: (du3) and stops
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 443, protocol: tcp, reason: serving }]
+        - name: (du3) SSH's port is TCP and 22/udp closes
+          assert:
+            that:
+              - "'ports=22,443/tcp\n' in lookup('file', _profile) ~ '\n'"
+              - _fw_kept_protected == ['22/tcp']
+              - _fw_closing == ['22/udp']
+              - _fw_open == ['22/tcp', '443/tcp']
+            success_msg: "protected ports are keyed by protocol too."
+
+        - name: (df1) firewalld, FCP lists 443/tcp and 443/udp
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['firewalld'], 'firewalld': {'running': true,
+                 'permanent': {'public': {'services': ['ssh'], 'ports': []}},
+                 'runtime': {'public': {'services': ['ssh'], 'ports': []}}}}, recursive=true) }}
+        - name: (df1) the service holds both, loaded
+          assert:
+            that:
+              - "'<port protocol=\"udp\" port=\"443\"/>' in lookup('file', _service)"
+              - "'<port protocol=\"tcp\" port=\"443\"/>' in lookup('file', _service)"
+              - _fake.firewalld.known['freesocks-fcp'] == ['443/tcp', '443/udp']
+              - _fw_open == ['443/tcp', '443/udp']
+              - _fw_report == _report_u
+            success_msg: "firewalld: 443/udp beside 443/tcp."
+
+        - name: (df1b) the same list again
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+        - name: (df1b) nothing reloads
+          assert:
+            that:
+              - not (_fw_changed | bool)
+              - "'firewall-cmd --reload' not in _new_calls"
+            success_msg: "firewalld: idempotent with UDP."
+
+        - name: (df2) a TCP-only list
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+        - name: (df2) the file is exactly what a TCP-only release wrote
+          assert:
+            that:
+              - lookup('file', _service) == _tcp_only_service
+            success_msg: "firewalld: upgrading the role rewrites no TCP-only service."
+          vars:
+            _tcp_only_service: |-
+              <?xml version="1.0" encoding="utf-8"?>
+              <!-- Managed by ansible-role-freesocks: the TCP ports FCP lists for this node. -->
+              <service>
+                <short>freesocks-fcp</short>
+                <description>The TCP ports the FreeSocks Control Plane lists for this node.</description>
+                <port protocol="tcp" port="443"/>
+                <port protocol="tcp" port="8443"/>
+              </service>
+
+        - name: (dn1) nftables, both sets wired
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {'freesocks_fcp': [], 'freesocks_fcp_udp': []}, 'chains': _operator_chains_udp}}}}, recursive=true) }}
+        - name: (dn1) both sets move in one transaction
+          assert:
+            that:
+              - "'set freesocks_fcp_udp {' in lookup('file', fcp_firewall_nftables_file)"
+              - _fake.nft_transactions | length == 1
+              - "'add element inet filter freesocks_fcp { 443 }' in _fake.nft_transactions[0]"
+              - "'add element inet filter freesocks_fcp_udp { 443 }' in _fake.nft_transactions[0]"
+              - _fake.nft.tables['inet filter'].sets.freesocks_fcp == [443]
+              - _fake.nft.tables['inet filter'].sets.freesocks_fcp_udp == [443]
+              - _fw_open == ['443/tcp', '443/udp']
+              - _fw_report == _report_u
+            success_msg: "nftables: a UDP set beside the TCP one."
+
+        - name: (dn1b) the same list again
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+        - name: (dn1b) nothing changes
+          assert:
+            that:
+              - not (_fw_changed | bool)
+              - "'nft -f /dev/stdin' not in _new_calls"
+            success_msg: "nftables: idempotent with UDP."
+
+        - name: (dn2) auto, a ruleset wired before the UDP set existed
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            _case_state: >-
+              {{ _host_bare | combine({'active': ['nftables'], 'nft': {'tables': {'inet filter':
+                 {'sets': {'freesocks_fcp': []}, 'chains': _operator_chains}}}}, recursive=true) }}
+        - name: (dn2) TCP goes on; UDP is neither touched nor reported
+          assert:
+            that:
+              - _fw_effective | bool
+              - _fw_not_in_effect == ['udp']
+              - "'set freesocks_fcp_udp {' in lookup('file', fcp_firewall_nftables_file)"
+              - _fake.nft_transactions | length == 1
+              - "'freesocks_fcp_udp' not in _fake.nft_transactions[0]"
+              - _fw_open == ['443/tcp']
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}]}"
+            success_msg: "nftables: an unwired UDP set holds back UDP only."
+
+        - name: (dn3) explicit nftables, the UDP set not wired, FCP lists a UDP port
+          block:
+            - name: Run against a ruleset without the UDP accept
+              include_tasks: firewall_run.yml
+              vars:
+                _fw_listed: "{{ _listed_u }}"
+                fcp_firewall_backend: nftables
+            - name: (dn3) Unreached
+              assert:
+                that: [false]
+                fail_msg: "An unwired UDP set was taken for open."
+          rescue:
+            - name: (dn3) it fails closed and says how to wire it
+              assert:
+                that:
+                  - "'freesocks_fcp_udp' in (ansible_failed_result.msg | default(''))"
+                  - "'udp dport @freesocks_fcp_udp accept' in (ansible_failed_result.msg | default(''))"
+                  - "'443/udp' in (ansible_failed_result.msg | default(''))"
+                success_msg: "nftables: explicit, a UDP port without its set stops the run."
+
+        - name: (dn4) explicit nftables, the UDP set not wired, TCP only listed
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_a }}"
+            fcp_firewall_backend: nftables
+        - name: (dn4) an operator who never needs UDP is not stopped
+          assert:
+            that:
+              - _fw_open == ['443/tcp', '8443/tcp']
+              - _fw_report.ports | length == 2
+            success_msg: "nftables: no UDP listed, no UDP accept needed."
+
+        - name: (dn5) a set file an older release wrote (TCP only, 443 and 9443)
+          copy:
+            dest: "{{ fcp_firewall_nftables_file }}"
+            content: |
+              # Managed by ansible-role-freesocks: the TCP ports FCP lists for this node.
+              set freesocks_fcp {
+              	type inet_service
+              	elements = { 443, 9443 }
+              }
+        - name: (dn5) FCP lists 443/tcp and 443/udp
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+        - name: (dn5) the old file is read as TCP, so 9443/tcp closes
+          assert:
+            that:
+              - _fw_owned_before == ['443/tcp', '9443/tcp']
+              - _fw_closing == ['9443/tcp']
+            success_msg: "nftables: an older set file is TCP."
+
+        - name: (dx1) none, the operator vouches for 443 (a bare number)
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: [443]
+            _case_state: "{{ _host_bare }}"
+        - name: (dx1) a bare number is TCP, so 443/udp is not reported
+          assert:
+            that:
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}]}"
+            success_msg: "assume-open: 443 is 443/tcp."
+
+        - name: (dx2) {port, protocol} entries
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: [443, { port: 443, protocol: udp }]
+        - name: (dx2) both are reported
+          assert:
+            that:
+              - _fw_report == _report_u
+            success_msg: "assume-open: {port: 443, protocol: udp}."
+
+        - name: (dx2b) the same as -e passes it
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: "{{ _listed_u }}"
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: "443/udp"
+        - name: (dx2b) '443/udp' vouches for UDP only
+          assert:
+            that:
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'udp'}]}"
+            success_msg: "assume-open: '443/udp'."
+
+        - name: (dx3) FCP lists an entry without a protocol
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 443, reason: serving }]
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: true
+        - name: (dx3) it is TCP
+          assert:
+            that:
+              - _fw_listed_keys == ['443/tcp']
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}]}"
+            success_msg: "no protocol: TCP."
+
+        - name: (dx4) FCP lists a protocol the role cannot open
+          include_tasks: firewall_run.yml
+          vars:
+            _fw_listed: [{ port: 443, protocol: tcp, reason: serving }, { port: 5000, protocol: sctp, reason: pending }]
+            fcp_firewall_backend: none
+            fcp_firewall_assume_open: true
+        - name: (dx4) it is left out and never reported
+          assert:
+            that:
+              - _fw_unknown == ['5000/sctp']
+              - _fw_listed_keys == ['443/tcp']
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'tcp'}]}"
+            success_msg: "an unknown protocol is never claimed."
+
+        - name: (dx5) a port that is not one
+          block:
+            - name: Run with port 0
+              include_tasks: firewall_run.yml
+              vars:
+                _fw_listed: [{ port: 0, protocol: udp, reason: serving }]
+                fcp_firewall_backend: none
+            - name: (dx5) Unreached
+              assert:
+                that: [false]
+                fail_msg: "Port 0 was taken."
+          rescue:
+            - name: (dx5) the run stops
+              assert:
+                that:
+                  - "'outside 1-65535' in (ansible_failed_result.msg | default(''))"
+                success_msg: "a port outside 1-65535 stops the run."
 
         # === switching backends ======================================================
         - name: (s1) ufw holds the role's rules
@@ -578,7 +887,7 @@
               - "'ports=8443/tcp' in lookup('file', _profile)"
               - _new_calls | select('match', '^ufw allow') | list | length == 0
               - _operator_ufw_rules | difference(_fake.ufw.rules) | length == 0
-              - _fw_open == [8443]
+              - _fw_open == ['8443/tcp']
               - "_fw_report == {'ports': [{'port': 8443, 'protocol': 'tcp'}]}"
               - lookup('file', _marker).splitlines() == ['firewalld', 'ufw']
             success_msg: "switching: the old backend is pruned, not added to."

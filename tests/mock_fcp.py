@@ -16,8 +16,9 @@ refusals the real FCP applies (FCP docs/servers.md "Node registration",
   POST   /__mint {token, scopes, boundary?}                            test hook
   POST   /__scenario {name: ...}                                       test hook: what
                                                                        the next calls answer
-  POST   /__port_change {slug, name, port}                             test hook: stage a
+  POST   /__port_change {slug, name, port, protocol?}                  test hook: stage a
                                                                        port change on a node
+                                                                       (protocol: tcp default)
   POST   /__settle {id}                                                test hook: the change
                                                                        was sent and is seen
   POST   /__rename {slug, from, to}                                    test hook: an admin
@@ -37,8 +38,9 @@ The node's view and the bootstrap answer carry `firewall.ports`: the port its
 transport serves (443; a WebSocket node's loopback transport is not listed, its
 Caddy's 443 is) as `serving`, and the port of every change staged for it and
 not yet settled as `pending`, confirmed or not. An applied report with
-`firewall.ports` confirms this node's waiting changes whose port it names; one
-without `firewall` confirms nothing.
+`firewall.ports` confirms this node's waiting changes whose port AND protocol
+it names (an entry without a protocol is TCP only, as FCP reads it); one
+without `firewall` confirms nothing. Reports are kept as keys "<port>/<protocol>".
 
 A renamed node answers under its old name too (an alias), its view's `name` is
 the new one, and a token bounded to this backend alone gains the new name.
@@ -91,9 +93,9 @@ STATE = {
     "requests": [],  # [{method, path}]
     "tokens": {},  # token -> {"scopes": [...], "boundary": {...} | None}
     "secrets_served": 0,
-    "port_changes": [],  # [{id, key, port, state: waiting|confirmed|settled}]
+    "port_changes": [],  # [{id, key, port, protocol, state: waiting|confirmed|settled}]
     "applied_reports": [],  # [{name, firewall}]
-    "confirmations": [],  # [{id, name, port}]
+    "confirmations": [],  # [{id, name, port, protocol}]
     "put_bodies": [],  # [{name, machineName}] (what each enrollment PUT carried)
 }
 
@@ -149,15 +151,15 @@ def _intent(slug, name, body):
 
 
 def _firewall(i, key):
-    serving = {i["_serving"]}
+    serving = {(i["_serving"], "tcp")} | {tuple(x) for x in i.get("_serving_extra", [])}
     pending = {
-        c["port"]
+        (c["port"], c["protocol"])
         for c in STATE["port_changes"]
-        if c["key"] == key and c["state"] in ("waiting", "confirmed") and c["port"] not in serving
+        if c["key"] == key and c["state"] in ("waiting", "confirmed") and (c["port"], c["protocol"]) not in serving
     }
     return {
-        "ports": [{"port": p, "protocol": "tcp", "reason": "serving"} for p in sorted(serving)]
-        + [{"port": p, "protocol": "tcp", "reason": "pending"} for p in sorted(pending)]
+        "ports": [{"port": p, "protocol": pr, "reason": "serving"} for p, pr in sorted(serving)]
+        + [{"port": p, "protocol": pr, "reason": "pending"} for p, pr in sorted(pending)]
     }
 
 
@@ -177,12 +179,12 @@ def _firewall_report(body):
         raise ValueError("firewall")
     ports = []
     for p in fw["ports"]:
-        if not isinstance(p, dict) or p.get("protocol") != "tcp":
+        if not isinstance(p, dict) or p.get("protocol", "tcp") not in ("tcp", "udp"):
             raise ValueError("firewall.ports.protocol")
         port = p.get("port")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("firewall.ports.port")
-        ports.append(port)
+        ports.append(f"{port}/{p.get('protocol', 'tcp')}")
     return ports
 
 
@@ -337,7 +339,13 @@ class Handler(BaseHTTPRequestHandler):
             if not i:
                 self._error(404, "not_found", "no such node")
                 return True
-            change = {"id": len(STATE["port_changes"]) + 1, "key": key, "port": int(body["port"]), "state": "waiting"}
+            change = {
+                "id": len(STATE["port_changes"]) + 1,
+                "key": key,
+                "port": int(body["port"]),
+                "protocol": body.get("protocol") or "tcp",
+                "state": "waiting",
+            }
             STATE["port_changes"].append(change)
             self._send(200, change)
             return True
@@ -346,7 +354,11 @@ class Handler(BaseHTTPRequestHandler):
             for c in STATE["port_changes"]:
                 if c["id"] == cid:
                     c["state"] = "settled"
-                    STATE["nodes"][c["key"]]["_serving"] = c["port"]
+                    node = STATE["nodes"][c["key"]]
+                    if c["protocol"] == "tcp":
+                        node["_serving"] = c["port"]
+                    else:  # a UDP transport added beside the TCP one (Hysteria 2 beside REALITY)
+                        node.setdefault("_serving_extra", []).append([c["port"], c["protocol"]])
                     self._send(200, c)
                     return True
             self._error(404, "not_found", "no such change")
@@ -434,9 +446,9 @@ class Handler(BaseHTTPRequestHandler):
             STATE["applied_reports"].append({"name": i["name"], "firewall": reported})
             # The firewall report holds whatever the revision (a re-report too).
             for c in STATE["port_changes"]:
-                if c["key"] == key and c["state"] == "waiting" and reported is not None and c["port"] in reported:
+                if c["key"] == key and c["state"] == "waiting" and reported is not None and f"{c['port']}/{c['protocol']}" in reported:
                     c["state"] = "confirmed"
-                    STATE["confirmations"].append({"id": c["id"], "name": i["name"], "port": c["port"]})
+                    STATE["confirmations"].append({"id": c["id"], "name": i["name"], "port": c["port"], "protocol": c["protocol"]})
             i["appliedRevision"] = rev
             if i["stage"] in ("registered", "bootstrap_available"):
                 i["stage"] = "machine_applied"

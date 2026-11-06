@@ -1,9 +1,14 @@
+{# templates/firewall/firewalld-freesocks-fcp.xml.j2 - the role's firewalld
+   service: one <port> per key, with its own protocol. Without a UDP port the
+   text is exactly what a TCP-only release wrote, so upgrading the role does
+   not rewrite the file (which would reload firewalld on every node). #}
+{% set _what = 'TCP ports' if (_fw_desired | fcp_fw_ports('udp') | length == 0) else 'ports' %}
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Managed by ansible-role-freesocks: the TCP ports FCP lists for this node. -->
+<!-- Managed by ansible-role-freesocks: the {{ _what }} FCP lists for this node. -->
 <service>
   <short>freesocks-fcp</short>
-  <description>The TCP ports the FreeSocks Control Plane lists for this node.</description>
-{% for p in _fw_desired %}
-  <port protocol="tcp" port="{{ p }}"/>
+  <description>The {{ _what }} the FreeSocks Control Plane lists for this node.</description>
+{% for k in _fw_desired %}
+  <port protocol="{{ k.split('/')[1] }}" port="{{ k.split('/')[0] }}"/>
 {% endfor %}
 </service>

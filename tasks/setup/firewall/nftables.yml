@@ -1,5 +1,6 @@
 ---
-# tasks/setup/firewall/nftables.yml - the role's nftables set `freesocks_fcp`.
+# tasks/setup/firewall/nftables.yml - the role's nftables sets: `freesocks_fcp`
+# (the TCP ports) and `freesocks_fcp_udp` (the UDP ports).
 #
 # An accept in a table of the role's own would not let a port past YOUR input
 # chain's drop (every base chain on the hook sees the packet), so the set lives
@@ -11,12 +12,20 @@
 #       chain input {
 #           ...
 #           tcp dport @freesocks_fcp accept
+#           udp dport @freesocks_fcp_udp accept
 #       }
 #   }
 #
 # The role then rewrites the file (what a reload or a reboot loads) and the
-# live set's elements in one nft transaction, never anything else: no reload,
+# live sets' elements in one nft transaction, never anything else: no reload,
 # no flush of your ruleset (Docker's and the node's own tables stay put).
+#
+# Each set counts on its own. A ruleset wired before the UDP set existed (the
+# TCP accept only) keeps working for TCP; a UDP port is then neither let in nor
+# reported until you add the UDP accept and reload (the file already holds the
+# set, so the reload loads it). An explicit nftables backend stops the run when
+# FCP lists a UDP port and the UDP set is not wired; `auto` says so and reports
+# the TCP ports only.
 
 - name: Validate the nftables table
   assert:
@@ -36,10 +45,7 @@
 
 - name: Take the ports the set file lets in now
   set_fact:
-    _fw_owned_before: >-
-      {{ (_fw_nft_before.content | default('') | b64decode)
-         | regex_search('elements = [{][0-9, ]*[}]') | default('', true)
-         | regex_findall('[0-9]+') | map('int') | unique | sort }}
+    _fw_owned_before: "{{ (_fw_nft_before.content | default('') | b64decode) | fcp_fw_nft_file }}"
 
 - name: Work out the ports
   include_tasks: setup/firewall/desired.yml
@@ -63,14 +69,15 @@
   register: _fw_nft_written
   become: "{{ _fcp_become | default(true) }}"
 
-- name: Look for the set in the live ruleset
-  command: nft -j list set {{ fcp_firewall_nftables_table }} freesocks_fcp
-  register: _fw_nft_set
+- name: Look for the sets in the live ruleset
+  command: nft -j list set {{ fcp_firewall_nftables_table }} {{ item }}
+  register: _fw_nft_sets
   changed_when: false
   failed_when: false
   become: "{{ _fcp_become | default(true) }}"
+  loop: [freesocks_fcp, freesocks_fcp_udp]
 
-- name: Look for the rule that lets the set in
+- name: Look for the rules that let the sets in
   command: nft -j list table {{ fcp_firewall_nftables_table }}
   register: _fw_nft_table
   changed_when: false
@@ -78,9 +85,9 @@
   become: "{{ _fcp_become | default(true) }}"
 
 # Wired = the set is in the table AND a base chain on the input hook of that
-# table holds exactly `tcp dport @freesocks_fcp accept` (a counter allowed): a
-# mention of the set anywhere else (a drop, a chain nothing jumps to) lets
-# nothing in.
+# table holds exactly `tcp dport @freesocks_fcp accept` (UDP: `udp dport
+# @freesocks_fcp_udp accept`; a counter allowed): a mention of the set anywhere
+# else (a drop, a chain nothing jumps to) lets nothing in.
 - name: Take the table's input chains
   set_fact:
     _fw_nft_items: "{{ (_fw_nft_table.stdout | from_json).nftables if (_fw_nft_table.rc | default(1)) == 0 else [] }}"
@@ -92,78 +99,101 @@
          | selectattr('hook', 'defined') | selectattr('hook', 'equalto', 'input')
          | selectattr('type', 'equalto', 'filter') | map(attribute='name') | list }}
 
-- name: Is the set wired into the ruleset
+- name: Take the rules of the input chains
+  set_fact:
+    _fw_nft_input_rules: >-
+      {{ _fw_nft_items | selectattr('rule', 'defined') | map(attribute='rule')
+         | selectattr('chain', 'in', _fw_nft_input_chains)
+         | map(attribute='expr') | map('rejectattr', 'counter', 'defined') | map('list') | list }}
+
+- name: Are the sets wired into the ruleset
   set_fact:
     _fw_nft_wired: >-
-      {{ (_fw_nft_set.rc | default(1)) == 0
-         and (_fw_nft_items | selectattr('rule', 'defined') | map(attribute='rule')
-              | selectattr('chain', 'in', _fw_nft_input_chains) | map(attribute='expr')
-              | map('rejectattr', 'counter', 'defined') | map('list')
-              | select('equalto', [{'match': {'op': '==', 'left': {'payload': {'protocol': 'tcp', 'field': 'dport'}},
-                                              'right': '@freesocks_fcp'}}, {'accept': none}])
-              | list | length > 0) }}
+      {{ {'tcp': (_fw_nft_sets.results[0].rc | default(1)) == 0
+                 and [{'match': {'op': '==', 'left': {'payload': {'protocol': 'tcp', 'field': 'dport'}},
+                                 'right': '@freesocks_fcp'}}, {'accept': none}] in _fw_nft_input_rules,
+          'udp': (_fw_nft_sets.results[1].rc | default(1)) == 0
+                 and [{'match': {'op': '==', 'left': {'payload': {'protocol': 'udp', 'field': 'dport'}},
+                                 'right': '@freesocks_fcp_udp'}}, {'accept': none}] in _fw_nft_input_rules} }}
+    _fw_nft_want_udp: "{{ _fw_desired | fcp_fw_ports('udp') | length > 0 }}"
 
 - name: Fail closed on a set the ruleset does not use
   fail:
     msg: >-
       fcp_firewall_backend is nftables but the live ruleset has no set
-      freesocks_fcp in table {{ fcp_firewall_nftables_table }} that an input chain
-      of that table lets in (`tcp dport @freesocks_fcp accept`).
+      {{ 'freesocks_fcp' if not _fw_nft_wired.tcp else 'freesocks_fcp_udp' }} in table
+      {{ fcp_firewall_nftables_table }} that an input chain of that table lets in
+      (`{{ 'tcp dport @freesocks_fcp accept' if not _fw_nft_wired.tcp else 'udp dport @freesocks_fcp_udp accept' }}`){{
+      '' if not _fw_nft_wired.tcp else (', and FCP lists a UDP port for ' ~ node_name ~ ' (' ~ (_fw_desired | select('match', '.*/udp$') | join(', ')) ~ ')') }}.
       {{ fcp_firewall_nftables_file }} is in place: include it inside that table
-      and add `tcp dport @freesocks_fcp accept` to its input chain (see the file's
-      header), load the ruleset, then run the role again.
+      and add `tcp dport @freesocks_fcp accept` and `udp dport @freesocks_fcp_udp accept`
+      to its input chain (see the file's header), load the ruleset, then run the
+      role again.
   when:
-    - not (_fw_nft_wired | bool)
     - fcp_firewall_backend == 'nftables'
+    - (not _fw_nft_wired.tcp) or ((_fw_nft_want_udp | bool) and not _fw_nft_wired.udp)
 
 - name: Note a set the ruleset does not use
   when:
-    - not (_fw_nft_wired | bool)
     - not (_fw_prune_only | default(false) | bool)
+    - (not _fw_nft_wired.tcp) or ((_fw_nft_want_udp | bool) and not _fw_nft_wired.udp)
   debug:
     msg: >-
-      nftables.service is active but its ruleset does not use the role's set
-      (freesocks_fcp in table {{ fcp_firewall_nftables_table }}): the role's rules
-      are not in effect. {{ fcp_firewall_nftables_file }} is in place; include it
-      inside that table, add `tcp dport @freesocks_fcp accept` to the input chain
-      and reload, or set fcp_firewall_backend.
+      nftables.service is active but its ruleset does not use the role's
+      {{ 'set (freesocks_fcp' if not _fw_nft_wired.tcp else 'UDP set (freesocks_fcp_udp' }} in table
+      {{ fcp_firewall_nftables_table }}): the role's {{ 'rules are' if not _fw_nft_wired.tcp else 'UDP rules are' }}
+      not in effect. {{ fcp_firewall_nftables_file }} is in place; include it inside
+      that table, add `tcp dport @freesocks_fcp accept` and `udp dport
+      @freesocks_fcp_udp accept` to the input chain and reload, or set
+      fcp_firewall_backend.
 
-- name: Take the live set's elements
+- name: Take the live sets' elements
   set_fact:
     _fw_nft_live: >-
-      {{ ((_fw_nft_set.stdout | from_json).nftables | selectattr('set', 'defined') | map(attribute='set')
-          | map(attribute='elem', default=[]) | flatten | reject('mapping') | map('int') | unique | sort)
-         if (_fw_nft_wired | bool) else [] }}
+      {{ {'tcp': ((_fw_nft_sets.results[0].stdout | from_json).nftables | selectattr('set', 'defined') | map(attribute='set')
+                  | map(attribute='elem', default=[]) | flatten | reject('mapping') | map('int') | unique | sort | list)
+                 if _fw_nft_wired.tcp else [],
+          'udp': ((_fw_nft_sets.results[1].stdout | from_json).nftables | selectattr('set', 'defined') | map(attribute='set')
+                  | map(attribute='elem', default=[]) | flatten | reject('mapping') | map('int') | unique | sort | list)
+                 if _fw_nft_wired.udp else []} }}
 
-- name: Bring the live set to the list (one transaction)
+- name: Bring the live sets to the list (one transaction)
   command: nft -f /dev/stdin
   args:
     stdin: |
-      flush set {{ fcp_firewall_nftables_table }} freesocks_fcp
-      {% if _fw_desired | length > 0 %}
-      add element {{ fcp_firewall_nftables_table }} freesocks_fcp { {{ _fw_desired | join(', ') }} }
+      {% for _name, _proto in [['freesocks_fcp', 'tcp'], ['freesocks_fcp_udp', 'udp']] %}
+      {% if _fw_nft_wired[_proto] and _fw_nft_live[_proto] != (_fw_desired | fcp_fw_ports(_proto)) %}
+      flush set {{ fcp_firewall_nftables_table }} {{ _name }}
+      {% if _fw_desired | fcp_fw_ports(_proto) | length > 0 %}
+      add element {{ fcp_firewall_nftables_table }} {{ _name }} { {{ _fw_desired | fcp_fw_ports(_proto) | join(', ') }} }
       {% endif %}
+      {% endif %}
+      {% endfor %}
   register: _fw_nft_apply
   become: "{{ _fcp_become | default(true) }}"
-  when:
-    - _fw_nft_wired | bool
-    - _fw_nft_live != _fw_desired
+  when: >-
+    (_fw_nft_wired.tcp and _fw_nft_live.tcp != (_fw_desired | fcp_fw_ports('tcp')))
+    or (_fw_nft_wired.udp and _fw_nft_live.udp != (_fw_desired | fcp_fw_ports('udp')))
 
 # --- read back -------------------------------------------------------------------
 
-- name: Read back the live set
-  command: nft -j list set {{ fcp_firewall_nftables_table }} freesocks_fcp
-  register: _fw_nft_set_after
+- name: Read back the live sets
+  command: nft -j list set {{ fcp_firewall_nftables_table }} {{ item.0 }}
+  register: _fw_nft_sets_after
   changed_when: false
   failed_when: false
   become: "{{ _fcp_become | default(true) }}"
-  when: _fw_nft_wired | bool
+  loop: [[freesocks_fcp, tcp], [freesocks_fcp_udp, udp]]
+  when: _fw_nft_wired[item.1]
 
-- name: Take what the role's set lets in
+- name: Take what the role's sets let in
   set_fact:
     _fw_open: >-
-      {{ ((_fw_nft_set_after.stdout | from_json).nftables | selectattr('set', 'defined') | map(attribute='set')
-          | map(attribute='elem', default=[]) | flatten | reject('mapping') | map('int') | unique | sort)
-         if ((_fw_nft_wired | bool) and (_fw_nft_set_after.rc | default(1)) == 0) else [] }}
-    _fw_effective: "{{ _fw_nft_wired | bool }}"
+      {{ _fw_nft_sets_after.results
+         | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+         | map(attribute='stdout') | map('from_json') | map(attribute='nftables') | flatten
+         | selectattr('set', 'defined') | map(attribute='set')
+         | map('fcp_fw_nft_set_keys') | flatten | fcp_fw_keys }}
+    _fw_effective: "{{ _fw_nft_wired.tcp or _fw_nft_wired.udp }}"
+    _fw_not_in_effect: "{{ ['tcp', 'udp'] | reject('in', _fw_nft_wired | dict2items | selectattr('value') | map(attribute='key') | list) | list }}"
     _fw_changed: "{{ (_fw_nft_written is changed) or (_fw_nft_apply is changed) }}"

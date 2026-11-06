@@ -20,6 +20,9 @@
 #       waiting; a run that can reports it and the change is confirmed;
 #       reporting again is idempotent;
 #   (j) once the change is sent, the run reports the new port only;
+#   (j2) a UDP requirement (Hysteria 2 on 443/udp beside REALITY on 8443/tcp):
+#       a report naming 443 without a protocol (TCP) does not confirm it; the
+#       role's report names {port: 443, protocol: udp} and does;
 #   (k) a malformed firewall report is refused;
 #   (l) an FCP that predates the firewall acknowledgement: no list, no claim;
 #   (m) the status gate passes a healthy node, and fails on a port change
@@ -128,7 +131,7 @@
               - "(_state.json.requests | selectattr('method', 'equalto', 'PUT') | list | length) == 1"
               - lookup('file', remnawave_node_install_dir ~ '/.applied_revision') | trim == '1'
               - lookup('file', remnawave_node_install_dir ~ '/.node_mode') | trim == 'privacy-reality'
-              - _state.json.applied_reports[-1].firewall == [443]
+              - _state.json.applied_reports[-1].firewall == ['443/tcp']
               - _state.json.put_bodies[-1].machineName == 'machine-1.example.org'
             success_msg: "machine_ready; one PUT, one secret, the accepted mode on the machine, 443 reported, the machine name sent."
 
@@ -388,12 +391,12 @@
         - name: Assert the change was confirmed once, by this node's report
           assert:
             that:
-              - _state.json.applied_reports[-2].firewall == [443, 8443]
-              - _state.json.applied_reports[-1].firewall == [443, 8443]
+              - _state.json.applied_reports[-2].firewall == ['443/tcp', '8443/tcp']
+              - _state.json.applied_reports[-1].firewall == ['443/tcp', '8443/tcp']
               - (_state.json.port_changes | selectattr('id', 'equalto', _change.json.id) | first).state == 'confirmed'
               - _state.json.confirmations | length == 1
               - _state.json.confirmations[0].port == 8443
-              - _fw_reported_ports == [443, 8443]
+              - _fw_reported_keys == ['443/tcp', '8443/tcp']
             success_msg: "the pending port is reported and confirmed; a re-report is idempotent."
 
         # (j) the change was sent
@@ -426,8 +429,72 @@
           assert:
             that:
               - "_fcp_bootstrap.firewall == [{'port': 8443, 'protocol': 'tcp', 'reason': 'serving'}]"
-              - _state.json.applied_reports[-1].firewall == [8443]
+              - _state.json.applied_reports[-1].firewall == ['8443/tcp']
             success_msg: "after the change, 8443 serves and is reported."
+
+        # (j2) a UDP requirement beside the TCP port
+        - name: An admin adds a UDP transport on 443 (Hysteria 2 beside REALITY)
+          uri:
+            url: "{{ _mock }}/__port_change"
+            method: POST
+            body_format: json
+            body: { slug: panel-a, name: quiet-falcon-nest, port: 443, protocol: udp }
+            return_content: yes
+          register: _udp_change
+        - name: A report that names 443 without a protocol
+          uri:
+            url: "{{ _node_url }}/quiet-falcon-nest/applied"
+            method: POST
+            headers: { Authorization: "Bearer {{ fcp_api_token }}" }
+            body_format: json
+            body: { appliedRevision: 1, nodeStarted: true, firewall: { ports: [{ port: 443 }, { port: 8443 }] } }
+            status_code: [200]
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert 443 without a protocol is TCP and confirms nothing on UDP
+          assert:
+            that:
+              - (_state.json.port_changes | selectattr('id', 'equalto', _udp_change.json.id) | first).state == 'waiting'
+            success_msg: "a TCP report never confirms a UDP requirement."
+
+        - name: The next run (bootstrap)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/register_node.yml
+        - name: Let in what the bootstrap answer lists (443/udp pending)
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/firewall/main.yml
+          vars:
+            _fw_listed: "{{ _fcp_bootstrap.firewall }}"
+        - name: Report applied
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: providers/fcp/applied.yml
+        - name: Read the mock's state
+          uri:
+            url: "{{ _mock }}/__state"
+            return_content: yes
+          register: _state
+        - name: Assert the report names each port with its protocol, and UDP is confirmed
+          assert:
+            that:
+              - "{'port': 443, 'protocol': 'udp', 'reason': 'pending'} in _fcp_bootstrap.firewall"
+              - "_fw_report == {'ports': [{'port': 443, 'protocol': 'udp'}, {'port': 8443, 'protocol': 'tcp'}]}"
+              - _state.json.applied_reports[-1].firewall == ['443/udp', '8443/tcp']
+              - (_state.json.port_changes | selectattr('id', 'equalto', _udp_change.json.id) | first).state == 'confirmed'
+              - (_state.json.confirmations | last).protocol == 'udp'
+              - _fw_reported_keys == ['443/udp', '8443/tcp']
+            success_msg: "{port: 443, protocol: udp} confirms the UDP requirement."
+        - name: FCP sends the UDP transport
+          uri:
+            url: "{{ _mock }}/__settle"
+            method: POST
+            body_format: json
+            body: { id: "{{ _udp_change.json.id }}" }
 
         # (k) a malformed firewall report
         - name: Report a firewall FCP cannot use
@@ -441,7 +508,7 @@
             return_content: yes
           register: _bad
           loop:
-            - { appliedRevision: 1, nodeStarted: true, firewall: { ports: [{ port: 8443, protocol: udp }] } }
+            - { appliedRevision: 1, nodeStarted: true, firewall: { ports: [{ port: 8443, protocol: sctp }] } }
             - { appliedRevision: 1, nodeStarted: true, firewall: { ports: [{ port: 0, protocol: tcp }] } }
             - { appliedRevision: 1, nodeStarted: true, firewall: {} }
         - name: Assert each was refused as a validation error
