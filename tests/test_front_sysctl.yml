@@ -10,7 +10,8 @@
 #   (c) a machine that already has larger values keeps them (raise only),
 #       and tcp_mem stays in order;
 #   (d) more RAM raises the RAM-based limits on the next run;
-#   (e) without connection tracking the drop-in leaves its key out.
+#   (e) without connection tracking the drop-in leaves its key out;
+#   (f) tcp_mem is counted in the host's own pages (64 KiB here), not 4 KiB.
 #
 # Run: ansible-playbook tests/test_front_sysctl.yml
 - hosts: localhost
@@ -50,6 +51,17 @@
             src: "{{ playbook_dir }}/fake_sysctl.py"
             dest: "{{ _bin }}/sysctl"
             state: link
+
+        # The page size the fake kernel has (kernel.json.pagesize, 4096 unless
+        # that file says otherwise).
+        - name: Put a fake getconf on the PATH
+          copy:
+            content: |
+              #!/bin/sh
+              [ "$1" = PAGESIZE ] || exit 2
+              cat "$FAKE_SYSCTL_STATE.pagesize" 2>/dev/null || echo 4096
+            dest: "{{ _bin }}/getconf"
+            mode: '0755'
 
         - name: Connection tracking is loaded
           copy:
@@ -147,6 +159,35 @@
               - _k3['net.ipv4.tcp_mem'] == '2053056 3079584 4106112'
               - _k3['net.netfilter.nf_conntrack_max'] == (64158 * 64) | string
             success_msg: "64 GiB: tcp_mem {{ _k3['net.ipv4.tcp_mem'] }}."
+
+        # (f)
+        - name: Small limits on a kernel with 64 KiB pages
+          copy:
+            content: "{{ _usual | combine({'net.ipv4.tcp_mem': '1000 2000 3000'}) | to_json }}"
+            dest: "{{ _state }}"
+
+        - name: Give the fake kernel 64 KiB pages
+          copy:
+            content: "65536\n"
+            dest: "{{ _state }}.pagesize"
+
+        - name: Raise the limits there
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+
+        - name: Back to 4 KiB pages
+          file:
+            path: "{{ _state }}.pagesize"
+            state: absent
+
+        - name: Assert tcp_mem counts 64 KiB pages
+          vars:
+            _k4: "{{ lookup('file', _state) | from_json }}"
+          assert:
+            that:
+              - _k4['net.ipv4.tcp_mem'] == '64158 96237 128316'
+            success_msg: "64 KiB pages: tcp_mem {{ _k4['net.ipv4.tcp_mem'] }} (12.5/18.75/25 % of 32079 MiB in 64 KiB pages)."
 
         # (e)
         - name: Connection tracking is not loaded

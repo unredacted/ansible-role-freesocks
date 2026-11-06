@@ -9,7 +9,8 @@
 #   net.core.netdev_max_backlog   packets queued per CPU before the stack
 #   net.ipv4.tcp_max_tw_buckets, tcp_max_orphans   closing sockets kept
 #   net.ipv4.tcp_mem   the kernel's TCP memory, as shares of RAM
-#       (remnawave_front_tcp_mem_percent): past "pressure" it shrinks every
+#       (remnawave_front_tcp_mem_percent), in the host's own page size: past
+#       "pressure" it shrinks every
 #       socket's buffers, past "high" it refuses memory. Each of the three is
 #       raised, and kept in order (low <= pressure <= high)
 #   net.netfilter.nf_conntrack_max   connection-tracking entries, per MiB of
@@ -27,6 +28,22 @@
   register: _front_sysctl_now
   changed_when: false
 
+# tcp_mem counts pages, and a page is not 4 KiB everywhere (16 or 64 KiB on
+# some arm64 and ppc64 kernels): the shares of RAM are worked out in the
+# host's own pages.
+- name: Read the host's page size
+  command: getconf PAGESIZE
+  register: _front_pagesize
+  changed_when: false
+
+- name: Assert the page size is a number
+  assert:
+    that:
+      - _front_pagesize.stdout | trim is match('^[0-9]+$')
+      - _front_pagesize.stdout | int >= 4096
+    fail_msg: "getconf PAGESIZE answered '{{ _front_pagesize.stdout | trim }}'"
+    quiet: true
+
 - name: Is connection tracking loaded
   stat:
     path: "{{ _front_conntrack_proc | default('/proc/sys/net/netfilter/nf_conntrack_max') }}"
@@ -42,7 +59,7 @@
   vars:
     _now: "{{ _front_sysctl_now.stdout_lines }}"
     _mem_now: "{{ _now[5].split() | map('int') | list }}"
-    _pages: "{{ (ansible_memtotal_mb | int) * 256 }}"
+    _pages: "{{ ((ansible_memtotal_mb | int) * 1048576 / (_front_pagesize.stdout | int)) | int }}"
     _pct: "{{ remnawave_front_tcp_mem_percent | map('float') | list }}"
     _mem_want: >-
       {{ [((_pct[0] * (_pages | int) / 100) | int),

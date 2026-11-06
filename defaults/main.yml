@@ -226,8 +226,12 @@ remnawave_caddy_strip_request_headers:
 # The role's own configuration file; the package's /etc/nginx/nginx.conf is
 # left as shipped (an edited conffile holds unattended upgrades back).
 remnawave_nginx_conf: /etc/nginx/freesocks/nginx.conf
-# nginx.org's signing key, as published on https://nginx.org/en/linux_packages.html.
-remnawave_nginx_signing_key_fingerprint: 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+# nginx.org's signing keys, as published on https://nginx.org/en/linux_packages.html.
+# Every primary key in the downloaded keyring must be one of these.
+remnawave_nginx_signing_key_fingerprints:
+  - 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+  - 8540A6F18833A80E9C1653A42FD21310B49F6B46
+  - 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3
 remnawave_nginx_acme_directory: https://acme-v02.api.letsencrypt.org/directory
 # The ACME module's account key, certificates and keys (0700, the nginx user).
 remnawave_nginx_acme_state_dir: /var/lib/nginx-acme/freesocks

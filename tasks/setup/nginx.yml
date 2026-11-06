@@ -45,19 +45,32 @@
     force: no
   become: yes
 
-- name: Read the signing key's fingerprints
-  command: gpg --show-keys --with-colons /etc/apt/keyrings/nginx-archive-keyring.asc
+# Only the fingerprint records of the PRIMARY keys (the `fpr` line right after
+# each `pub` line), field 10 exactly: a fingerprint written into a user ID or
+# another field never counts. Every primary key in the file must be one of
+# nginx.org's published keys, so an extra key added beside them is refused
+# too (APT would trust it for this repository).
+- name: Read the signing keys' fingerprints
+  shell: >-
+    set -o pipefail;
+    gpg --show-keys --with-colons /etc/apt/keyrings/nginx-archive-keyring.asc
+    | awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }'
+  args:
+    executable: /bin/bash
   register: _nginx_key
   changed_when: false
 
-- name: Assert it is nginx.org's key
+- name: Assert they are nginx.org's keys, and only those
   assert:
     that:
-      - remnawave_nginx_signing_key_fingerprint in _nginx_key.stdout
+      - _nginx_key.stdout_lines | length > 0
+      - _nginx_key.stdout_lines | difference(remnawave_nginx_signing_key_fingerprints) | length == 0
     fail_msg: >-
-      /etc/apt/keyrings/nginx-archive-keyring.asc does not carry
-      {{ remnawave_nginx_signing_key_fingerprint }}: remove it and run again, or
-      compare it with https://nginx.org/en/linux_packages.html.
+      /etc/apt/keyrings/nginx-archive-keyring.asc holds keys that are not
+      nginx.org's published signing keys
+      ({{ _nginx_key.stdout_lines | difference(remnawave_nginx_signing_key_fingerprints) | join(', ') or 'none at all' }}):
+      remove it and run again, or compare it with
+      https://nginx.org/en/linux_packages.html.
 
 - name: Pin nginx.org over Debian's nginx
   template:
