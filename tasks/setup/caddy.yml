@@ -113,7 +113,7 @@
   notify: reload caddy
 
 - name: Set up the decoy site
-  include_tasks: decoy.yml
+  include_tasks: setup/decoy.yml
 
 - name: Render the Caddyfile
   template:

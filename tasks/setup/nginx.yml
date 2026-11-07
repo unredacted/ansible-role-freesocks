@@ -31,7 +31,7 @@
 
 # === Install nginx from nginx.org ===
 - name: Add nginx.org's apt repository
-  include_tasks: nginx_repo.yml
+  include_tasks: setup/nginx_repo.yml
 
 # Its postinst starts nginx straight away on a fresh install, with the
 # package's own configuration (port 80, the package's page). The unit is
@@ -109,7 +109,7 @@
     fail_msg: "remnawave_nginx_loopback_sources must be 1 to 254"
 
 - name: Raise the kernel's connection limits
-  include_tasks: front_sysctl.yml
+  include_tasks: setup/front_sysctl.yml
   when: remnawave_front_kernel_tuning | bool
 
 - name: Assert the host has a resolver
@@ -140,7 +140,7 @@
   become: yes
 
 - name: Set up the decoy site
-  include_tasks: decoy.yml
+  include_tasks: setup/decoy.yml
 
 - name: Render the nginx configuration
   template:
@@ -149,7 +149,7 @@
     mode: '0644'
     validate: "nginx -t -q -c %s"
   become: yes
-  notify: reload nginx
+  register: _nginx_conf
 
 - name: Ensure the unit drop-in directory
   file:
@@ -184,8 +184,18 @@
     enabled: yes
   become: yes
 
-- name: Flush handlers (apply the configuration now)
-  meta: flush_handlers
+# A changed configuration is applied by a reload (new workers; the old ones
+# keep their sessions until they end or worker_shutdown_timeout passes), but
+# not right after a restart, which already read it: a reload then would only
+# leave a second generation of workers holding the first reconnecting sessions.
+- name: Reload nginx for a changed configuration
+  systemd:
+    name: nginx
+    state: reloaded
+  become: yes
+  when:
+    - _nginx_conf is changed
+    - _nginx_dropin is not changed
 
 - name: Wait for nginx to bind the listen port
   wait_for:

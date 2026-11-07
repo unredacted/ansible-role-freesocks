@@ -6,11 +6,3 @@
     name: caddy
     state: reloaded
   become: yes
-
-# nginx re-reads its configuration in new workers; the old ones keep their open
-# sessions until they end or remnawave_nginx_worker_shutdown_timeout passes.
-- name: reload nginx
-  systemd:
-    name: nginx
-    state: reloaded
-  become: yes
