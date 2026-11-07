@@ -1,0 +1,71 @@
+---
+# tasks/setup/remnanode_compose.yml - the remnanode compose file, keeping the
+# node's panel secret across runs.
+#
+# FCP serves a new secret on every bootstrap (each GET /api/keygen on the panel
+# mints a new node certificate). Written out, it would change the file and
+# recreate the container, dropping every open session, on every run. A secret
+# the node already has stays valid while its certificate does (three years)
+# and the panel keeps its CA and JWT key, so the node keeps it unless:
+#   - the operator asks (remnawave_node_rotate_secret, force_reinstall_remnawave);
+#   - it is for another panel CA or JWT key (panel re-keyed, node moved);
+#   - its certificate ends within remnawave_node_secret_min_days;
+#   - it cannot be read or checked.
+# The reasons are in filter_plugins/fcp_node_secret.py. Every step that holds
+# a secret is no_log; only the reason code is shown.
+#
+# Registers compose_template (the render) for tasks/setup/remnawave.yml.
+
+- name: Read the node's compose file
+  slurp:
+    src: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+  register: _remnanode_compose_current
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  no_log: true # it carries the node's secret
+
+- name: Decide whether the node keeps its secret
+  set_fact:
+    _remnanode_secret_on_host: >-
+      {{ ((_remnanode_compose_current.content | b64decode)
+          if (_remnanode_compose_current.content is defined) else '')
+         | fcp_node_secret_on_host }}
+  no_log: true
+
+- name: Decide whether the node keeps its secret (the reason)
+  set_fact:
+    _remnanode_secret_choice: >-
+      {{ remnawave_panel_secret_key
+         | fcp_node_secret_choice(_remnanode_secret_on_host,
+             rotate=((remnawave_node_rotate_secret | bool) or (force_reinstall_remnawave | bool)),
+             min_days=(remnawave_node_secret_min_days | int)) }}
+  no_log: true
+
+- name: Keep the node's secret
+  set_fact:
+    remnawave_panel_secret_key: "{{ _remnanode_secret_on_host }}"
+  when: _remnanode_secret_choice == 'kept'
+  no_log: true
+
+- name: Forget the secret read from the node
+  set_fact:
+    _remnanode_secret_on_host: ""
+    _remnanode_compose_current: {}
+  no_log: true
+
+- name: Show which secret the node gets
+  debug:
+    msg: >-
+      Node secret: {{ 'kept' if _remnanode_secret_choice == 'kept' else 'the one FCP served' }}
+      ({{ _remnanode_secret_choice }}).
+
+- name: Render docker-compose.yml
+  template:
+    src: remnanode-docker-compose.yml.j2
+    dest: "{{ remnawave_node_install_dir }}/docker-compose.yml"
+    mode: '0640'
+  vars:
+    remnawave_node_port: "{{ _fcp_bootstrap.nodePort | int }}"
+  become: "{{ _fcp_become | default(true) }}"
+  register: compose_template
+  no_log: true # the rendered file carries the panel-wide node secret
