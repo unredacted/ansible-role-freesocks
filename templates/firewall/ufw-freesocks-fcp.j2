@@ -1,9 +1,12 @@
 {# templates/firewall/ufw-freesocks-fcp.j2 - the role's ufw application
-   profile: the TCP ports FCP lists for this node. The role owns this profile
-   and the one rule allowing it (`ufw allow freesocks-fcp`), nothing else.
-   Rendered only when there is at least one port (ufw takes no empty profile). #}
+   profile: the ports FCP lists for this node, one `|` entry per protocol
+   (ufw makes one rule tuple of each). The role owns this profile and the one
+   rule allowing it (`ufw allow freesocks-fcp`), nothing else. Rendered only
+   when there is at least one port (ufw takes no empty profile). #}
 # Managed by ansible-role-freesocks: the ports FCP lists for this node.
 [freesocks-fcp]
 title=FreeSocks node
-description=The TCP ports the FreeSocks Control Plane lists for this node
-ports={{ _fw_desired | join(',') }}/tcp
+description=The ports the FreeSocks Control Plane lists for this node
+{% set _tcp = _fw_desired | fcp_fw_ports('tcp') %}
+{% set _udp = _fw_desired | fcp_fw_ports('udp') %}
+ports={{ (([(_tcp | join(',')) ~ '/tcp'] if _tcp else []) + ([(_udp | join(',')) ~ '/udp'] if _udp else [])) | join('|') }}

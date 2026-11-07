@@ -1,0 +1,209 @@
+---
+# tests/test_sysctl.yml
+#
+# Offline test of tasks/setup/sysctl.yml against a fake kernel (a `sysctl` and
+# a `modprobe` on PATH that keep their state in a JSON file):
+#   (a) the default raises rmem_max/wmem_max to 16 MiB in the role's drop-in
+#       and applies it at once; (b) a second run changes nothing; (c) a run
+#       that wrote the file but never applied it applies on the next run;
+#   (d) a larger limit the machine already has is kept (raise only);
+#   (e) BBR (opt-in) adds fq + bbr and loads tcp_bbr at boot; (f) a kernel
+#       without BBR stops the run and leaves no boot file asking for it; (g) with both off the drop-in is removed.
+#
+# Run: ansible-playbook tests/test_sysctl.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.sysctl"
+    _state_file: "{{ playbook_dir }}/.sysctl/state.json"
+    _fcp_become: false
+    node_name: "quiet-falcon-nest"
+    node_sysctl_file: "{{ playbook_dir }}/.sysctl/sysctl.d/60-freesocks-node.conf"
+    node_sysctl_modules_file: "{{ playbook_dir }}/.sysctl/modules-load.d/freesocks-node.conf"
+    _kernel_default:
+      values:
+        net.core.rmem_max: "212992"
+        net.core.wmem_max: "212992"
+        net.core.default_qdisc: pfifo_fast
+        net.ipv4.tcp_congestion_control: cubic
+        net.ipv4.tcp_available_congestion_control: "reno cubic"
+      calls: []
+  environment:
+    PATH: "{{ playbook_dir }}/.sysctl/bin:{{ lookup('env', 'PATH') }}"
+    FAKE_SYSCTL_STATE: "{{ playbook_dir }}/.sysctl/state.json"
+  tasks:
+    - name: Prepare the fake kernel
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ _dir }}/bin"
+        - "{{ _dir }}/sysctl.d"
+        - "{{ _dir }}/modules-load.d"
+
+    - name: Put the fake tools on PATH
+      copy:
+        dest: "{{ _dir }}/bin/{{ item }}"
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import json, os, re, sys
+          path = os.environ["FAKE_SYSCTL_STATE"]
+          state = json.load(open(path))
+          args = sys.argv[1:]
+          state["calls"].append(["{{ item }}"] + args)
+          def save():
+              json.dump(state, open(path, "w"), indent=2)
+          if "{{ item }}" == "modprobe":
+              if args == ["tcp_bbr"] and state.get("bbr_module", True):
+                  state["values"]["net.ipv4.tcp_available_congestion_control"] = "reno cubic bbr"
+              save()
+              sys.exit(0)
+          if args[:1] == ["-n"]:
+              for k in args[1:]:
+                  if k not in state["values"]:
+                      save(); sys.exit(255)
+                  print(state["values"][k])
+              save()
+              sys.exit(0)
+          if args[:1] == ["-p"]:
+              for line in open(args[1]):
+                  m = re.match(r"^\s*([a-z0-9_.]+)\s*=\s*(\S+)\s*$", line)
+                  if m:
+                      k, v = m.groups()
+                      if k == "net.ipv4.tcp_congestion_control" and v not in state["values"]["net.ipv4.tcp_available_congestion_control"].split():
+                          save(); sys.exit(255)
+                      state["values"][k] = v
+                      print(f"{k} = {v}")
+              save()
+              sys.exit(0)
+          save()
+          sys.exit(2)
+      loop: [sysctl, modprobe]
+
+    - block:
+        - name: (a) the default, on a kernel with its usual limits
+          copy:
+            dest: "{{ _state_file }}"
+            content: "{{ _kernel_default | to_nice_json }}"
+        - name: (a) run
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (a) read the kernel
+          set_fact:
+            _k: "{{ lookup('file', _state_file) | from_json }}"
+        - name: (a) 16 MiB in the drop-in and in the kernel, BBR left alone
+          assert:
+            that:
+              - "'net.core.rmem_max = 16777216' in lookup('file', node_sysctl_file)"
+              - "'net.core.wmem_max = 16777216' in lookup('file', node_sysctl_file)"
+              - "'tcp_congestion_control' not in lookup('file', node_sysctl_file)"
+              - _k['values']['net.core.rmem_max'] == '16777216'
+              - _k['values']['net.core.wmem_max'] == '16777216'
+              - _k['values']['net.ipv4.tcp_congestion_control'] == 'cubic'
+              - _sysctl_applied is changed
+              - not (node_sysctl_modules_file is exists)
+            success_msg: "QUIC buffers raised, at once and at boot."
+
+        - name: (b) the same again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (b) nothing written, nothing applied
+          assert:
+            that:
+              - _sysctl_written is not changed
+              - _sysctl_applied is skipped
+            success_msg: "idempotent."
+
+        - name: (c) the kernel lost the setting (a run stopped before applying it)
+          copy:
+            dest: "{{ _state_file }}"
+            content: "{{ (lookup('file', _state_file) | from_json) | combine({'values': {'net.core.rmem_max': '212992'}}, recursive=true) | to_nice_json }}"
+        - name: (c) run
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (c) applied though the file did not change
+          assert:
+            that:
+              - _sysctl_written is not changed
+              - _sysctl_applied is changed
+              - (lookup('file', _state_file) | from_json)['values']['net.core.rmem_max'] == '16777216'
+            success_msg: "what the kernel runs is checked, not only the file."
+
+        - name: (d) a machine with a larger receive limit already
+          copy:
+            dest: "{{ _state_file }}"
+            content: "{{ _kernel_default | combine({'values': {'net.core.rmem_max': '33554432'}}, recursive=true) | to_nice_json }}"
+        - name: (d) run
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (d) the larger limit is kept
+          assert:
+            that:
+              - "'net.core.rmem_max = 33554432' in lookup('file', node_sysctl_file)"
+              - "'net.core.wmem_max = 16777216' in lookup('file', node_sysctl_file)"
+              - (lookup('file', _state_file) | from_json)['values']['net.core.rmem_max'] == '33554432'
+            success_msg: "raise only."
+
+        - name: (e) BBR on
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+          vars:
+            node_tcp_bbr: true
+        - name: (e) fq + bbr, the module loaded at boot
+          assert:
+            that:
+              - "'net.core.default_qdisc = fq' in lookup('file', node_sysctl_file)"
+              - "'net.ipv4.tcp_congestion_control = bbr' in lookup('file', node_sysctl_file)"
+              - "'tcp_bbr' in lookup('file', node_sysctl_modules_file)"
+              - (lookup('file', _state_file) | from_json)['values']['net.ipv4.tcp_congestion_control'] == 'bbr'
+            success_msg: "BBR when asked for."
+
+        - name: (f) a kernel without BBR
+          block:
+            - name: Write a kernel without the module
+              copy:
+                dest: "{{ _state_file }}"
+                content: "{{ _kernel_default | combine({'bbr_module': false}) | to_nice_json }}"
+            - name: Run with BBR on
+              include_role:
+                name: ansible-role-freesocks
+                tasks_from: setup/sysctl.yml
+              vars:
+                node_tcp_bbr: true
+            - name: (f) Unreached
+              assert:
+                that: [false]
+                fail_msg: "BBR was set on a kernel without it."
+          rescue:
+            - name: (f) the run stops and says why
+              assert:
+                that:
+                  - "'offers no BBR' in (ansible_failed_result.msg | default(''))"
+                  - not (node_sysctl_modules_file is exists)
+                success_msg: "no BBR: the run stops and the boot file (left by (e)) is gone."
+
+        - name: (g) both off
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+          vars:
+            node_quic_buffers: false
+            node_tcp_bbr: false
+        - name: (g) the drop-in and the module file are gone
+          assert:
+            that:
+              - not (node_sysctl_file is exists)
+              - not (node_sysctl_modules_file is exists)
+            success_msg: "off: nothing of the role's is left."
+      always:
+        - name: Remove the fake kernel
+          file:
+            path: "{{ _dir }}"
+            state: absent

@@ -86,19 +86,30 @@ ansible-playbook playbook.yml -e target=node1 -e operation_mode=wipe     # retir
 
 ## Firewall
 
-FCP moves a transport to another port only once every node serving it says its firewall lets the new port in (FCP `docs/servers.md` "Firewall acknowledgement"). The node's view and the bootstrap answer list `firewall.ports`: each port the node serves (`serving`) and each port a staged change waits for on this node (`pending`). On every `deploy` and `update` run the role lets each listed port in (TCP, from anywhere) before the node starts and before it reports, then names in the applied report the ports it can stand behind. That report is what confirms a waiting change.
+FCP moves a transport to another port only once every node serving it says its firewall lets the new port in (FCP `docs/servers.md` "Firewall acknowledgement"). The node's view and the bootstrap answer list `firewall.ports` (`{port, protocol, reason}`, `protocol` being `tcp` or `udp`): each port the node serves (`serving`) and each port a staged change waits for on this node (`pending`). On every `deploy` and `update` run the role lets each listed port in, with its own protocol and from anywhere, before the node starts and before it reports, then names in the applied report the ports it can stand behind. That report is what confirms a waiting change.
+
+**A port is a port and a protocol.** 443/udp (Hysteria 2) and 443/tcp (REALITY) are two entries everywhere: what FCP lists, what the role opens, what it closes, what it protects and what it reports. An entry FCP lists without a protocol is TCP; a protocol the role cannot open (neither `tcp` nor `udp`) is left out, said so, and never reported, so its change keeps waiting.
+
+The applied report (`POST …/applied`) carries exactly what is open after the run, each entry naming its protocol:
+
+```json
+{"appliedRevision": 7, "nodeStarted": true,
+ "firewall": {"ports": [{"port": 443, "protocol": "tcp"}, {"port": 443, "protocol": "udp"}]}}
+```
+
+FCP confirms a UDP requirement only from an entry that names `udp` (it reads an entry without a protocol as TCP only). The entries are sorted by port, then protocol, one per (port, protocol).
 
 **Where the rules go** (`fcp_firewall_backend`). The role keeps one object in the host firewall and never touches anything else: no rule of yours, no default policy, and it never installs, enables, starts or flushes a firewall.
 
 | Backend     | What the role owns                                                                                          |
 | ----------- | ----------------------------------------------------------------------------------------------------------- |
-| `ufw`       | The application profile `freesocks-fcp` (`/etc/ufw/applications.d/`) and the one rule `ufw allow freesocks-fcp`. On an inactive ufw the rule waits for it. |
-| `firewalld` | The service `freesocks-fcp` (`/etc/firewalld/services/`) in `fcp_firewall_firewalld_zone` (default: the default zone), permanent and runtime. A change to the list reloads firewalld. |
-| `nftables`  | The set `freesocks_fcp` in `fcp_firewall_nftables_file`, which your ruleset includes once (below). The role rewrites the file and the live set in one transaction, never reloading your ruleset. |
+| `ufw`       | The application profile `freesocks-fcp` (`/etc/ufw/applications.d/`; one entry per protocol, `ports=443,8443/tcp\|443/udp`, which ufw expands to one rule tuple each) and the one rule `ufw allow freesocks-fcp`. On an inactive ufw the rule waits for it. |
+| `firewalld` | The service `freesocks-fcp` (`/etc/firewalld/services/`; `<port protocol="tcp\|udp" port="…"/>`) in `fcp_firewall_firewalld_zone` (default: the default zone), permanent and runtime. A change to the list reloads firewalld. |
+| `nftables`  | The sets `freesocks_fcp` (TCP) and `freesocks_fcp_udp` (UDP) in `fcp_firewall_nftables_file`, which your ruleset includes once (below). The role rewrites the file and the live sets in one transaction, never reloading your ruleset. |
 | `none`      | Nothing.                                                                                                    |
 | `auto`      | The default: firewalld if it runs, else ufw if it is active, else nftables if `nftables.service` is active, else `none`. |
 
-An `accept` in a table of the role's own would not get past your input chain's drop, so with nftables the set lives in your table. Wire it once, then load the ruleset (the role writes the file first, so it exists before you include it):
+An `accept` in a table of the role's own would not get past your input chain's drop, so with nftables the sets live in your table. Wire them once, then load the ruleset (the role writes the file first, so it exists before you include it):
 
 ```
 table inet filter {
@@ -107,13 +118,16 @@ table inet filter {
         type filter hook input priority filter; policy drop;
         ...
         tcp dport @freesocks_fcp accept
+        udp dport @freesocks_fcp_udp accept
     }
 }
 ```
 
-The set counts as wired only when a chain on the input hook of that table holds exactly `tcp dport @freesocks_fcp accept` (a counter allowed); a mention anywhere else (a drop, a chain off the hook) does not. An explicit `nftables` whose ruleset does not use the set stops the run and says how to wire it; under `auto` the role reports nothing for it instead.
+A set counts as wired only when a chain on the input hook of that table holds exactly `tcp dport @freesocks_fcp accept` (UDP: `udp dport @freesocks_fcp_udp accept`; a counter allowed); a mention anywhere else (a drop, a chain off the hook) does not. Each set counts on its own. An explicit `nftables` whose ruleset does not use the TCP set stops the run and says how to wire it, and so does one that does not use the UDP set once FCP lists a UDP port for the node; under `auto` the role reports nothing for an unwired set instead (TCP ports are still reported when only the UDP set is unwired).
 
-**Closing.** A port FCP no longer lists (the old port once a change is sent) leaves the role's object. SSH (22 and `ansible_port`), the node API port and `fcp_firewall_protected_ports` never do, and an empty list from FCP is taken as a gap, not as "close everything". `wipe` empties the object (protected ports kept).
+**Upgrading a ruleset wired for TCP only.** Run the role once with this release: it rewrites the file with both sets, and a ruleset that only lets `@freesocks_fcp` in keeps working for TCP. Then add `udp dport @freesocks_fcp_udp accept` to the input chain and reload (the include now brings the UDP set). Until you do, a UDP port FCP lists is neither let in nor reported, and FCP keeps waiting on this node; with `fcp_firewall_backend: nftables` the run stops and says what to add.
+
+**Closing.** A port FCP no longer lists (the old port once a change is sent) leaves the role's object, by port and protocol: FCP dropping 443/udp closes 443/udp and leaves 443/tcp. SSH (22 and `ansible_port`) and the node API port (both TCP) and `fcp_firewall_protected_ports` never do, and an empty list from FCP is taken as a gap, not as "close everything". `wipe` empties the object (protected ports kept).
 
 **Switching backends.** The machine records which backends hold the role's rules (`/opt/remnanode/.firewall_backends`). When the backend changes (you set another, or `auto` now finds another firewall), the object in the old one is pruned on every run as FCP stops listing its ports, never added to, and forgotten once empty; `wipe` empties it too. A stopped firewalld is remembered and pruned once it runs again.
 
@@ -122,18 +136,37 @@ The set counts as wired only when a chain on the input hook of that table holds 
 | Variable                        | Default                              | What                                                                                   |
 | ------------------------------- | ------------------------------------ | -------------------------------------------------------------------------------------- |
 | `fcp_firewall_backend`          | `auto`                               | `auto`, `ufw`, `firewalld`, `nftables` or `none`                                       |
-| `fcp_firewall_assume_open`      | `false`                              | What you vouch is open: `true` (every listed port), a list of ports (`-e fcp_firewall_assume_open=443,8443`), or `false` |
+| `fcp_firewall_assume_open`      | `false`                              | What you vouch is open: `true` (every listed port), a list of ports, or `false`. A port is `{port: 443, protocol: udp}`, `'443/udp'` or a bare number (TCP): `[443, {port: 443, protocol: udp}]`, or from the command line `-e fcp_firewall_assume_open=443,443/udp` |
 | `fcp_firewall_provider_filter`  | `false`                              | A provider firewall also filters the machine: report only what is vouched for          |
-| `fcp_firewall_protected_ports`  | `[]`                                 | Ports never closed on the role's account, besides SSH and the node API port            |
+| `fcp_firewall_protected_ports`  | `[]`                                 | Ports never closed on the role's account, besides SSH and the node API port; as for `fcp_firewall_assume_open` (a bare number is TCP) |
 | `fcp_firewall_firewalld_zone`   | the default zone                     | The firewalld zone the role's service goes in                                          |
 | `fcp_firewall_nftables_table`   | `inet filter`                        | The family and table your input chain is in                                            |
-| `fcp_firewall_nftables_file`    | `/etc/nftables.d/freesocks-fcp.nft`  | The role's set file                                                                    |
+| `fcp_firewall_nftables_file`    | `/etc/nftables.d/freesocks-fcp.nft`  | The role's set file (both sets)                                                        |
 
 No firewall rule the role writes logs anything (the no-log posture of `remnawave_node_nftables_logging`).
 
 ### Upgrading: port changes wait on older nodes
 
 A role that predates this release sends no `firewall` in its applied report, and FCP confirms nothing from such a report. So **until every node serving a transport runs this release, an FCP port change on that transport waits**, and the Servers page ("Port changes") names the node it waits on. Run `deploy` (or `update`) with this release on those nodes before changing a port; a node no role runs (adopted) is confirmed by an admin on the Servers page. Against an FCP that predates the firewall acknowledgement (no `firewall` in its answers) the role leaves the host firewall alone and reports nothing about it.
+
+The same holds for UDP: a release of the role before UDP support skips every entry that is not TCP, so it neither opens a UDP port nor reports one. A UDP transport (Hysteria 2) added on a node waits until that node runs a release with UDP support.
+
+## Kernel settings
+
+Before the node starts, the role writes one sysctl drop-in of its own (`node_sysctl_file`, `/etc/sysctl.d/60-freesocks-node.conf`) and applies it at once; the kernel loads it again at boot. Nothing else in `/etc/sysctl.d` is touched.
+
+- **QUIC buffers** (`node_quic_buffers`, on by default). A QUIC transport (Hysteria 2 on UDP) asks for larger socket buffers than the kernel's default limit (about 208 KiB) allows, and drops datagrams under load without them. The role raises `net.core.rmem_max` and `net.core.wmem_max` to `node_quic_buffer_bytes` (16 MiB, quic-go's recommendation). It only ever raises: a larger limit the machine already has is written as it is.
+- **BBR** (`node_tcp_bbr`, off by default): `net.ipv4.tcp_congestion_control = bbr` and `net.core.default_qdisc = fq`, with `tcp_bbr` loaded at boot (`/etc/modules-load.d/freesocks-node.conf`). A kernel that offers no BBR stops the run. fq takes over an interface's qdisc when the interface comes up, so one that is already up keeps its own until a reboot (BBR paces by itself meanwhile).
+
+Each run compares what the kernel runs with the drop-in and applies it again when they differ. With both off the drop-in (and the module file) is removed; the kernel keeps the values it was given until the next boot. `wipe` leaves them: they are harmless on a machine without the node.
+
+| Variable                   | Default                                    | What                                                    |
+| -------------------------- | ------------------------------------------ | ------------------------------------------------------- |
+| `node_quic_buffers`        | `true`                                     | Raise the socket buffer limits for QUIC                 |
+| `node_quic_buffer_bytes`   | `16777216`                                 | The limit for `net.core.rmem_max` and `wmem_max`        |
+| `node_tcp_bbr`             | `false`                                    | BBR congestion control with the fq qdisc                |
+| `node_sysctl_file`         | `/etc/sysctl.d/60-freesocks-node.conf`     | The role's drop-in                                      |
+| `node_sysctl_modules_file` | `/etc/modules-load.d/freesocks-node.conf`  | Loads `tcp_bbr` at boot (with `node_tcp_bbr`)           |
 
 ## Members' addresses
 
@@ -197,6 +230,7 @@ If all of that fails, the run stops and says what to set. The login is written, 
 | `fcp_wait_machine_ready`              | `true`                 | Wait for FCP's verification after the applied report                      |
 | `fcp_status_gate`                     | `false`                | At the end, wait for the node's own view to be healthy, then the backend row (`admin:status:read`) |
 | `fcp_firewall_*`                      |                        | See [Firewall](#firewall)                                                  |
+| `node_quic_buffers`, `node_tcp_bbr`, … |                       | See [Kernel settings](#kernel-settings)                                   |
 | `fcp_registration_retries` / `_delay` | `60` / `5`             | Polling the node's view                                                   |
 | `remnawave_node_image`                | `remnawave/node:3.4.2` | The node container                                                        |
 | `remnawave_docker_hub_*`, `remnawave_node_image_pull_backoff` |  | See [Pulling the node image](#pulling-the-node-image)                 |
@@ -207,7 +241,7 @@ If all of that fails, the run stops and says what to set. The login is written, 
 
 ## What the role writes on the machine
 
-`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile`, the decoy under `/var/www/decoy` (a maintenance page that carries no part of the node's name, only a reference picked at random once per machine and kept in `/opt/remnanode/.decoy_ref`), and Caddy's state, data and config directories (`/var/lib/caddy`, its `.local/share/caddy` and `.config/caddy`, owned by `caddy`), made before Caddy starts in case an earlier install left the `caddy` user without its home; for the length of a pull only, the Docker Hub login under `/run/remnanode-docker` and the IPv4 pin in `/etc/hosts`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file). The node's country lives in FCP (the node's Settings), not here.
+`/opt/remnanode/docker-compose.yml` (0640, carries the node secret), `.node_name` (written before the first FCP call), `.node_mode` (written once FCP accepted it), `.node_former_names` (after a rename), `.firewall_backends` (which firewalls hold the role's rules), `.applied_revision`; `/etc/logrotate.d/remnanode`; when the mode runs Caddy `/etc/caddy/Caddyfile`, the decoy under `/var/www/decoy` (a maintenance page that carries no part of the node's name, only a reference picked at random once per machine and kept in `/opt/remnanode/.decoy_ref`), and Caddy's state, data and config directories (`/var/lib/caddy`, its `.local/share/caddy` and `.config/caddy`, owned by `caddy`), made before Caddy starts in case an earlier install left the `caddy` user without its home; for the length of a pull only, the Docker Hub login under `/run/remnanode-docker` and the IPv4 pin in `/etc/hosts`; the role's firewall object (the ufw profile `freesocks-fcp`, the firewalld service `freesocks-fcp`, or the nftables set file); the sysctl drop-in `/etc/sysctl.d/60-freesocks-node.conf` (and, with `node_tcp_bbr`, `/etc/modules-load.d/freesocks-node.conf`). The node's country lives in FCP (the node's Settings), not here.
 
 ## Testing
 
@@ -215,7 +249,7 @@ If all of that fails, the run stops and says what to set. The login is written, 
 tests/run.sh
 ```
 
-Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching), the name and mode resolution including a new node named after its inventory host (or refused when the host name is not a DNS label) and a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed) and the compose render, the decoy page (`test_decoy.yml`: no part of the node's name, the same page on every run and after a rename, another reference on another machine), the management address resolution, the image pull against a mock Docker API (`test_image_pull.yml`, `tests/mock_docker.py`: the mirror, the login, the retries while the registry answers 429, the IPv4 pin and its removal, a failure that stops at once). The image pull test needs `community.docker` (`requirements.yml`) and the `requests` library in the Python that runs Ansible. CI runs the same, with Caddy installed.
+Offline: the bootstrap contract against `tests/mock_fcp.py` (`test_register.yml`: enrollment, the firewall report and a port change waiting on the node, renames, FCP's scope rules, the status gate), the retirement contract (`test_wipe.yml`), each firewall backend against a fake host firewall (`test_firewall.yml`, `tests/fake_firewall.py`: what the role renders and runs, idempotence, pruning only its own object, `none` with and without vouching, and every port by port and protocol: UDP beside TCP in each backend, a ruleset wired for TCP only, protected ports, vouching for UDP), the kernel settings against a fake `sysctl` (`test_sysctl.yml`: the QUIC buffers raised and never lowered, applied again when the kernel lost them, BBR when asked for), the name and mode resolution including a new node named after its inventory host (or refused when the host name is not a DNS label) and a machine that carries a legacy purpose or a former name (`test_identity.yml`), the Caddyfile render (every route removes the client-address headers, nothing trusts a proxy; `caddy validate` and `caddy adapt` when Caddy is installed) and the compose render, the decoy page (`test_decoy.yml`: no part of the node's name, the same page on every run and after a rename, another reference on another machine), the management address resolution, the image pull against a mock Docker API (`test_image_pull.yml`, `tests/mock_docker.py`: the mirror, the login, the retries while the registry answers 429, the IPv4 pin and its removal, a failure that stops at once). The image pull test needs `community.docker` (`requirements.yml`) and the `requests` library in the Python that runs Ansible. CI runs the same, with Caddy installed.
 
 ## License
 

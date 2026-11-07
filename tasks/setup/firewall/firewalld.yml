@@ -1,6 +1,7 @@
 ---
 # tasks/setup/firewall/firewalld.yml - the role's firewalld service
-# (`freesocks-fcp`, under /etc/firewalld/services) and its place in one zone
+# (`freesocks-fcp`, under /etc/firewalld/services; one <port> per key, with its
+# own protocol, tcp or udp) and its place in one zone
 # (fcp_firewall_firewalld_zone, else the default zone), permanent and runtime.
 # Your zones' own services and ports are never touched. firewalld learns a
 # changed service definition only on a reload, so a change to the role's list
@@ -55,10 +56,7 @@
 
 - name: Take the ports the service lets in now
   set_fact:
-    _fw_owned_before: >-
-      {{ (_fw_fwd_before.content | default('') | b64decode)
-         | regex_findall('protocol="tcp" port="[0-9]+"')
-         | map('regex_replace', '[^0-9]', '') | select | map('int') | unique | sort }}
+    _fw_owned_before: "{{ (_fw_fwd_before.content | default('') | b64decode) | fcp_fw_firewalld_service }}"
 
 - name: Work out the ports
   include_tasks: setup/firewall/desired.yml
@@ -86,7 +84,7 @@
     _fw_fwd_loaded: >-
       {{ ((_fw_fwd_info_before.stdout | default('') | regex_search('(?m)^ *ports:.*$') | default('', true)
            | regex_replace('^ *ports:', '')).split(' '))
-         | select('match', '^[0-9]+/tcp$') | map('regex_replace', '/tcp$', '') | map('int') | unique | sort
+         | select('match', '^[0-9]+/(tcp|udp)$') | fcp_fw_keys
          if (_fw_fwd_info_before.rc | default(1)) == 0 else none }}
 
 - name: Load the role's service (a new, changed or not yet loaded definition)
@@ -146,7 +144,7 @@
     _fw_open: >-
       {{ ((_fw_fwd_info.stdout | default('') | regex_search('(?m)^ *ports:.*$') | default('', true)
            | regex_replace('^ *ports:', '')).split(' '))
-         | select('match', '^[0-9]+/tcp$') | map('regex_replace', '/tcp$', '') | map('int') | unique | sort
+         | select('match', '^[0-9]+/(tcp|udp)$') | fcp_fw_keys
          if ((_fw_fwd_info.rc | default(1)) == 0 and (_fw_fwd_run_after.rc | default(1)) == 0) else [] }}
     _fw_effective: true
     _fw_changed: >-
