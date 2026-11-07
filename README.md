@@ -142,7 +142,7 @@ A mode with an ingress (`freedom-ws`) puts a front server on the node: it ends T
 - **`caddy`** (the default for now): Caddy from its apt repository, `/etc/caddy/Caddyfile`.
 - **`nginx`**: nginx and its ACME module (`nginx-module-acme`) from nginx.org's stable repository, pinned over Debian's and added to unattended-upgrades, so its security releases install by themselves. The role's configuration is its own file (`remnawave_nginx_conf`, `/etc/nginx/freesocks/nginx.conf`) and the unit reads it through a drop-in that also confines the service (no new privileges, a read-only system, only the capabilities it needs); the package's `/etc/nginx/nginx.conf` is never edited, so an upgrade never stops at a configuration question, and an upgrade swaps the binary without dropping open sessions. A reload starts new workers and lets the old ones finish their sessions for up to `remnawave_nginx_worker_shutdown_timeout`.
 
-Switching a node from one to the other stops the old one (its open sessions drop), starts the new one and takes a new certificate for the origin name (Let's Encrypt allows five for the same name a week). The one a node does not run is stopped and its configuration removed; nginx is also masked there, because its package starts a stopped nginx on every upgrade. Try nginx on one node (`remnawave_front_server: nginx` in its host vars) before the rest.
+Switching a node from one to the other stops the old one (its open sessions drop), starts the new one and takes a new certificate for the origin name (Let's Encrypt allows five for the same name a week). The one a node does not run is stopped and its configuration removed; nginx is also masked there, because its package starts a stopped nginx on every upgrade. Caddy is removed entirely (`remnawave_caddy_purge`, on by default): the package purged with its user, ACME account and certificates, logs and configuration, and its apt repository and key. Try nginx on one node (`remnawave_front_server: nginx` in its host vars) before the rest.
 
 **Sized for growth (nginx).** Every limit follows the machine, so more RAM or vCPUs raise them on the next run:
 
@@ -150,7 +150,7 @@ Switching a node from one to the other stops the old one (its open sessions drop
 - each session reaches Xray from one of `remnawave_nginx_loopback_sources` loopback addresses (64): from a single address the host's ephemeral port range caps one inbound at about 49k sessions whatever the machine has;
 - the kernel (`remnawave_front_kernel_tuning`, one drop-in `remnawave_front_sysctl_file` that only ever raises): listen and device backlogs, TIME_WAIT and orphan sockets, `tcp_mem` as shares of RAM (`remnawave_front_tcp_mem_percent`, 12.5/18.75/25 %) and the connection-tracking table (`remnawave_front_conntrack_per_mb`, 64 per MiB).
 
-**Certificate.** The ACME module answers HTTP-01 on port 80, keeps its account and certificates in `remnawave_nginx_acme_state_dir` (0700) and renews by itself. The applied report's `certificateReady` is whether the port serves a certificate for the origin name, looked for for up to a minute after a start.
+**Certificate.** An ECDSA P-256 key (named in the configuration, not left to the module's default). The ACME module answers HTTP-01 on port 80, keeps its account and certificates in `remnawave_nginx_acme_state_dir` (0700) and renews by itself. The applied report's `certificateReady` is whether the port serves a certificate for the origin name, looked for for up to a minute after a start.
 
 **Logs.** No access log; the error log only at `crit` (`remnawave_nginx_error_log_level`): below that nginx writes the client's address into its error lines.
 
@@ -235,6 +235,7 @@ If all of that fails, the run stops and says what to set. The login is written, 
 | `remnawave_decoy_stock_page`          |                        | The page served without a kit; empty: the front server's own              |
 | `remnawave_caddy_strip_request_headers` | the client-address headers | Request headers the front server removes before a route reaches Xray, one name per line; see [Members' addresses](#members-addresses) |
 | `remnawave_front_server`              | `caddy`                | `caddy` or `nginx`; see [Front server](#front-server-caddy-or-nginx)       |
+| `remnawave_caddy_purge`               | `true`                 | Remove Caddy entirely where it is not the front server                    |
 | `remnawave_nginx_max_connections`     | 32 per MiB of RAM      | Connections nginx can hold in all                                         |
 | `remnawave_nginx_loopback_sources`    | `64`                   | Loopback addresses nginx reaches Xray from                                |
 | `remnawave_nginx_stream_timeout`      | `1h`                   | How long a proxied stream may stay silent                                 |

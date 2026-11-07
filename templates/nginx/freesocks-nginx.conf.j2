@@ -114,7 +114,9 @@ http {
 {% endif %}
         server_name {{ origin_hostname }};
 
-        acme_certificate freesocks {{ origin_hostname }};
+        # ECDSA P-256: the cheapest signature per handshake, and what every
+        # client and edge takes. Named, not left to the module's default.
+        acme_certificate freesocks {{ origin_hostname }} key=ecdsa:256;
         ssl_certificate $acme_certificate;
         ssl_certificate_key $acme_certificate_key;
         ssl_certificate_cache max=4;

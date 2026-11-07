@@ -182,6 +182,10 @@ remnawave_docker_hub_ipv4_names:
 remnawave_front_server: caddy
 
 # --- Caddy (front nodes) ---------------------------------------------------------
+# Where Caddy is not the front server (no ingress, or nginx in front): remove it
+# entirely (package, user, data and certificates, logs, configuration, its apt
+# repository). Off: stop and disable it only, keeping the package and its home.
+remnawave_caddy_purge: true
 # remnawave_caddy_email, _listen_port and _strip_request_headers apply to nginx
 # too (ACME registration, the port when FCP declared none, the headers removed).
 remnawave_caddy_email: ""

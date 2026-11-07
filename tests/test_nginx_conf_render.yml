@@ -64,7 +64,7 @@
               - "'listen 443 ssl default_server reuseport backlog=65535;' in _conf"
               - "'listen [::]:443 ssl default_server reuseport backlog=65535;' in _conf"
               - "'server_name bright-harbor-lane.origin.example;' in _conf"
-              - "'acme_certificate freesocks bright-harbor-lane.origin.example;' in _conf"
+              - "'acme_certificate freesocks bright-harbor-lane.origin.example key=ecdsa:256;' in _conf"
               - "'ssl_certificate $acme_certificate;' in _conf"
               - "'ssl_certificate_key $acme_certificate_key;' in _conf"
               - "'challenge http-01;' in _conf"
