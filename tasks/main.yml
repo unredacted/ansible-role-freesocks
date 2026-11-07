@@ -9,8 +9,10 @@
 #            fetch the machine configuration + node secret (POST bootstrap) ->
 #            let in the ports FCP lists (the role's own firewall rules, TCP
 #            and UDP) -> kernel settings (QUIC buffers, optional BBR) ->
-#            [ingress] wait for the origin name to resolve, Caddy + decoy,
-#            [no ingress] take an earlier run's Caddy out of the way ->
+#            [ingress] wait for the origin name to resolve, the front server
+#            (Caddy or nginx, remnawave_front_server) + decoy, the other one
+#            out of the way,
+#            [no ingress] take an earlier run's Caddy and nginx out of the way ->
 #            render compose, start the node -> report applied (and which
 #            ports the firewall lets in) -> [optional] wait for machine_ready
 #   update   re-pull the image, recreate, re-report applied
@@ -40,6 +42,12 @@
     that:
       - "'$ANSIBLE_VAULT;' not in (fcp_api_token | string)"
     fail_msg: "fcp_api_token is still a raw vault blob: pass --ask-vault-pass or a vault id"
+
+- name: Validate the front server
+  assert:
+    that:
+      - remnawave_front_server in ['caddy', 'nginx']
+    fail_msg: "remnawave_front_server must be caddy or nginx (got '{{ remnawave_front_server }}')"
 
 - name: Resolve the node's name and mode
   include_tasks: setup/identity.yml
@@ -96,18 +104,30 @@
     - name: Apply the node's kernel settings
       include_tasks: setup/sysctl.yml
 
-    # FCP's bootstrap answer says whether this mode wants Caddy in front of a
-    # loopback transport (an ingress with routes); the role knows no shapes.
+    # FCP's bootstrap answer says whether this mode wants a front server in
+    # front of a loopback transport (an ingress with routes); the role knows no
+    # shapes. remnawave_front_server picks which one. Whatever this node does
+    # not run is taken out of the way FIRST, so the one it runs (or the node's
+    # own transport, with no ingress) finds the public ports free.
+    - name: Take down an earlier run's Caddy (no ingress, or nginx in front)
+      include_tasks: setup/caddy_absent.yml
+      when: _fcp_bootstrap.ingress is not mapping or remnawave_front_server != 'caddy'
+
+    - name: Take down an earlier run's nginx (no ingress, or Caddy in front)
+      include_tasks: setup/nginx_absent.yml
+      when: _fcp_bootstrap.ingress is not mapping or remnawave_front_server != 'nginx'
+
     - name: Set up Caddy and the decoy site (when FCP declared an ingress)
       include_tasks: setup/caddy.yml
-      when: _fcp_bootstrap.ingress is mapping
+      when:
+        - _fcp_bootstrap.ingress is mapping
+        - remnawave_front_server == 'caddy'
 
-    # And where it declared none, this node's own transport owns the public TLS
-    # port: an earlier run's Caddy is stopped and its configuration removed,
-    # otherwise it keeps the port and the node cannot bind it.
-    - name: Take down an earlier run's Caddy (no ingress)
-      include_tasks: setup/caddy_absent.yml
-      when: _fcp_bootstrap.ingress is not mapping
+    - name: Set up nginx and the decoy site (when FCP declared an ingress)
+      include_tasks: setup/nginx.yml
+      when:
+        - _fcp_bootstrap.ingress is mapping
+        - remnawave_front_server == 'nginx'
 
     - name: Start the node
       include_tasks: setup/remnawave.yml

@@ -1,0 +1,5 @@
+// Managed by ansible-role-freesocks: nginx.org's security releases install
+// like Debian's. The list adds to the one in 50unattended-upgrades.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=nginx,codename=${distro_codename},label=nginx";
+};

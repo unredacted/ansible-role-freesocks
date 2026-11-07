@@ -1,0 +1,49 @@
+---
+# tasks/setup/nginx_absent.yml - this node runs no nginx: its mode wants no
+# ingress, or remnawave_front_server is caddy.
+#
+# A machine that ran nginx before still has it installed and holding the
+# public ports, and the node (or Caddy) would fail to bind them. Stop it,
+# disable and MASK it (the package's postinst starts a stopped nginx on every
+# upgrade, and unattended-upgrades runs those), and remove the role's
+# configuration. The package and the ACME state (account, certificates) are
+# left, as caddy_absent.yml leaves Caddy's; nginx.yml unmasks it again.
+
+- name: Look for the nginx unit
+  command: systemctl list-unit-files nginx.service --no-legend
+  register: _nginx_unit
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Take nginx out of the way
+  when: "'nginx.service' in (_nginx_unit.stdout | default(''))"
+  become: yes
+  block:
+    - name: Stop, disable and mask the nginx service
+      systemd:
+        name: nginx
+        state: stopped
+        enabled: no
+        masked: yes
+
+    - name: Remove the role's nginx configuration
+      file:
+        path: "{{ remnawave_nginx_conf }}"
+        state: absent
+
+    - name: Look for a listener nginx still holds
+      shell: "ss -ltnHp | grep '\"nginx\"' || true"
+      register: _nginx_listeners
+      changed_when: false
+      failed_when: false
+
+    - name: Assert nginx holds no listener any more
+      assert:
+        that:
+          - _nginx_listeners.stdout | trim | length == 0
+        fail_msg: >-
+          nginx still holds a listener after being stopped
+          ({{ _nginx_listeners.stdout | trim }}). The public ports belong to this
+          node's own transport or to Caddy.
+        success_msg: "no nginx in front of this node."

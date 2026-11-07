@@ -46,7 +46,8 @@ jobs:
           done
 
   # The offline tests: the bootstrap contract against the mock FCP, the
-  # retirement contract, the Caddyfile and compose renders, address resolution,
+  # retirement contract, the Caddyfile, nginx and compose renders, the decoy
+  # site, the front kernel limits, address resolution,
   # the image pull against the mock Docker API.
   unit:
     runs-on: ubuntu-latest
@@ -73,5 +74,21 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q caddy
           caddy version
+      # So the nginx render test runs `nginx -t` on it: nginx and its ACME
+      # module from nginx.org, as on a node (Ubuntu's suite here).
+      - name: Install nginx and its ACME module
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -fsSL -o /etc/apt/keyrings/nginx-archive-keyring.asc https://nginx.org/keys/nginx_signing.key
+          gpg --show-keys --with-colons /etc/apt/keyrings/nginx-archive-keyring.asc \
+            | grep -q '^fpr:::::::::573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62:'
+          echo "deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.asc] https://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
+            | sudo tee /etc/apt/sources.list.d/nginx-org.list
+          printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' \
+            | sudo tee /etc/apt/preferences.d/99nginx
+          sudo apt-get update -q
+          sudo apt-get install -y -q nginx nginx-module-acme
+          sudo install -d -o nginx -g nginx -m 0700 /var/lib/nginx-acme /var/lib/nginx-acme/freesocks
+          nginx -v
       - name: Run the offline tests
         run: tests/run.sh
