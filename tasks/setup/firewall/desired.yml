@@ -1,9 +1,10 @@
 ---
 # tasks/setup/firewall/desired.yml - the ports the role's object should let in,
 # from what FCP lists and what the object holds now (_fw_owned_before, read by
-# the backend's own file):
+# the backend's own file). Every one is a key "<port>/<protocol>"
+# (setup/firewall/main.yml), so all of this goes by port AND protocol:
 #   - every listed port;
-#   - a protected port the object already holds (SSH, the node API port) stays,
+#   - a protected port the object already holds (SSH, the node API port: TCP) stays,
 #     listed or not: the role never closes those on FCP's account;
 #   - an EMPTY list is not "close everything" (a node always serves something,
 #     so it is a gap in what FCP knows): the object is kept as it is;
@@ -16,18 +17,18 @@
     _fw_desired: >-
       {{ ((_fw_owned_before | intersect(_fw_protected))
             if (_fw_wipe | default(false) | bool)
-          else _fw_owned_before if (_fw_listed_ports | length == 0)
-          else (_fw_owned_before | intersect(_fw_listed_ports | union(_fw_protected)))
+          else _fw_owned_before if (_fw_listed_keys | length == 0)
+          else (_fw_owned_before | intersect(_fw_listed_keys | union(_fw_protected)))
             if (_fw_prune_only | default(false) | bool)
-          else (_fw_listed_ports | union(_fw_owned_before | intersect(_fw_protected))))
-         | map('int') | unique | sort }}
+          else (_fw_listed_keys | union(_fw_owned_before | intersect(_fw_protected))))
+         | fcp_fw_keys }}
 
 - name: Work out what leaves the role's rules
   set_fact:
-    _fw_closing: "{{ _fw_owned_before | difference(_fw_desired) | sort }}"
+    _fw_closing: "{{ _fw_owned_before | difference(_fw_desired) | fcp_fw_keys }}"
     _fw_kept_protected: >-
-      {{ _fw_desired | difference(_fw_listed_ports) | intersect(_fw_protected) | sort
-         if (_fw_listed_ports | length > 0 and not (_fw_prune_only | default(false) | bool)) else [] }}
+      {{ _fw_desired | difference(_fw_listed_keys) | intersect(_fw_protected) | fcp_fw_keys
+         if (_fw_listed_keys | length > 0 and not (_fw_prune_only | default(false) | bool)) else [] }}
 
 - name: Note an empty list from FCP
   debug:
@@ -36,7 +37,7 @@
       ({{ _fw_owned_before | join(', ') }}) rather than closing it.
   when:
     - not (_fw_wipe | default(false) | bool)
-    - _fw_listed_ports | length == 0
+    - _fw_listed_keys | length == 0
     - _fw_owned_before | length > 0
 
 - name: Note the ports FCP no longer lists

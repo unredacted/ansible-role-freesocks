@@ -17,6 +17,7 @@ State:
                 permanent: {zone: {services, ports}}, runtime: {...}}
   nft          {tables: {"inet filter": {sets: {name: [ports]},
                 chains: [{name, hook?, type?, rules: [text]}]}}}
+               (the role's sets: freesocks_fcp for TCP, freesocks_fcp_udp for UDP)
 
 Usage: fake_firewall.py <tool> [args...]
 """
@@ -61,11 +62,13 @@ def systemctl(state, args):
 
 # --- ufw -------------------------------------------------------------------------
 
-UFW_PROFILE = re.compile(r"^ports=([0-9]+(?:,[0-9]+)*)/tcp$", re.M)
+UFW_PROFILE = re.compile(r"^ports=(\S+)$", re.M)
+UFW_ENTRY = re.compile(r"^([0-9]+(?:,[0-9]+)*)/(tcp|udp)$")
 
 
 def ufw_profile_ports(u, name):
-    """The ports of an application profile, as ufw parses it; None when ufw would refuse it."""
+    """The `|` entries of an application profile, as ufw parses it: [[proto, [ports]], ...]
+    (ufw makes one rule tuple of each); None when ufw would refuse the profile."""
     path = os.path.join(u["dir"], "applications.d", name)
     if not os.path.exists(path):
         return None
@@ -75,10 +78,16 @@ def ufw_profile_ports(u, name):
     m = UFW_PROFILE.search(text)
     if not m:
         return None
-    ports = [int(p) for p in m.group(1).split(",")]
-    if len(ports) > 15 or any(not 1 <= p <= 65535 for p in ports):
-        return None
-    return ports
+    entries = []
+    for entry in m.group(1).split("|"):
+        e = UFW_ENTRY.match(entry)
+        if not e:
+            return None
+        ports = [int(p) for p in e.group(1).split(",")]
+        if len(ports) > 15 or any(not 1 <= p <= 65535 for p in ports):
+            return None
+        entries.append([e.group(2), ports])
+    return entries
 
 
 def ufw_write_user_rules(u):
@@ -91,10 +100,10 @@ def ufw_write_user_rules(u):
             continue
         m = re.match(r"^ufw allow ([A-Za-z0-9-]+)$", r)
         if m:
-            ports = u["app_ports"].get(m.group(1), [])
-            lines.append(
-                f"### tuple ### allow tcp {','.join(str(p) for p in ports)} 0.0.0.0/0 any 0.0.0.0/0 {m.group(1)} - in"
-            )
+            for proto, ports in u["app_ports"].get(m.group(1), []):
+                lines.append(
+                    f"### tuple ### allow {proto} {','.join(str(p) for p in ports)} 0.0.0.0/0 any 0.0.0.0/0 {m.group(1)} - in"
+                )
     lines += ["### END RULES ###", "COMMIT"]
     with open(os.path.join(u["dir"], "user.rules"), "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -223,30 +232,37 @@ def firewall_cmd(state, args):
 
 # --- nft ---------------------------------------------------------------------------
 
-SET_FILE = re.compile(
-    r"^\s*set freesocks_fcp \{\s*type inet_service\s*(?:elements = \{ ([0-9]+(?:, [0-9]+)*) \}\s*)?\}\s*$"
-)
+SET_FILE = re.compile(r"\s*set (freesocks_fcp(?:_udp)?) \{\s*type inet_service\s*(?:elements = \{ ([0-9]+(?:, [0-9]+)*) \}\s*)?\}")
 
 
 def nft_check_set_file(path):
-    """The role's set file, as nft would parse it inside a table; None when nft would refuse it."""
+    """The role's set file, as nft would parse it inside a table: {set: [ports]}; None when
+    nft would refuse it (anything but the role's sets, or a set twice)."""
     text = "\n".join(line for line in open(path).read().splitlines() if not line.lstrip().startswith("#"))
-    m = SET_FILE.match(text)
-    if not m:
+    sets, pos = {}, 0
+    while True:
+        m = SET_FILE.match(text, pos)
+        if not m:
+            break
+        if m.group(1) in sets:
+            return None
+        sets[m.group(1)] = [int(p) for p in m.group(2).split(", ")] if m.group(2) else []
+        pos = m.end()
+    if text[pos:].strip() or not sets:
         return None
-    return [int(p) for p in m.group(1).split(", ")] if m.group(1) else []
+    return sets
 
 
 def nft_rule_expr(text):
     """A rule as `nft -j` lists it, for the few forms the tests write."""
-    m = re.match(r"^tcp dport (\S+)( counter)? (accept|drop)$", text)
+    m = re.match(r"^(tcp|udp) dport (\S+)( counter)? (accept|drop)$", text)
     if not m:
         return [{"xt": {"text": text}}]
-    right = m.group(1) if m.group(1).startswith("@") else int(m.group(1))
-    expr = [{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": right}}]
-    if m.group(2):
+    right = m.group(2) if m.group(2).startswith("@") else int(m.group(2))
+    expr = [{"match": {"op": "==", "left": {"payload": {"protocol": m.group(1), "field": "dport"}}, "right": right}}]
+    if m.group(3):
         expr.append({"counter": {"packets": 0, "bytes": 0}})
-    expr.append({m.group(3): None})
+    expr.append({m.group(4): None})
     return expr
 
 

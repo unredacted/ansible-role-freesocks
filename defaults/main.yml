@@ -45,25 +45,31 @@ fcp_status_gate_delay: 20
 # --- the firewall (FCP docs/servers.md "Firewall acknowledgement") -------------
 # FCP moves a transport to another port only once every node serving it says
 # its firewall lets the new port in. On every deploy/update run the role lets
-# in each port FCP lists for this node (TCP, from anywhere) before it reports,
-# and tells FCP which ports are open.
+# in each port FCP lists for this node (with its own protocol, TCP or UDP, from
+# anywhere) before it reports, and tells FCP which ports are open, each with its
+# protocol: {port: 443, protocol: udp} is not {port: 443, protocol: tcp}.
 #
 # Where the role keeps its rules. It owns ONE object there and never touches
 # anything else: never a rule of yours, never a default policy, never enabling
 # or reloading a firewall that is off.
 #   auto       firewalld if it runs, else ufw if it is active, else nftables if
 #              nftables.service is active, else none
-#   ufw        an application profile `freesocks-fcp` and the one rule allowing it
-#   firewalld  a service `freesocks-fcp` in fcp_firewall_firewalld_zone (a change
-#              to it reloads firewalld)
-#   nftables   a set `freesocks_fcp` in fcp_firewall_nftables_file, which YOUR
-#              ruleset includes inside the table of its input chain and lets in:
+#   ufw        an application profile `freesocks-fcp` (`ports=443/tcp|443/udp`)
+#              and the one rule allowing it
+#   firewalld  a service `freesocks-fcp` (`<port protocol="tcp|udp">`) in
+#              fcp_firewall_firewalld_zone (a change to it reloads firewalld)
+#   nftables   the sets `freesocks_fcp` (TCP) and `freesocks_fcp_udp` (UDP) in
+#              fcp_firewall_nftables_file, which YOUR ruleset includes inside
+#              the table of its input chain and lets in:
 #                include "/etc/nftables.d/freesocks-fcp.nft"
 #                tcp dport @freesocks_fcp accept
+#                udp dport @freesocks_fcp_udp accept
 #   none       the role writes no rule
 fcp_firewall_backend: auto
 # What you vouch is open that the role did not open itself: `true` (every port
-# FCP lists), a list of ports, or `false`. With `none` (or nothing found by
+# FCP lists), a list of ports, or `false`. A port is {port, protocol}, '443/udp'
+# or a bare number (TCP): [443, {port: 443, protocol: udp}] or, from -e,
+# fcp_firewall_assume_open=443,443/udp. With `none` (or nothing found by
 # `auto`) the role reports only these: a firewall it cannot see, such as a
 # provider's, may still drop the rest, so a port change waits on this node
 # until you say so.
@@ -73,7 +79,8 @@ fcp_firewall_assume_open: false
 # rules, but reports only what fcp_firewall_assume_open vouches for.
 fcp_firewall_provider_filter: false
 # Never closed on the role's account, even once FCP stops listing them: SSH
-# (22 and ansible_port) and the node API port are always kept; add more here.
+# (22 and ansible_port) and the node API port (TCP) are always kept; add more
+# here, as for fcp_firewall_assume_open (a bare number is TCP).
 fcp_firewall_protected_ports: []
 fcp_firewall_firewalld_zone: ""          # empty = the default zone
 fcp_firewall_nftables_table: "inet filter"
@@ -128,6 +135,25 @@ node_public_address: ""
 node_publish_ipv6: false
 # A front node's origin hostname when FCP does not manage the zone (explicit DNS).
 node_origin_hostname: ""
+
+# --- kernel settings (tasks/setup/sysctl.yml) -----------------------------------
+# One drop-in of the role's, applied at once and at boot; nothing else in
+# /etc/sysctl.d is touched. With both off the drop-in is removed (the kernel
+# keeps what it was set to until the next boot).
+#
+# Raise net.core.rmem_max and wmem_max to node_quic_buffer_bytes (16 MiB,
+# quic-go's recommendation): a QUIC transport (Hysteria 2 on UDP) wants larger
+# socket buffers than the kernel's default limit and drops datagrams under load
+# without them. Raise only: a larger limit the machine already has is kept.
+node_quic_buffers: true
+node_quic_buffer_bytes: 16777216
+# BBR congestion control with the fq qdisc (TCP only; off by default). The run
+# stops if the kernel offers no BBR. fq takes over an interface's qdisc when
+# the interface comes up, so an interface already up keeps its own until a
+# reboot.
+node_tcp_bbr: false
+node_sysctl_file: "/etc/sysctl.d/60-freesocks-node.conf"
+node_sysctl_modules_file: "/etc/modules-load.d/freesocks-node.conf"
 
 # --- the remnanode container ------------------------------------------------
 remnawave_node_image: "remnawave/node:3.4.2"

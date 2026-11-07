@@ -63,9 +63,9 @@
 - name: Take the ports a change waits for that this run did not report
   set_fact:
     _fcp_gate_waiting: >-
-      {{ (_fcp_gate_v.firewall.ports | default([]) | selectattr('reason', 'equalto', 'pending')
-          | map(attribute='port') | map('int') | list)
-         | difference(_fw_reported_ports | default([])) | sort }}
+      {{ (_fcp_gate_v.firewall.ports | default([]) | selectattr('reason', 'defined')
+          | selectattr('reason', 'equalto', 'pending') | fcp_fw_keys)
+         | difference(_fw_reported_keys | default([])) | fcp_fw_keys }}
 
 - name: Work out what keeps the node from healthy
   set_fact:

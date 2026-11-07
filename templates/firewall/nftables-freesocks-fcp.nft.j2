@@ -1,12 +1,17 @@
-# Managed by ansible-role-freesocks: the TCP ports FCP lists for this node.
-# Include this file inside the table that holds your input chain, and let the
-# set in from that chain:
+# Managed by ansible-role-freesocks: the ports FCP lists for this node, TCP in
+# freesocks_fcp and UDP in freesocks_fcp_udp.
+# Include this file inside the table that holds your input chain, and let both
+# sets in from that chain:
 #   include "{{ fcp_firewall_nftables_file }}"
 #   tcp dport @freesocks_fcp accept
-# The role rewrites this set and nothing else.
-set freesocks_fcp {
+#   udp dport @freesocks_fcp_udp accept
+# The role rewrites these sets and nothing else.
+{% for _name, _proto in [['freesocks_fcp', 'tcp'], ['freesocks_fcp_udp', 'udp']] %}
+{% set _ports = _fw_desired | fcp_fw_ports(_proto) %}
+set {{ _name }} {
 	type inet_service
-{% if _fw_desired | length > 0 %}
-	elements = { {{ _fw_desired | join(', ') }} }
+{% if _ports | length > 0 %}
+	elements = { {{ _ports | join(', ') }} }
 {% endif %}
 }
+{% endfor %}
