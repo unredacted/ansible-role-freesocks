@@ -16,3 +16,4 @@ tests/.identity-*/
 tests/.pull/
 tests/.caddyfile.rendered
 tests/.compose.rendered
+tests/.node_secret/

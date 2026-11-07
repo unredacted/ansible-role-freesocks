@@ -1,7 +1,8 @@
 ---
 # tasks/setup/remnawave.yml - the remnanode container. The compose file carries
-# the panel's node secret FCP served (register_node.yml); it is rendered
-# no_log with restrictive permissions and never printed.
+# the panel's node secret: the one the node already has while it stays good,
+# else the one FCP served (register_node.yml, remnanode_compose.yml). It is
+# rendered no_log with restrictive permissions and never printed.
 
 - name: Create the install directory
   file:
@@ -17,16 +18,10 @@
     mode: '0755'
   become: yes
 
+# Keeps the node's panel secret across runs, so a repeat run leaves the file,
+# and so the container, alone (remnanode_compose.yml).
 - name: Render docker-compose.yml
-  template:
-    src: remnanode-docker-compose.yml.j2
-    dest: "{{ remnawave_node_install_dir }}/docker-compose.yml"
-    mode: '0640'
-  vars:
-    remnawave_node_port: "{{ _fcp_bootstrap.nodePort | int }}"
-  become: yes
-  register: compose_template
-  no_log: true # the rendered file carries the panel-wide node secret
+  include_tasks: setup/remnanode_compose.yml
 
 - name: Render the logrotate config
   template:

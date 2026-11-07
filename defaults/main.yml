@@ -162,6 +162,14 @@ remnawave_log_dir: "/var/log/remnanode"
 # The 3.x node's nftables plugins log client IPs by default: kept OFF (no-log posture).
 remnawave_node_nftables_logging: false
 force_reinstall_remnawave: false
+# The panel's node secret. FCP serves a new one on every run; the node keeps
+# the one it has (so the container, and every open session, is left alone)
+# while it is for the same panel CA and JWT key and its certificate has at
+# least remnawave_node_secret_min_days left (a panel's node certificates last
+# three years). true (or force_reinstall_remnawave) writes FCP's new one, and
+# the container is recreated.
+remnawave_node_rotate_secret: false
+remnawave_node_secret_min_days: 30
 remnawave_docker_apt_suite: ""
 
 # --- pulling the node image ----------------------------------------------------
