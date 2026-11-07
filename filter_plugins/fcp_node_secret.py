@@ -27,7 +27,10 @@ on every run. These filters decide when the one already on the node can stay.
         other_panel     the node's secret is for another CA or JWT key (the
                         panel was re-keyed, or the node moved);
         expiring        its certificate ends within min_days, or has ended;
-        cannot_check    no `cryptography` on the controller to read it.
+        not_yet_valid   its certificate starts in the future (minted while
+                        the panel's clock ran ahead);
+        cannot_check    no `cryptography` 40 or later on the controller to
+                        read it and check its signature.
       Only `kept` keeps the node's secret; every other code takes FCP's.
 
 Neither filter puts a secret into an error or a return value other than the
@@ -76,36 +79,42 @@ def _normalise_pem(pem):
     return "\n".join(line.strip() for line in text.split("\n") if line.strip())
 
 
-def _not_after(cert):
-    value = getattr(cert, "not_valid_after_utc", None)
-    if value is None:  # cryptography < 42
-        value = cert.not_valid_after.replace(tzinfo=timezone.utc)
-    return value
+def _validity(cert):
+    """(not_before, not_after), timezone-aware."""
+    before = getattr(cert, "not_valid_before_utc", None)
+    after = getattr(cert, "not_valid_after_utc", None)
+    if before is None or after is None:  # cryptography < 42
+        before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+        after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    return before, after
 
 
 def _node_cert_good_for(payload, min_days, now):
-    """'kept', 'expiring', 'unreadable' or 'cannot_check' for the node's own certificate."""
+    """'kept', 'expiring', 'not_yet_valid', 'unreadable' or 'cannot_check' for the node's own certificate."""
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization
     except ImportError:
+        return "cannot_check"
+    # The signature check needs verify_directly_issued_by (cryptography 40):
+    # without it a certificate from another CA of the same name would pass.
+    if not hasattr(x509.Certificate, "verify_directly_issued_by"):
         return "cannot_check"
     try:
         node = x509.load_pem_x509_certificate(payload["nodeCertPem"].encode())
         ca = x509.load_pem_x509_certificate(payload["caCertPem"].encode())
         key = serialization.load_pem_private_key(payload["nodeKeyPem"].encode(), password=None)
         serialization.load_pem_public_key(payload["jwtPublicKey"].encode())
-        if node.issuer != ca.subject:
-            return "unreadable"
-        verify = getattr(node, "verify_directly_issued_by", None)
-        if verify is not None:  # cryptography >= 40
-            verify(ca)
+        node.verify_directly_issued_by(ca)
         spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
         if key.public_key().public_bytes(*spki) != node.public_key().public_bytes(*spki):
             return "unreadable"
     except Exception:  # any parse or signature failure; never echo the PEMs
         return "unreadable"
-    if _not_after(node) - now < timedelta(days=min_days):
+    not_before, not_after = _validity(node)
+    if not_before > now:
+        return "not_yet_valid"
+    if not_after - now < timedelta(days=min_days):
         return "expiring"
     return "kept"
 

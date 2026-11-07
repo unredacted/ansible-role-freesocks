@@ -5,6 +5,7 @@ Mints secrets shaped like the panel's GET /api/keygen pubKey: base64 of
 signed by the panel's CA (ECDSA P-256, like the panel). Prints a JSON object:
   a1, a2, a3       panel A, three keygen calls (same CA and JWT key)
   a_expiring       panel A, a node certificate ending in 10 days
+  a_future         panel A, a node certificate that starts in 2 days
   a_foreign_cert   panel A's CA and JWT key, a node certificate from another CA
   b1               panel B (another CA and JWT key)
 
@@ -58,9 +59,9 @@ def panel(cn):
     return {"key": key, "cert": cert, "jwt": jwt_pub}
 
 
-def secret(p, days=3 * 365, signer=None):
+def secret(p, days=3 * 365, signer=None, starts_in_days=0):
     signer = signer or p
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc) + timedelta(days=starts_in_days)
     key = ec.generate_private_key(ec.SECP256R1())
     cert = (
         x509.CertificateBuilder()
@@ -93,6 +94,7 @@ if __name__ == "__main__":
                 "a2": secret(a),
                 "a3": secret(a),
                 "a_expiring": secret(a, days=10),
+                "a_future": secret(a, starts_in_days=2),
                 "a_foreign_cert": secret(a, signer=impostor),
                 "b1": secret(b),
             }
