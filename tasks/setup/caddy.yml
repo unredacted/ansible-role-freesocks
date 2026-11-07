@@ -174,4 +174,4 @@
 
 - name: Note certificate readiness
   set_fact:
-    _caddy_cert_ready: "{{ (_caddy_certs.files | default([])) | selectattr('path', 'search', '/' ~ (origin_hostname | regex_escape) ~ '/') | list | length > 0 }}"
+    _front_cert_ready: "{{ (_caddy_certs.files | default([])) | selectattr('path', 'search', '/' ~ (origin_hostname | regex_escape) ~ '/') | list | length > 0 }}"

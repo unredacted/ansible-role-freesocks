@@ -105,8 +105,26 @@
   become: yes
   when: "'caddy.service' in (_caddy_unit.stdout | default(''))"
 
+- name: Look for the nginx unit
+  command: systemctl list-unit-files nginx.service --no-legend
+  register: _nginx_unit
+  changed_when: false
+  failed_when: false
+  become: yes
+
+# Masked too: the package's postinst starts a stopped nginx on an upgrade.
+- name: Stop nginx
+  systemd:
+    name: nginx
+    state: stopped
+    enabled: no
+    masked: yes
+  become: yes
+  when: "'nginx.service' in (_nginx_unit.stdout | default(''))"
+
 # Caddy itself (the package, the caddy user, its home with the ACME account
-# and certificates) is left, as caddy_absent.yml leaves it; a later deploy
+# and certificates) is left, as caddy_absent.yml leaves it, and so is nginx
+# (the package, its ACME state); a later deploy
 # makes any of Caddy's directories that went missing (caddy.yml). The pull's
 # Docker config is only ever left by a run that stopped mid-pull.
 - name: Remove the machine's node files
@@ -119,6 +137,7 @@
     - "{{ remnawave_log_dir }}"
     - /etc/logrotate.d/remnanode
     - /etc/caddy/Caddyfile
+    - "{{ remnawave_nginx_conf }}"
     - "{{ remnawave_decoy_root }}"
     - "{{ remnawave_node_install_dir }}/.decoy_ref"
     - "{{ _image_pull_config_dir }}"

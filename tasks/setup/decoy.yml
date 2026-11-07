@@ -1,16 +1,29 @@
 ---
 # tasks/setup/decoy.yml
 #
-# Create the decoy/camouflage web root and a plausible static landing page.
-# Caddy serves this on every non-transport path and every Host, edge hostnames
-# included (see remnanode-caddyfile.j2), so a probe of https://<host>/ sees an
-# innocuous "maintenance" site rather than a bare proxy or an error. Idempotent.
+# What the front server (Caddy or nginx) serves on every non-transport path and
+# every Host, edge hostnames included: what anyone who probes
+# https://<origin or edge name>/ sees.
 #
-# The page carries nothing of the node's name: names may follow the operator's
-# scheme and say what the node is, and even a hash of one could be matched
-# against that scheme's candidates. So that the page is not byte-identical
-# across nodes, it carries a reference picked at random once per machine and
-# kept in .decoy_ref: the same on every run and after a rename.
+# This repository is public, so nothing in it can be what makes a decoy hard
+# to recognise: a generator shipped here is read by everyone who wants to
+# fingerprint it. So the role ships only the mechanism.
+#
+#   no kit (remnawave_decoy_kit empty)  the front server's own stock page,
+#       copied from its package (nginx's welcome page, Caddy's "Caddy works!"):
+#       what countless fresh installs serve, so it marks nothing on its own.
+#   a kit (remnawave_decoy_kit = a directory on the controller, kept in
+#       private inventory)  the kit's site. The kit is a directory of
+#       templates plus a filter named `decoy_kit` that the playbook provides
+#       (its playbook-adjacent filter_plugins). `<reference> | decoy_kit`
+#       returns {site: {...}, pages: [{template, dest, vars}]}: each page is
+#       the kit's `template` rendered to `dest` under the web root, with
+#       `site` and `page` (its `vars`) in scope.
+#
+# The reference is picked at random once per machine and kept in .decoy_ref,
+# never derived from the node's name (names may follow the operator's scheme
+# and say what the node is): the same site on every run and after a rename.
+# Files the site does not have (an earlier decoy's) are removed. Idempotent.
 
 - name: Create decoy web root
   file:
@@ -39,11 +52,121 @@
     mode: '0640'
   become: "{{ _fcp_become | default(true) }}"
 
-- name: Render decoy index page
-  template:
-    src: decoy-index.html.j2
-    dest: "{{ remnawave_decoy_root }}/index.html"
-    mode: '0644'
-  vars:
-    decoy_ref: "{{ _decoy_ref }}"
+# --- no kit: the front server's stock page -------------------------------------
+- name: Serve the front server's stock page
+  when: remnawave_decoy_kit | length == 0
+  block:
+    - name: Find the stock page
+      set_fact:
+        _decoy_stock: >-
+          {{ remnawave_decoy_stock_page
+             if remnawave_decoy_stock_page | length > 0
+             else ('/usr/share/nginx/html/index.html'
+                   if remnawave_front_server | default('caddy') == 'nginx'
+                   else '/usr/share/caddy/index.html') }}
+
+    - name: Copy it into the web root
+      copy:
+        src: "{{ _decoy_stock }}"
+        dest: "{{ remnawave_decoy_root }}/index.html"
+        remote_src: yes
+        mode: '0644'
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: The site is that one page
+      set_fact:
+        _decoy_files: ["index.html"]
+
+# --- a kit ----------------------------------------------------------------------
+- name: Render the kit's site
+  when: remnawave_decoy_kit | length > 0
+  block:
+    - name: Assert the kit is there
+      assert:
+        that:
+          - remnawave_decoy_kit is directory
+        fail_msg: "remnawave_decoy_kit ({{ remnawave_decoy_kit }}) is not a directory on the controller"
+        quiet: true
+
+    - name: Work out the kit's site
+      block:
+        - name: Ask the kit's filter for this machine's site
+          set_fact:
+            _decoy_kit: "{{ _decoy_ref | decoy_kit }}"
+      rescue:
+        - name: Say what the kit is missing
+          fail:
+            msg: >-
+              remnawave_decoy_kit is set but the playbook provides no working
+              `decoy_kit` filter ({{ ansible_failed_result.msg | default('') | truncate(300) }}).
+              Put the kit's filter plugin in the playbook's filter_plugins
+              directory (next to the playbook), or leave remnawave_decoy_kit empty
+              for the front server's stock page.
+
+    - name: Assert the kit's pages are usable
+      assert:
+        that:
+          - _decoy_kit.pages is defined
+          - _decoy_kit.pages | length > 0
+          - _decoy_kit.pages | map(attribute='dest') | select('match', '^[A-Za-z0-9_][A-Za-z0-9._/-]*[A-Za-z0-9._-]$') | list | length == _decoy_kit.pages | length
+          - _decoy_kit.pages | map(attribute='dest') | select('search', '(^|/)\.\.?(/|$)|//') | list | length == 0
+          - _decoy_kit.pages | map(attribute='template') | select('search', '(^|/)\.\.(/|$)|^/') | list | length == 0
+          - "'index.html' in (_decoy_kit.pages | map(attribute='dest') | list)"
+          - _decoy_kit.pages | map(attribute='dest') | unique | length == _decoy_kit.pages | length
+        fail_msg: >-
+          The kit's pages must be relative paths inside the web root (no '..',
+          no leading '/', no duplicates), include index.html, and name templates
+          inside the kit.
+        quiet: true
+
+    - name: The site's files
+      set_fact:
+        _decoy_files: "{{ _decoy_kit.pages | map(attribute='dest') | list }}"
+
+    - name: Create the site's directories
+      file:
+        path: "{{ remnawave_decoy_root }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ _decoy_files | decoy_dirs }}"
+      become: "{{ _fcp_become | default(true) }}"
+
+    - name: Render the site's pages
+      template:
+        src: "{{ remnawave_decoy_kit }}/{{ _decoy_page.template }}"
+        dest: "{{ remnawave_decoy_root }}/{{ _decoy_page.dest }}"
+        mode: '0644'
+      loop: "{{ _decoy_kit.pages }}"
+      loop_control:
+        loop_var: _decoy_page
+        label: "{{ _decoy_page.dest }}"
+      vars:
+        site: "{{ _decoy_kit.site | default({}) }}"
+        page: "{{ _decoy_page.vars | default({}) }}"
+      become: "{{ _fcp_become | default(true) }}"
+
+# --- either way -----------------------------------------------------------------
+- name: Does the site have its own not-found page
+  set_fact:
+    _decoy_has_404: "{{ '404.html' in _decoy_files }}"
+
+- name: Look at what the web root holds
+  find:
+    paths: "{{ remnawave_decoy_root }}"
+    recurse: yes
+    file_type: any
+    hidden: yes
+  register: _decoy_found
+  become: "{{ _fcp_become | default(true) }}"
+
+# Anything the site does not have: an earlier decoy's pages (the maintenance
+# page of earlier releases, another kit's site), or a file left by hand.
+- name: Remove what the site does not have
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ _decoy_found.files | map(attribute='path')
+       | reject('in', (_decoy_files + (_decoy_files | decoy_dirs)) | map('regex_replace', '^', remnawave_decoy_root ~ '/') | list)
+       | sort | list }}
   become: "{{ _fcp_become | default(true) }}"

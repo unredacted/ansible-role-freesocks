@@ -1,0 +1,218 @@
+---
+# tests/test_front_sysctl.yml
+#
+# Offline test of tasks/setup/front_sysctl.yml against a fake `sysctl`
+# (tests/fake_sysctl.py, the kernel's values in a JSON file):
+#   (a) a machine with the kernel's usual limits gets each one raised (tcp_mem
+#       and the connection-tracking table as shares of its RAM), written to
+#       the role's drop-in and applied;
+#   (b) a second run changes and applies nothing;
+#   (c) a machine that already has larger values keeps them (raise only),
+#       and tcp_mem stays in order;
+#   (d) more RAM raises the RAM-based limits on the next run;
+#   (e) without connection tracking the drop-in leaves its key out;
+#   (f) tcp_mem is counted in the host's own pages (64 KiB here), not 4 KiB.
+#
+# Run: ansible-playbook tests/test_front_sysctl.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _dir: "{{ playbook_dir }}/.front_sysctl"
+    _bin: "{{ _dir }}/bin"
+    _state: "{{ _dir }}/kernel.json"
+    _fcp_become: false
+    _front_conntrack_proc: "{{ _dir }}/nf_conntrack_max"
+    remnawave_front_sysctl_file: "{{ _dir }}/61-freesocks-front.conf"
+    remnawave_front_tcp_mem_percent: [12.5, 18.75, 25]
+    remnawave_front_conntrack_per_mb: 64
+    remnawave_nginx_backlog: 65535
+    ansible_memtotal_mb: 32079
+    _usual:
+      net.core.somaxconn: "4096"
+      net.ipv4.tcp_max_syn_backlog: "2048"
+      net.core.netdev_max_backlog: "1000"
+      net.ipv4.tcp_max_tw_buckets: "131072"
+      net.ipv4.tcp_max_orphans: "131072"
+      net.ipv4.tcp_mem: "382479 509973 764958"
+      net.netfilter.nf_conntrack_max: "262144"
+  environment:
+    PATH: "{{ playbook_dir }}/.front_sysctl/bin:{{ lookup('env', 'PATH') }}"
+    FAKE_SYSCTL_STATE: "{{ playbook_dir }}/.front_sysctl/kernel.json"
+  tasks:
+    - block:
+        - name: Prepare the fake kernel
+          file:
+            path: "{{ _bin }}"
+            state: directory
+
+        - name: Put the fake sysctl on the PATH
+          file:
+            src: "{{ playbook_dir }}/fake_sysctl.py"
+            dest: "{{ _bin }}/sysctl"
+            state: link
+
+        # The page size the fake kernel has (kernel.json.pagesize, 4096 unless
+        # that file says otherwise).
+        - name: Put a fake getconf on the PATH
+          copy:
+            content: |
+              #!/bin/sh
+              [ "$1" = PAGESIZE ] || exit 2
+              cat "$FAKE_SYSCTL_STATE.pagesize" 2>/dev/null || echo 4096
+            dest: "{{ _bin }}/getconf"
+            mode: '0755'
+
+        - name: Connection tracking is loaded
+          copy:
+            content: "262144\n"
+            dest: "{{ _front_conntrack_proc }}"
+
+        - name: The kernel's usual limits
+          copy:
+            content: "{{ _usual | to_json }}"
+            dest: "{{ _state }}"
+
+        # (a)
+        - name: Raise the limits
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+
+        - name: Read the kernel and the drop-in
+          set_fact:
+            _k: "{{ lookup('file', _state) | from_json }}"
+            _dropin: "{{ lookup('file', remnawave_front_sysctl_file) }}"
+            _applied: "{{ lookup('file', _state ~ '.applied', errors='ignore') | default('', true) }}"
+
+        - name: Assert each limit raised and applied
+          vars:
+            _pages: "{{ 32079 * 256 }}"
+          assert:
+            that:
+              - _k['net.core.somaxconn'] == '65535'
+              - _k['net.ipv4.tcp_max_syn_backlog'] == '65535'
+              - _k['net.core.netdev_max_backlog'] == '16384'
+              - _k['net.ipv4.tcp_max_tw_buckets'] == '2000000'
+              - _k['net.ipv4.tcp_max_orphans'] == '262144'
+              - _k['net.ipv4.tcp_mem'] == ((_pages | int * 0.125) | int) ~ ' ' ~ ((_pages | int * 0.1875) | int) ~ ' ' ~ ((_pages | int * 0.25) | int)
+              - _k['net.netfilter.nf_conntrack_max'] == (32079 * 64) | string
+              - "'net.ipv4.tcp_mem = 1026528 1539792 2053056' in _dropin"
+              - _applied.splitlines() | length == 1
+            success_msg: "raised: tcp_mem {{ _k['net.ipv4.tcp_mem'] }}, conntrack {{ _k['net.netfilter.nf_conntrack_max'] }}."
+
+        # (b)
+        - name: Run again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+
+        - name: Assert nothing applied again
+          assert:
+            that:
+              - lookup('file', _state ~ '.applied').splitlines() | length == 1
+              - lookup('file', remnawave_front_sysctl_file) == _dropin
+            success_msg: "a second run applies nothing."
+
+        # (c)
+        - name: A machine with larger values
+          copy:
+            content: >-
+              {{ _usual | combine({'net.core.somaxconn': '131072',
+                                   'net.ipv4.tcp_mem': '9000000 1000 12000000',
+                                   'net.netfilter.nf_conntrack_max': '8388608'}) | to_json }}
+            dest: "{{ _state }}"
+
+        - name: Raise the limits there
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+
+        - name: Assert the larger values are kept
+          vars:
+            _k2: "{{ lookup('file', _state) | from_json }}"
+          assert:
+            that:
+              - _k2['net.core.somaxconn'] == '131072'
+              - _k2['net.ipv4.tcp_mem'] == '9000000 9000000 12000000'
+              - _k2['net.netfilter.nf_conntrack_max'] == '8388608'
+            success_msg: "nothing lowered: {{ _k2['net.ipv4.tcp_mem'] }}."
+
+        # (d)
+        - name: The usual limits again
+          copy:
+            content: "{{ _usual | to_json }}"
+            dest: "{{ _state }}"
+
+        - name: Raise the limits on a machine with twice the RAM
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+          vars:
+            ansible_memtotal_mb: 64158
+
+        - name: Assert the RAM-based limits doubled
+          vars:
+            _k3: "{{ lookup('file', _state) | from_json }}"
+          assert:
+            that:
+              - _k3['net.ipv4.tcp_mem'] == '2053056 3079584 4106112'
+              - _k3['net.netfilter.nf_conntrack_max'] == (64158 * 64) | string
+            success_msg: "64 GiB: tcp_mem {{ _k3['net.ipv4.tcp_mem'] }}."
+
+        # (f)
+        - name: Small limits on a kernel with 64 KiB pages
+          copy:
+            content: "{{ _usual | combine({'net.ipv4.tcp_mem': '1000 2000 3000'}) | to_json }}"
+            dest: "{{ _state }}"
+
+        - name: Give the fake kernel 64 KiB pages
+          copy:
+            content: "65536\n"
+            dest: "{{ _state }}.pagesize"
+
+        - name: Raise the limits there
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+
+        - name: Back to 4 KiB pages
+          file:
+            path: "{{ _state }}.pagesize"
+            state: absent
+
+        - name: Assert tcp_mem counts 64 KiB pages
+          vars:
+            _k4: "{{ lookup('file', _state) | from_json }}"
+          assert:
+            that:
+              - _k4['net.ipv4.tcp_mem'] == '64158 96237 128316'
+            success_msg: "64 KiB pages: tcp_mem {{ _k4['net.ipv4.tcp_mem'] }} (12.5/18.75/25 % of 32079 MiB in 64 KiB pages)."
+
+        # (e)
+        - name: Connection tracking is not loaded
+          file:
+            path: "{{ _front_conntrack_proc }}"
+            state: absent
+
+        - name: The usual limits, without connection tracking
+          copy:
+            content: "{{ _usual | dict2items | rejectattr('key', 'equalto', 'net.netfilter.nf_conntrack_max') | items2dict | to_json }}"
+            dest: "{{ _state }}"
+
+        - name: Raise the limits without connection tracking
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/front_sysctl.yml
+
+        - name: Assert the drop-in leaves connection tracking out
+          assert:
+            that:
+              - "'nf_conntrack_max' not in lookup('file', remnawave_front_sysctl_file)"
+              - (lookup('file', _state) | from_json)['net.core.somaxconn'] == '65535'
+            success_msg: "no connection tracking, no key for it."
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _dir }}"
+            state: absent

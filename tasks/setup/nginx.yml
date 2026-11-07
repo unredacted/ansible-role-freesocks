@@ -1,0 +1,238 @@
+---
+# tasks/setup/nginx.yml - nginx in front of a front node's loopback transport
+# (remnawave_front_server: nginx). The same job as caddy.yml: TLS on the
+# external port FCP declared for the origin hostname FCP served (HTTP-01 on
+# port 80, which must be free), the routes FCP declared proxied to their
+# loopback ports, everything else the decoy site.
+#
+# nginx and its ACME module come from nginx.org (pinned over Debian's, and
+# added to unattended-upgrades so its security releases install by
+# themselves). The role's configuration is its own file; the package's
+# /etc/nginx/nginx.conf is never edited, so an upgrade never stops at a
+# conffile question. A package upgrade swaps the binary in place (the
+# package's `upgrade`): open sessions are not dropped.
+
+- name: Set the routes and the external port FCP declared
+  set_fact:
+    nginx_routes: "{{ _fcp_bootstrap.ingress.routes | default([]) }}"
+    nginx_listen_port: "{{ _fcp_bootstrap.ingress.externalPort | default(remnawave_caddy_listen_port) | int }}"
+
+- name: Assert FCP declared at least one route
+  assert:
+    that:
+      - nginx_routes | length > 0
+    fail_msg: "FCP served an ingress without routes for this node"
+
+- name: Assert the ACME registration address is set
+  assert:
+    that:
+      - remnawave_caddy_email | length > 0
+    fail_msg: "remnawave_caddy_email is required on a node that runs a front server (ACME registration)"
+
+# === Install nginx from nginx.org ===
+- name: Add nginx.org's apt repository
+  include_tasks: nginx_repo.yml
+
+# Its postinst starts nginx straight away on a fresh install, with the
+# package's own configuration (port 80, the package's page). The unit is
+# masked on a node that runs no nginx (nginx_absent.yml): unmask it first,
+# and the configuration below replaces the package's within this run.
+- name: Unmask the nginx unit
+  systemd:
+    name: nginx
+    masked: no
+  become: yes
+  failed_when: false
+
+- name: Install nginx and its ACME module
+  apt:
+    name:
+      - nginx
+      - nginx-module-acme
+    state: present
+  become: yes
+
+# === Configuration ===
+- name: Read the host's resolvers
+  slurp:
+    src: /etc/resolv.conf
+  register: _resolv_conf
+  when: remnawave_nginx_resolvers | length == 0
+
+- name: Does the host carry IPv6
+  stat:
+    path: /proc/net/if_inet6
+  register: _if_inet6
+
+- name: Set the resolvers and the address families
+  set_fact:
+    nginx_ipv6: "{{ _if_inet6.stat.exists }}"
+    nginx_resolvers: >-
+      {{ (remnawave_nginx_resolvers
+          if remnawave_nginx_resolvers | length > 0
+          else (_resolv_conf.content | b64decode).splitlines()
+               | select('match', '^\s*nameserver\s+')
+               | map('regex_replace', '^\s*nameserver\s+(\S+).*$', '\1') | list)
+         | map('regex_replace', '^([0-9a-fA-F:]*:[0-9a-fA-F:.%a-zA-Z0-9]*)$', '[\1]')
+         | list }}
+
+- name: Read the kernel's per-process file limit
+  command: sysctl -n fs.nr_open
+  register: _nr_open
+  changed_when: false
+
+# Sized from the machine, so a node given more RAM or vCPUs takes more on the
+# next run: the total from RAM (or remnawave_nginx_max_connections), split
+# over one worker per vCPU with a quarter on top (reuseport spreads new
+# connections evenly, not perfectly), at least 16384 a worker. Each worker
+# may open that many files plus some for the decoy, within the kernel's cap.
+- name: Size the workers
+  vars:
+    _total: >-
+      {{ (remnawave_nginx_max_connections | int)
+         if (remnawave_nginx_max_connections | string | length > 0)
+         else (ansible_memtotal_mb | int) * 32 }}
+    _workers: "{{ [ansible_processor_vcpus | default(1) | int, 1] | max }}"
+  set_fact:
+    nginx_worker_connections: "{{ [16384, ((_total | int) * 1.25 / (_workers | int)) | round(0, 'ceil') | int] | max }}"
+
+- name: Size the file limits and the listen queue
+  set_fact:
+    nginx_worker_rlimit_nofile: "{{ [(nginx_worker_connections | int) + 4096, _nr_open.stdout | int] | min }}"
+    nginx_backlog: "{{ remnawave_nginx_backlog | int }}"
+
+- name: Assert the loopback source count is usable
+  assert:
+    that:
+      - remnawave_nginx_loopback_sources | int >= 1
+      - remnawave_nginx_loopback_sources | int <= 254
+    fail_msg: "remnawave_nginx_loopback_sources must be 1 to 254"
+
+- name: Raise the kernel's connection limits
+  include_tasks: front_sysctl.yml
+  when: remnawave_front_kernel_tuning | bool
+
+- name: Assert the host has a resolver
+  assert:
+    that:
+      - nginx_resolvers | length > 0
+    fail_msg: "No nameserver in /etc/resolv.conf: set remnawave_nginx_resolvers"
+
+# The ACME module keeps its account key, certificates and private keys
+# here; the workers (the nginx user) write it.
+- name: Ensure the ACME state directory
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: nginx
+    group: nginx
+    mode: '0700'
+  loop:
+    - "{{ remnawave_nginx_acme_state_dir | dirname }}"
+    - "{{ remnawave_nginx_acme_state_dir }}"
+  become: yes
+
+- name: Ensure the configuration directory
+  file:
+    path: "{{ remnawave_nginx_conf | dirname }}"
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Set up the decoy site
+  include_tasks: decoy.yml
+
+- name: Render the nginx configuration
+  template:
+    src: nginx/freesocks-nginx.conf.j2
+    dest: "{{ remnawave_nginx_conf }}"
+    mode: '0644'
+    validate: "nginx -t -q -c %s"
+  become: yes
+  notify: reload nginx
+
+- name: Ensure the unit drop-in directory
+  file:
+    path: /etc/systemd/system/nginx.service.d
+    state: directory
+    mode: '0755'
+  become: yes
+
+# A change here restarts nginx (a reload cannot change the unit), which drops
+# open sessions: it changes only when the role's drop-in does.
+- name: Point the unit at the role's configuration and confine it
+  template:
+    src: nginx/nginx-service-override.conf.j2
+    dest: /etc/systemd/system/nginx.service.d/freesocks.conf
+    mode: '0644'
+  become: yes
+  register: _nginx_dropin
+
+- name: Restart nginx with the drop-in
+  systemd:
+    name: nginx
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+  become: yes
+  when: _nginx_dropin is changed
+
+- name: Ensure nginx is enabled and running
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes
+  become: yes
+
+- name: Flush handlers (apply the configuration now)
+  meta: flush_handlers
+
+- name: Wait for nginx to bind the listen port
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ nginx_listen_port }}"
+    timeout: 30
+    delay: 2
+
+- name: Check which process owns the listen port
+  shell: "ss -ltnHp 'sport = :{{ nginx_listen_port }}'"
+  register: nginx_port_owner
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Assert nginx (not Xray) owns the public TLS port
+  assert:
+    that:
+      - "'nginx' in nginx_port_owner.stdout"
+    fail_msg: >-
+      Port {{ nginx_listen_port }} is not owned by nginx
+      (listeners: {{ nginx_port_owner.stdout | trim | default('none') }}).
+      The panel's inbound for this node must listen on its loopback port
+      ({{ nginx_routes | map(attribute='port') | join(', ') }}), which FCP's
+      profile does; look at the profile in Admin -> Servers.
+  when: nginx_port_owner.stdout | default('') | length > 0
+
+# The module keeps no file named after the certificate the way Caddy does, so
+# readiness is what the port serves for the origin name: a certificate whose
+# names include it. The first order takes a few seconds after a start; FCP
+# checks the served certificate from outside either way.
+- name: Look at the certificate served for the origin hostname
+  shell: |
+    for _ in $(seq {{ remnawave_nginx_certificate_wait_tries | int }}); do
+      names="$(openssl s_client -connect 127.0.0.1:{{ nginx_listen_port }} \
+        -servername {{ origin_hostname | quote }} </dev/null 2>/dev/null \
+        | openssl x509 -noout -ext subjectAltName 2>/dev/null)"
+      case "$names" in *"DNS:{{ origin_hostname }}"*) echo "$names"; exit 0 ;; esac
+      sleep 5
+    done
+    exit 0
+  args:
+    executable: /bin/bash
+  register: _nginx_served_cert
+  changed_when: false
+  failed_when: false
+
+- name: Note certificate readiness
+  set_fact:
+    _front_cert_ready: "{{ ('DNS:' ~ origin_hostname) in (_nginx_served_cert.stdout | default('')) }}"

@@ -199,10 +199,32 @@ remnawave_docker_hub_ipv4_names:
   - registry-1.docker.io
   - auth.docker.io
 
+# --- Front server (front nodes) ---------------------------------------------------
+# Which server terminates TLS in front of a front node's loopback transport and
+# serves the decoy: `caddy` or `nginx` (from nginx.org, with its ACME module).
+# Switching a node stops the other one (its open sessions drop) and takes a
+# new certificate for the origin hostname. Caddy until nginx has run on a
+# canary node; then flip the default.
+remnawave_front_server: caddy
+
 # --- Caddy (front nodes) ---------------------------------------------------------
+# Where Caddy is not the front server (no ingress, or nginx in front): remove it
+# entirely (package, user, data and certificates, logs, configuration, its apt
+# repository). Off: stop and disable it only, keeping the package and its home.
+remnawave_caddy_purge: true
+# remnawave_caddy_email, _listen_port and _strip_request_headers apply to nginx
+# too (ACME registration, the port when FCP declared none, the headers removed).
 remnawave_caddy_email: ""
 remnawave_caddy_listen_port: 443
 remnawave_decoy_root: "/var/www/decoy"
+# The decoy (tasks/setup/decoy.yml). Empty: the front server's own stock page
+# from its package. A path on the controller: a decoy kit kept in private
+# inventory (its templates here, its `decoy_kit` filter in the playbook's
+# filter_plugins). Never ship a kit in this public repository.
+remnawave_decoy_kit: ""
+# Empty: nginx's /usr/share/nginx/html/index.html or Caddy's
+# /usr/share/caddy/index.html, by remnawave_front_server.
+remnawave_decoy_stock_page: ""
 # Members' addresses never reach Xray: Caddy removes these request headers
 # (`header_up -<name>`, WebSocket upgrades included) on every route before it
 # proxies to the loopback inbound. Every header an edge or a client may use to
@@ -229,3 +251,55 @@ remnawave_caddy_strip_request_headers:
   - CloudFront-Viewer-Address
   - X-Azure-ClientIP
   - X-Azure-SocketIP
+
+# --- nginx (front nodes, remnawave_front_server: nginx) --------------------------
+# The role's own configuration file; the package's /etc/nginx/nginx.conf is
+# left as shipped (an edited conffile holds unattended upgrades back).
+remnawave_nginx_conf: /etc/nginx/freesocks/nginx.conf
+# nginx.org's signing keys, as published on https://nginx.org/en/linux_packages.html.
+# Every primary key in the downloaded keyring must be one of these.
+remnawave_nginx_signing_key_fingerprints:
+  - 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+  - 8540A6F18833A80E9C1653A42FD21310B49F6B46
+  - 9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3
+remnawave_nginx_acme_directory: https://acme-v02.api.letsencrypt.org/directory
+# The ACME module's account key, certificates and keys (0700, the nginx user).
+remnawave_nginx_acme_state_dir: /var/lib/nginx-acme/freesocks
+# Empty: the nameservers in the host's /etc/resolv.conf.
+remnawave_nginx_resolvers: []
+# How many connections nginx can hold in all (each session holds two: the
+# edge's and the loopback one to Xray). Empty: 32 per MiB of the machine's RAM
+# (about 1M on 32 GiB, half a million sessions), so more RAM raises it on the
+# next run. Each worker (one per vCPU) gets its share plus a quarter, at least
+# 16384; nginx sets each slot up at start, about 0.5 KiB a slot.
+remnawave_nginx_max_connections: ""
+# Loopback addresses nginx connects to Xray from (127.0.0.1 .. 127.0.0.N): each
+# adds a full ephemeral port range of sessions per inbound.
+remnawave_nginx_loopback_sources: 64
+# The listen queue of each listener (the kernel caps it at net.core.somaxconn,
+# which remnawave_front_kernel_tuning raises to match).
+remnawave_nginx_backlog: 65535
+# How long a proxied stream may stay silent before nginx closes it. Sessions
+# through an edge often idle for minutes between packets.
+remnawave_nginx_stream_timeout: 1h
+# A reload or a package upgrade starts new workers; the old ones keep their
+# open sessions until they end or this passes.
+remnawave_nginx_worker_shutdown_timeout: 10m
+# Below crit, nginx writes the client's address into its error lines: raise it
+# only to debug, and lower it again.
+remnawave_nginx_error_log_level: crit
+# How many times (5 s apart) a run looks for the origin certificate being
+# served before it reports certificateReady false to FCP.
+remnawave_nginx_certificate_wait_tries: 12
+
+# --- Kernel limits (front nodes running nginx; tasks/setup/front_sysctl.yml) ----
+# One drop-in of the role's, remnawave_front_sysctl_file, that only ever RAISES:
+# a larger value the machine already has is kept. The listen and device
+# backlogs, TIME_WAIT and orphan sockets, the kernel's TCP memory (a share of
+# RAM, so more RAM raises it) and the connection-tracking table.
+remnawave_front_kernel_tuning: true
+remnawave_front_sysctl_file: /etc/sysctl.d/61-freesocks-front.conf
+# Shares of RAM for net.ipv4.tcp_mem (low, pressure, high), in percent.
+remnawave_front_tcp_mem_percent: [12.5, 18.75, 25]
+# Connection-tracking entries per MiB of RAM (about 2M on 32 GiB).
+remnawave_front_conntrack_per_mb: 64

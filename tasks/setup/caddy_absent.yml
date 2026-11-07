@@ -1,14 +1,20 @@
 ---
-# tasks/setup/caddy_absent.yml - this node's mode wants no ingress.
+# tasks/setup/caddy_absent.yml - this node runs no Caddy: its mode wants no
+# ingress, or remnawave_front_server is nginx.
 #
-# FCP declared no ingress, so nothing belongs in front of the node: its own
-# transport (REALITY, XHTTP under REALITY) binds the public TLS port itself.
-# A machine that ran a mode with an ingress before still has Caddy installed,
-# enabled and holding that port, and the node would fail to bind it while the
-# role still reported the revision as applied. Stop it, disable it and remove
-# its configuration; the package is left installed, and with it Caddy's home
-# (/var/lib/caddy: the ACME account, certificates). A later mode with an
-# ingress makes any of Caddy's directories that went missing (caddy.yml).
+# With no ingress nothing belongs in front of the node: its own transport
+# (REALITY, XHTTP under REALITY) binds the public TLS port itself; with nginx
+# in front, nginx binds it. A machine that ran Caddy before still has it
+# installed, enabled and holding that port, and the node (or nginx) would fail
+# to bind it while the role still reported the revision as applied. Stop it,
+# disable it and remove its configuration.
+#
+# With remnawave_caddy_purge (the default) Caddy is then removed entirely: the
+# package purged (its postrm removes the caddy user, /var/lib/caddy with the
+# ACME account and certificates, /var/log/caddy and /etc/caddy), and its apt
+# repository and signing key. A later run with Caddy in front installs it
+# afresh and takes a new certificate. Off: the package and Caddy's home stay,
+# and caddy.yml makes any of its directories that went missing.
 
 - name: Look for an installed Caddy
   stat:
@@ -47,6 +53,33 @@
           - _caddy_listeners.stdout | trim | length == 0
         fail_msg: >-
           Caddy still holds a listener after being stopped
-          ({{ _caddy_listeners.stdout | trim }}). This node's mode has no ingress:
-          its own transport needs the public TLS port.
+          ({{ _caddy_listeners.stdout | trim }}). The public ports belong to this
+          node's own transport or to nginx.
         success_msg: "no Caddy in front of this node."
+
+    - name: Purge the Caddy package (its user, data, logs and configuration)
+      apt:
+        name: caddy
+        state: absent
+        purge: yes
+      when: remnawave_caddy_purge | bool
+
+    - name: Remove what the purge may leave
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/caddy
+        - /var/log/caddy
+        - /etc/caddy
+      when: remnawave_caddy_purge | bool
+
+- name: Remove Caddy's apt repository and signing key
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/caddy-stable.list
+    - /etc/apt/keyrings/caddy-stable-archive-keyring.asc
+  become: yes
+  when: remnawave_caddy_purge | bool

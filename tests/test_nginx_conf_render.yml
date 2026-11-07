@@ -1,0 +1,185 @@
+---
+# tests/test_nginx_conf_render.yml
+#
+# Render test for templates/nginx/freesocks-nginx.conf.j2 from a bootstrap
+# answer, the nginx twin of test_caddyfile_render.yml:
+#   (a) the origin site is the default server (a foreign SNI and Host get the
+#       origin certificate), with the ACME module's certificate for the origin
+#       name, HTTP-01 on port 80 and everything else there redirected;
+#   (b) each HTTP/1.1 route proxies the path and what lies under it to its
+#       loopback port with the upgrade headers, from a spread of loopback
+#       source addresses; an h2c route is gRPC (and only then is HTTP/2 on);
+#   (c) every route clears each client-address header of the role's default
+#       list and nothing adds one; no access log; the error log at crit;
+#   (d) the decoy is the fallback; a kit's own 404.html only when it has one.
+# Runs `nginx -t` on the render when nginx and its ACME module are installed
+# and sudo needs no password (CI).
+#
+# Run: ansible-playbook tests/test_nginx_conf_render.yml
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    remnawave_caddy_email: "admin@example.com"
+    remnawave_decoy_root: "/var/www/decoy"
+    origin_hostname: "bright-harbor-lane.origin.example"
+    nginx_listen_port: 443
+    nginx_ipv6: true
+    nginx_resolvers: ["127.0.0.53", "[2001:db8::53]"]
+    nginx_worker_connections: 40098
+    nginx_worker_rlimit_nofile: 44194
+    nginx_backlog: 65535
+    nginx_routes:
+      - { path: "/ws", port: 8443 }
+      - { path: "/xh", port: 8445 }
+      - { path: "/svc", port: 8446, upstream: "h2c" }
+    _defaults: "{{ lookup('file', playbook_dir ~ '/../defaults/main.yml') | from_yaml }}"
+    remnawave_caddy_strip_request_headers: "{{ _defaults.remnawave_caddy_strip_request_headers }}"
+    remnawave_nginx_acme_directory: "{{ _defaults.remnawave_nginx_acme_directory }}"
+    remnawave_nginx_acme_state_dir: "{{ _defaults.remnawave_nginx_acme_state_dir }}"
+    remnawave_nginx_stream_timeout: "{{ _defaults.remnawave_nginx_stream_timeout }}"
+    remnawave_nginx_worker_shutdown_timeout: "{{ _defaults.remnawave_nginx_worker_shutdown_timeout }}"
+    remnawave_nginx_error_log_level: "{{ _defaults.remnawave_nginx_error_log_level }}"
+    remnawave_nginx_loopback_sources: "{{ _defaults.remnawave_nginx_loopback_sources }}"
+    _rendered: "{{ playbook_dir }}/.nginx.rendered.conf"
+    _http_routes: 2
+    _grpc_routes: 1
+  tasks:
+    - block:
+        - name: Render the nginx configuration
+          template:
+            src: "{{ playbook_dir }}/../templates/nginx/freesocks-nginx.conf.j2"
+            dest: "{{ _rendered }}"
+          changed_when: false
+
+        - name: Read it
+          set_fact:
+            _conf: "{{ lookup('file', _rendered) }}"
+
+        # (a)
+        - name: Assert the origin site, its certificate and port 80
+          assert:
+            that:
+              - "'load_module modules/ngx_http_acme_module.so;' in _conf"
+              - "'listen 443 ssl default_server reuseport backlog=65535;' in _conf"
+              - "'listen [::]:443 ssl default_server reuseport backlog=65535;' in _conf"
+              - "'server_name bright-harbor-lane.origin.example;' in _conf"
+              - "'acme_certificate freesocks bright-harbor-lane.origin.example key=ecdsa:256;' in _conf"
+              - "'ssl_certificate $acme_certificate;' in _conf"
+              - "'ssl_certificate_key $acme_certificate_key;' in _conf"
+              - "'challenge http-01;' in _conf"
+              - "'contact admin@example.com;' in _conf"
+              - "'accept_terms_of_service;' in _conf"
+              - "'listen 80 default_server backlog=65535;' in _conf"
+              - "'return 301 https://$host$request_uri;' in _conf"
+              - "'resolver 127.0.0.53 [2001:db8::53] valid=300s;' in _conf"
+              - "'worker_connections 40098;' in _conf"
+              - "'worker_rlimit_nofile 44194;' in _conf"
+              - "'pid /run/nginx.pid;' in _conf"
+            success_msg: "nginx: origin site as default server, ACME certificate, HTTP-01."
+
+        # (b)
+        - name: Assert the routes
+          assert:
+            that:
+              - "'location = /ws {' in _conf"
+              - "'location ^~ /ws/ {' in _conf"
+              - "'location = /xh {' in _conf"
+              - "'location ^~ /xh/ {' in _conf"
+              - _conf.count('proxy_pass http://127.0.0.1:8443;') == 2
+              - _conf.count('proxy_pass http://127.0.0.1:8445;') == 2
+              - _conf.count('proxy_set_header Upgrade $http_upgrade;') == _http_routes * 2
+              - _conf.count('proxy_set_header Connection $connection_upgrade;') == _http_routes * 2
+              - _conf.count('proxy_bind $freesocks_loopback_src;') == _http_routes * 2
+              - "'location ^~ /svc/ {' in _conf"
+              - "'grpc_pass grpc://127.0.0.1:8446;' in _conf"
+              - "'grpc_bind $freesocks_loopback_src;' in _conf"
+              - "'location = /svc {' not in _conf"
+              - "'http2 on;' in _conf"
+              - _conf | regex_findall('[0-9]% 127\.0\.0\.[0-9]+;') | length == (remnawave_nginx_loopback_sources | int) - 1
+              - "'* 127.0.0.' ~ remnawave_nginx_loopback_sources ~ ';' in _conf"
+            success_msg: "nginx: path + subpaths per route, gRPC for h2c, {{ remnawave_nginx_loopback_sources }} loopback sources."
+
+        # (c)
+        - name: Assert members' addresses are removed on every route and nothing adds one
+          assert:
+            that:
+              - _conf | regex_findall('proxy_set_header \S+ "";') | length == (remnawave_caddy_strip_request_headers | length) * _http_routes * 2
+              - _conf | regex_findall('grpc_set_header \S+ "";') | length == (remnawave_caddy_strip_request_headers | length) * _grpc_routes
+              - "'proxy_set_header X-Forwarded-For \"\";' in _conf"
+              - "'$proxy_add_x_forwarded_for' not in _conf"
+              - "'$remote_addr;' not in _conf"
+              - "'real_ip' not in _conf"
+              - "'access_log off;' in _conf"
+              - "'error_log /var/log/nginx/error.log crit;' in _conf"
+              - "'server_tokens off;' in _conf"
+            success_msg: "nginx: {{ remnawave_caddy_strip_request_headers | length }} client-address headers cleared per route, no access log."
+
+        # (d)
+        - name: Assert the decoy fallback
+          assert:
+            that:
+              - "'root /var/www/decoy;' in _conf"
+              - "'try_files $uri $uri/ =404;' in _conf"
+              - "'error_page 404 /404.html;' not in _conf"
+
+        - name: Render for a kit with its own not-found page
+          template:
+            src: "{{ playbook_dir }}/../templates/nginx/freesocks-nginx.conf.j2"
+            dest: "{{ _rendered }}"
+          vars:
+            _decoy_has_404: true
+          changed_when: false
+
+        - name: Assert the kit's not-found page is used
+          vars:
+            _conf404: "{{ lookup('file', _rendered) }}"
+          assert:
+            that:
+              - "'error_page 404 /404.html;' in _conf404"
+              - "'location = /404.html {' in _conf404"
+
+        - name: Render with HTTP/1.1 routes only, IPv4 only, another port
+          template:
+            src: "{{ playbook_dir }}/../templates/nginx/freesocks-nginx.conf.j2"
+            dest: "{{ _rendered }}"
+          vars:
+            nginx_routes: [{ path: "/ws", port: 8443 }]
+            nginx_ipv6: false
+            nginx_listen_port: 8444
+            nginx_resolvers: ["127.0.0.53"]
+          changed_when: false
+
+        - name: Assert no HTTP/2, no IPv6 listeners, the port in the redirect
+          vars:
+            _conf2: "{{ lookup('file', _rendered) }}"
+          assert:
+            that:
+              - "'http2 on;' not in _conf2"
+              - "'listen [::]' not in _conf2"
+              - "'listen 8444 ssl default_server' in _conf2"
+              - "'return 301 https://$host:8444$request_uri;' in _conf2"
+              - "'resolver 127.0.0.53 valid=300s ipv6=off;' in _conf2"
+
+        - name: Is nginx with its ACME module available (and sudo without a password)
+          shell: "command -v nginx && test -f /etc/nginx/modules/ngx_http_acme_module.so && sudo -n true"
+          register: _which
+          changed_when: false
+          failed_when: false
+
+        - name: Render the first configuration again for nginx -t
+          template:
+            src: "{{ playbook_dir }}/../templates/nginx/freesocks-nginx.conf.j2"
+            dest: "{{ _rendered }}"
+          changed_when: false
+          when: _which.rc == 0
+
+        - name: Validate with nginx -t
+          command: sudo -n nginx -t -c {{ _rendered }}
+          changed_when: false
+          when: _which.rc == 0
+      always:
+        - name: Clean up
+          file:
+            path: "{{ _rendered }}"
+            state: absent
