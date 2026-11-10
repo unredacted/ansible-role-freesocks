@@ -8,7 +8,7 @@
 #            resolve addresses -> enroll / report observations (PUT) ->
 #            fetch the machine configuration + node secret (POST bootstrap) ->
 #            let in the ports FCP lists (the role's own firewall rules, TCP
-#            and UDP) -> kernel settings (QUIC buffers, optional BBR) ->
+#            and UDP) -> kernel settings (QUIC buffers, BBR) ->
 #            [ingress] wait for the origin name to resolve, the front server
 #            (Caddy or nginx, remnawave_front_server) + decoy, the other one
 #            out of the way,

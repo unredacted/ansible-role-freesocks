@@ -9,18 +9,28 @@
 #                      default and drops datagrams under load without them.
 #                      Raise only: a larger limit the machine already has is
 #                      kept as it is.
-#   node_tcp_bbr       (default off) BBR congestion control with the fq qdisc.
-#                      fq applies to an interface's qdisc when it is created,
-#                      so an interface that is up keeps its own until a reboot
-#                      (BBR paces by itself meanwhile).
+#   node_tcp_bbr       (default on) BBR congestion control with the fq qdisc:
+#                      net.ipv4.tcp_congestion_control = bbr and
+#                      net.core.default_qdisc = fq, tcp_bbr loaded now and at
+#                      boot. A kernel that offers no BBR stops the run.
+#                      The node container and the front server share the
+#                      host's network, so the host's setting is theirs.
+#                      default_qdisc only reaches a qdisc when it is made, so
+#                      the interfaces of the default routes are given fq at
+#                      once (filter_plugins/node_qdisc.py); one that carries a
+#                      qdisc the role does not know is left alone.
+#                      What the kernel ran before is written down first
+#                      (node_sysctl_previous_file) and put back, on the
+#                      kernel and on those interfaces, when this is turned off.
 #
 # Nothing else in /etc/sysctl.d is touched. With both off the drop-in is
-# removed; the kernel keeps what it was set to until the next boot.
+# removed; the buffer limits stay as they are until the next boot.
 
 - name: Set the role's sysctl paths
   set_fact:
     _sysctl_file: "{{ node_sysctl_file }}"
     _sysctl_modules_file: "{{ node_sysctl_modules_file }}"
+    _sysctl_previous_file: "{{ node_sysctl_previous_file }}"
 
 - name: Validate the buffer size
   assert:
@@ -86,7 +96,7 @@
     msg: >-
       node_tcp_bbr is on but this kernel offers no BBR
       (available: {{ (_sysctl_cc.stdout | default('') | trim) or 'unknown' }}).
-      Turn node_tcp_bbr off, or run a kernel with tcp_bbr.
+      Set node_tcp_bbr: false for this machine, or run a kernel with tcp_bbr.
   when:
     - node_tcp_bbr | bool
     - not (_sysctl_bbr | bool)
@@ -95,6 +105,96 @@
   copy:
     content: "# Managed by ansible-role-freesocks (node_tcp_bbr).\ntcp_bbr\n"
     dest: "{{ _sysctl_modules_file }}"
+    mode: '0644'
+  become: "{{ _fcp_become | default(true) }}"
+  when: _sysctl_bbr | bool
+
+# What the kernel ran before BBR: the role's record when there is one (BBR is
+# or was on), otherwise what the kernel runs now. Written before anything is
+# changed, so a run that stops half way still knows what to put back.
+- name: Read the role's record of what the kernel ran before BBR
+  command: cat {{ _sysctl_previous_file }}
+  register: _sysctl_prev_read
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Read the record
+  set_fact:
+    _sysctl_prev: >-
+      {{ dict((_sysctl_prev_read.stdout | default(''))
+              | regex_findall('(?m)^(net[.][a-z0-9_.]+) = ([a-z0-9_]+) *$'))
+         if _sysctl_prev_read.rc == 0 else {} }}
+    _sysctl_prev_devs: >-
+      {{ (_sysctl_prev_read.stdout | default('')) | regex_findall('(?m)^# qdisc: ([^ ]+) *$')
+         if _sysctl_prev_read.rc == 0 else [] }}
+
+- name: Read the kernel's congestion control and qdisc
+  command: sysctl -n net.core.default_qdisc net.ipv4.tcp_congestion_control
+  register: _sysctl_cc_now
+  changed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - _sysctl_bbr | bool
+    - _sysctl_prev | length != 2
+
+- name: Note what the kernel ran before BBR
+  set_fact:
+    _sysctl_prev:
+      net.core.default_qdisc: "{{ _sysctl_cc_now.stdout_lines[0] | trim }}"
+      net.ipv4.tcp_congestion_control: "{{ _sysctl_cc_now.stdout_lines[1] | trim }}"
+  when:
+    - _sysctl_bbr | bool
+    - _sysctl_prev | length != 2
+
+- name: Find the interfaces of the default routes
+  command: ip -o {{ item }} route show default
+  loop: ['-4', '-6']
+  register: _sysctl_routes
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+  when: _sysctl_bbr | bool
+
+# BBR on: the default routes' interfaces. BBR off: the ones the role gave fq.
+- name: Note the interfaces to look at
+  set_fact:
+    _sysctl_devs: >-
+      {{ (_sysctl_routes.results | map(attribute='stdout', default='') | join(' ')
+          | regex_findall(' dev ([^ ]+)') | unique | sort)
+         if (_sysctl_bbr | bool)
+         else (_sysctl_prev_devs if (_sysctl_prev | length == 2) else []) }}
+
+- name: Read their qdiscs
+  command: tc -j qdisc show dev {{ item }}
+  loop: "{{ _sysctl_devs }}"
+  register: _sysctl_qdiscs
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Work out which interfaces change qdisc
+  set_fact:
+    _sysctl_qdisc_plan: >-
+      {{ (_sysctl_qdiscs.results
+          | node_qdisc_plan('fq', ['pfifo_fast', 'fq_codel', 'pfifo', _sysctl_prev['net.core.default_qdisc']]))
+         if (_sysctl_bbr | bool)
+         else ((_sysctl_qdiscs.results | node_qdisc_plan(_sysctl_prev['net.core.default_qdisc'], ['fq']))
+               if (_sysctl_prev | length == 2) else {'run': [], 'kept': []}) }}
+
+- name: Write down what the kernel ran before BBR
+  copy:
+    content: |
+      # Managed by ansible-role-freesocks (node_tcp_bbr): what the kernel ran
+      # before BBR and the interfaces the role gave fq. Put back when
+      # node_tcp_bbr is turned off. Not read by sysctl at boot.
+      {% for k, v in _sysctl_prev | dictsort %}
+      {{ k }} = {{ v }}
+      {% endfor %}
+      {% for d in (_sysctl_prev_devs + (_sysctl_qdisc_plan.run | map(attribute='dev') | list)) | unique | sort %}
+      # qdisc: {{ d }}
+      {% endfor %}
+    dest: "{{ _sysctl_previous_file }}"
     mode: '0644'
   become: "{{ _fcp_become | default(true) }}"
   when: _sysctl_bbr | bool
@@ -140,9 +240,46 @@
       or (_sysctl_now.stdout_lines | default([]) | map('trim') | list)
          != (_sysctl_settings | dictsort | map('last') | map('string') | list)
 
+# BBR turned off: the kernel gets back what the record says it ran before
+# (default_qdisc first, so an interface handed back to the kernel takes it).
+- name: Put back what the kernel ran before BBR
+  command: sysctl -p {{ _sysctl_previous_file }}
+  register: _sysctl_restored
+  become: "{{ _fcp_become | default(true) }}"
+  when:
+    - not (node_tcp_bbr | bool)
+    - _sysctl_prev | length == 2
+
+# After the kernel's default is set either way: fq with BBR on, the earlier
+# default with BBR off. Queued packets on the interface are dropped once.
+- name: Change the qdisc of the interfaces that are up
+  command:
+    argv: "{{ ['tc'] + item.argv }}"
+  loop: "{{ _sysctl_qdisc_plan.run }}"
+  loop_control:
+    label: "{{ item.dev }}"
+  register: _sysctl_qdisc_changed
+  become: "{{ _fcp_become | default(true) }}"
+
+- name: Forget the record (BBR is off and the earlier values are back)
+  file:
+    path: "{{ _sysctl_previous_file }}"
+    state: absent
+  become: "{{ _fcp_become | default(true) }}"
+  when: not (node_tcp_bbr | bool)
+
 - name: Say what the kernel runs with
   debug:
     msg: >-
       Kernel settings for {{ node_name }}:
       {{ _sysctl_settings | dictsort | map('join', ' = ') | join(', ') if _sysctl_settings else 'none of the role' }}.
-  when: (_sysctl_written is changed) or (_sysctl_applied is changed)
+      {% if _sysctl_restored is changed %}BBR off, put back:
+      {{ _sysctl_prev | dictsort | map('join', ' = ') | join(', ') }}.{% endif %}
+      {% if _sysctl_qdisc_plan.run %}qdisc changed on:
+      {{ _sysctl_qdisc_plan.run | map(attribute='dev') | join(', ') }}.{% endif %}
+      {% if _sysctl_qdisc_plan.kept %}qdisc left as it is on:
+      {{ _sysctl_qdisc_plan.kept | join(', ') }}.{% endif %}
+  when: >-
+    (_sysctl_written is changed) or (_sysctl_applied is changed)
+    or (_sysctl_restored is changed) or (_sysctl_qdisc_plan.run | length > 0)
+    or (_sysctl_qdisc_plan.kept | length > 0)
