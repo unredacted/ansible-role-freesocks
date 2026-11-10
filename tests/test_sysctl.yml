@@ -13,6 +13,8 @@
 #       somebody's shaping alone; (e2) a second run changes nothing;
 #   (g) BBR off puts the earlier values and qdiscs back and forgets the
 #       record; (g2) and does nothing more on the next run;
+#   (j) a machine an earlier release gave BBR has no earlier values: none
+#       are invented, and off leaves the kernel to its next boot;
 #   (h) a kernel without BBR stops the run and leaves no boot file asking for
 #       it; (i) with both off the drop-in is removed.
 # (a)-(d) run with BBR off, to look at the buffers alone.
@@ -40,10 +42,11 @@
       calls: []
     # eth0: multiqueue, the IPv4 default route. eth1: one queue, the IPv6
     # default route. tun0: a second IPv4 default route with shaping on it.
+    # eth2 and eth9: two more IPv6 default routes (see below).
     _kernel_links:
       routes:
         "-4": "default via 192.0.2.1 dev eth0 proto dhcp \\ default via 198.51.100.1 dev tun0 metric 50"
-        "-6": "default via fe80::1 dev eth1 proto ra metric 100 pref medium"
+        "-6": "default via fe80::1 dev eth1 proto ra metric 100 pref medium \\ default via fe80::2 dev eth2 metric 200 \\ default dev eth9 metric 300"
       qdiscs:
         eth0:
           - {kind: mq, handle: "0:", root: true}
@@ -51,6 +54,9 @@
           - {kind: fq_codel, handle: "0:", parent: ":2"}
         eth1:
           - {kind: fq_codel, handle: "0:", root: true}
+        # eth2: a kernel-default kind, but attached by hand. eth9: tc cannot read it.
+        eth2:
+          - {kind: fq_codel, handle: "8002:", root: true}
         tun0:
           - {kind: htb, handle: "1:", root: true}
   environment:
@@ -245,8 +251,10 @@
               - "['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'mq'] in _k['calls']"
               - "['tc', 'qdisc', 'replace', 'dev', 'eth1', 'root', 'fq'] in _k['calls']"
               - _k['calls'].index(['sysctl', '-p', node_sysctl_file]) < _k['calls'].index(['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'mq'])
-              - _sysctl_qdisc_plan.kept == ['tun0 (htb)']
-            success_msg: "BBR and fq at once; shaping left alone."
+              - _k['qdiscs']['eth2'] == _kernel_links.qdiscs.eth2
+              - "'eth2' not in lookup('file', node_sysctl_previous_file)"
+              - _sysctl_qdisc_plan.kept == ['eth2 (fq_codel, set by hand)', 'eth9 (not read)', 'tun0 (htb)']
+            success_msg: "BBR and fq at once; shaping, a qdisc set by hand and an unread interface left alone and named."
 
         - name: (e2) forget the calls so far
           copy:
@@ -310,6 +318,44 @@
               - (lookup('file', _state_file) | from_json)['calls'] | select('contains', 'tc') | list | length == 0
               - (lookup('file', _state_file) | from_json)['calls'] | select('contains', '-p') | list | length == 0
             success_msg: "idempotent with BBR off."
+
+        - name: (j) a machine an earlier release gave BBR (drop-in, no record)
+          copy:
+            dest: "{{ _state_file }}"
+            content: >-
+              {{ _kernel_default | combine(_kernel_links)
+                 | combine({'values': {'net.core.default_qdisc': 'fq', 'net.ipv4.tcp_congestion_control': 'bbr',
+                                       'net.ipv4.tcp_available_congestion_control': 'reno cubic bbr'}}, recursive=true)
+                 | to_nice_json }}
+        - name: (j) its drop-in
+          copy:
+            dest: "{{ node_sysctl_file }}"
+            content: "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n"
+        - name: (j) BBR on with this release, twice
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+          vars:
+            node_tcp_bbr: true
+          loop: [1, 2]
+        - name: (j) the role's own BBR is not written down as what came before
+          assert:
+            that:
+              - "'net.' not in lookup('file', node_sysctl_previous_file)"
+              - "'# qdisc: eth0' in lookup('file', node_sysctl_previous_file)"
+            success_msg: "no earlier values invented."
+        - name: (j) BBR off
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (j) nothing put back, the record forgotten, the drop-in without BBR
+          assert:
+            that:
+              - _sysctl_restored is skipped
+              - (lookup('file', _state_file) | from_json)['values']['net.ipv4.tcp_congestion_control'] == 'bbr'
+              - not (node_sysctl_previous_file is exists)
+              - "'tcp_congestion_control' not in lookup('file', node_sysctl_file)"
+            success_msg: "off without a record: left to the next boot, and said so."
 
         - name: (h) a kernel without BBR
           block:

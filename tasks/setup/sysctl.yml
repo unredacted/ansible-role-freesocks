@@ -18,10 +18,14 @@
 #                      default_qdisc only reaches a qdisc when it is made, so
 #                      the interfaces of the default routes are given fq at
 #                      once (filter_plugins/node_qdisc.py); one that carries a
-#                      qdisc the role does not know is left alone.
+#                      qdisc the role does not know, or one set by hand,
+#                      is left alone and named.
 #                      What the kernel ran before is written down first
 #                      (node_sysctl_previous_file) and put back, on the
 #                      kernel and on those interfaces, when this is turned off.
+#                      A machine an earlier release already gave BBR has no
+#                      such record: nothing is put back there, and the kernel
+#                      takes its own defaults at the next boot.
 #
 # Nothing else in /etc/sysctl.d is touched. With both off the drop-in is
 # removed; the buffer limits stay as they are until the next boot.
@@ -112,6 +116,16 @@
 # What the kernel ran before BBR: the role's record when there is one (BBR is
 # or was on), otherwise what the kernel runs now. Written before anything is
 # changed, so a run that stops half way still knows what to put back.
+# The record always comes before the drop-in, so a drop-in that asks for BBR
+# with no record beside it is an earlier release's: what the kernel runs now
+# is then the role's own BBR, not what came before, and is not written down.
+- name: Read the role's drop-in as the last run left it
+  command: cat {{ _sysctl_file }}
+  register: _sysctl_dropin_read
+  changed_when: false
+  failed_when: false
+  become: "{{ _fcp_become | default(true) }}"
+
 - name: Read the role's record of what the kernel ran before BBR
   command: cat {{ _sysctl_previous_file }}
   register: _sysctl_prev_read
@@ -128,6 +142,10 @@
     _sysctl_prev_devs: >-
       {{ (_sysctl_prev_read.stdout | default('')) | regex_findall('(?m)^# qdisc: ([^ ]+) *$')
          if _sysctl_prev_read.rc == 0 else [] }}
+    _sysctl_prev_unknown: >-
+      {{ (_sysctl_prev_read.rc != 0)
+         and (_sysctl_dropin_read.rc == 0)
+         and ('net.ipv4.tcp_congestion_control = bbr' in _sysctl_dropin_read.stdout) }}
 
 - name: Read the kernel's congestion control and qdisc
   command: sysctl -n net.core.default_qdisc net.ipv4.tcp_congestion_control
@@ -136,7 +154,8 @@
   become: "{{ _fcp_become | default(true) }}"
   when:
     - _sysctl_bbr | bool
-    - _sysctl_prev | length != 2
+    - _sysctl_prev_read.rc != 0
+    - not (_sysctl_prev_unknown | bool)
 
 - name: Note what the kernel ran before BBR
   set_fact:
@@ -145,7 +164,8 @@
       net.ipv4.tcp_congestion_control: "{{ _sysctl_cc_now.stdout_lines[1] | trim }}"
   when:
     - _sysctl_bbr | bool
-    - _sysctl_prev | length != 2
+    - _sysctl_prev_read.rc != 0
+    - not (_sysctl_prev_unknown | bool)
 
 - name: Find the interfaces of the default routes
   command: ip -o {{ item }} route show default
@@ -177,9 +197,10 @@
   set_fact:
     _sysctl_qdisc_plan: >-
       {{ (_sysctl_qdiscs.results
-          | node_qdisc_plan('fq', ['pfifo_fast', 'fq_codel', 'pfifo', _sysctl_prev['net.core.default_qdisc']]))
+          | node_qdisc_plan('fq', ['pfifo_fast', 'fq_codel', 'pfifo']
+                                  + ([_sysctl_prev['net.core.default_qdisc']] if (_sysctl_prev | length == 2) else [])))
          if (_sysctl_bbr | bool)
-         else ((_sysctl_qdiscs.results | node_qdisc_plan(_sysctl_prev['net.core.default_qdisc'], ['fq']))
+         else ((_sysctl_qdiscs.results | node_qdisc_plan(_sysctl_prev['net.core.default_qdisc'], ['fq'], mine=true))
                if (_sysctl_prev | length == 2) else {'run': [], 'kept': []}) }}
 
 - name: Write down what the kernel ran before BBR
@@ -275,11 +296,18 @@
       {{ _sysctl_settings | dictsort | map('join', ' = ') | join(', ') if _sysctl_settings else 'none of the role' }}.
       {% if _sysctl_restored is changed %}BBR off, put back:
       {{ _sysctl_prev | dictsort | map('join', ' = ') | join(', ') }}.{% endif %}
+      {% if _sysctl_off_unknown | bool %}BBR is off, but what the kernel ran
+      before it was never written down (an earlier release turned it on): the
+      kernel keeps bbr and fq until the next boot.{% endif %}
       {% if _sysctl_qdisc_plan.run %}qdisc changed on:
       {{ _sysctl_qdisc_plan.run | map(attribute='dev') | join(', ') }}.{% endif %}
       {% if _sysctl_qdisc_plan.kept %}qdisc left as it is on:
       {{ _sysctl_qdisc_plan.kept | join(', ') }}.{% endif %}
+  vars:
+    _sysctl_off_unknown: >-
+      {{ (not (node_tcp_bbr | bool))
+         and ((_sysctl_prev_unknown | bool) or (_sysctl_prev_read.rc == 0 and (_sysctl_prev | length != 2))) }}
   when: >-
-    (_sysctl_written is changed) or (_sysctl_applied is changed)
+    (_sysctl_written is changed) or (_sysctl_applied is changed) or (_sysctl_off_unknown | bool)
     or (_sysctl_restored is changed) or (_sysctl_qdisc_plan.run | length > 0)
     or (_sysctl_qdisc_plan.kept | length > 0)
