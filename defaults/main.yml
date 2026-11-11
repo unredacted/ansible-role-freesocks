@@ -138,8 +138,8 @@ node_origin_hostname: ""
 
 # --- kernel settings (tasks/setup/sysctl.yml) -----------------------------------
 # One drop-in of the role's, applied at once and at boot; nothing else in
-# /etc/sysctl.d is touched. With both off the drop-in is removed (the kernel
-# keeps what it was set to until the next boot).
+# /etc/sysctl.d is touched. With both off the drop-in is removed (the buffer
+# limits stay as they are until the next boot).
 #
 # Raise net.core.rmem_max and wmem_max to node_quic_buffer_bytes (16 MiB,
 # quic-go's recommendation): a QUIC transport (Hysteria 2 on UDP) wants larger
@@ -147,13 +147,22 @@ node_origin_hostname: ""
 # without them. Raise only: a larger limit the machine already has is kept.
 node_quic_buffers: true
 node_quic_buffer_bytes: 16777216
-# BBR congestion control with the fq qdisc (TCP only; off by default). The run
-# stops if the kernel offers no BBR. fq takes over an interface's qdisc when
-# the interface comes up, so an interface already up keeps its own until a
-# reboot.
-node_tcp_bbr: false
+# BBR congestion control with the fq qdisc, for every TCP transport (on by
+# default): net.ipv4.tcp_congestion_control = bbr and net.core.default_qdisc =
+# fq, tcp_bbr loaded now and at boot. The node container and the front server
+# use the host's network, so the host's setting is theirs. The run stops if
+# the kernel offers no BBR: set this to false there.
+# The interfaces of the default routes get fq at once (a qdisc is only made
+# from default_qdisc when an interface comes up); one that carries a qdisc the
+# role does not know is left alone. Queued packets are dropped once.
+# Turning it off puts back what the kernel ran before the role first turned it
+# on (the distribution's default, read from the kernel and kept in
+# node_sysctl_previous_file), on the kernel and on those interfaces.
+node_tcp_bbr: true
 node_sysctl_file: "/etc/sysctl.d/60-freesocks-node.conf"
 node_sysctl_modules_file: "/etc/modules-load.d/freesocks-node.conf"
+# Not a .conf: sysctl does not load it at boot.
+node_sysctl_previous_file: "/etc/sysctl.d/60-freesocks-node.previous"
 
 # --- the remnanode container ------------------------------------------------
 remnawave_node_image: "remnawave/node:3.4.2"

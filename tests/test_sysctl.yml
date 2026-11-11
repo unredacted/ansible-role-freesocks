@@ -7,8 +7,17 @@
 #       and applies it at once; (b) a second run changes nothing; (c) a run
 #       that wrote the file but never applied it applies on the next run;
 #   (d) a larger limit the machine already has is kept (raise only);
-#   (e) BBR (opt-in) adds fq + bbr and loads tcp_bbr at boot; (f) a kernel
-#       without BBR stops the run and leaves no boot file asking for it; (g) with both off the drop-in is removed.
+#   (e) BBR (the default) adds fq + bbr, loads tcp_bbr at boot, writes down
+#       what the kernel ran before and gives fq to the default routes'
+#       interfaces at once (a multiqueue one through mq), leaving one with
+#       somebody's shaping alone; (e2) a second run changes nothing;
+#   (g) BBR off puts the earlier values and qdiscs back and forgets the
+#       record; (g2) and does nothing more on the next run;
+#   (j) a machine an earlier release gave BBR has no earlier values: none
+#       are invented, and off leaves the kernel to its next boot;
+#   (h) a kernel without BBR stops the run and leaves no boot file asking for
+#       it; (i) with both off the drop-in is removed.
+# (a)-(d) run with BBR off, to look at the buffers alone.
 #
 # Run: ansible-playbook tests/test_sysctl.yml
 - hosts: localhost
@@ -21,6 +30,8 @@
     node_name: "quiet-falcon-nest"
     node_sysctl_file: "{{ playbook_dir }}/.sysctl/sysctl.d/60-freesocks-node.conf"
     node_sysctl_modules_file: "{{ playbook_dir }}/.sysctl/modules-load.d/freesocks-node.conf"
+    node_sysctl_previous_file: "{{ playbook_dir }}/.sysctl/sysctl.d/60-freesocks-node.previous"
+    node_tcp_bbr: false
     _kernel_default:
       values:
         net.core.rmem_max: "212992"
@@ -29,6 +40,25 @@
         net.ipv4.tcp_congestion_control: cubic
         net.ipv4.tcp_available_congestion_control: "reno cubic"
       calls: []
+    # eth0: multiqueue, the IPv4 default route. eth1: one queue, the IPv6
+    # default route. tun0: a second IPv4 default route with shaping on it.
+    # eth2 and eth9: two more IPv6 default routes (see below).
+    _kernel_links:
+      routes:
+        "-4": "default via 192.0.2.1 dev eth0 proto dhcp \\ default via 198.51.100.1 dev tun0 metric 50"
+        "-6": "default via fe80::1 dev eth1 proto ra metric 100 pref medium \\ default via fe80::2 dev eth2 metric 200 \\ default dev eth9 metric 300"
+      qdiscs:
+        eth0:
+          - {kind: mq, handle: "0:", root: true}
+          - {kind: fq_codel, handle: "0:", parent: ":1"}
+          - {kind: fq_codel, handle: "0:", parent: ":2"}
+        eth1:
+          - {kind: fq_codel, handle: "0:", root: true}
+        # eth2: a kernel-default kind, but attached by hand. eth9: tc cannot read it.
+        eth2:
+          - {kind: fq_codel, handle: "8002:", root: true}
+        tun0:
+          - {kind: htb, handle: "1:", root: true}
   environment:
     PATH: "{{ playbook_dir }}/.sysctl/bin:{{ lookup('env', 'PATH') }}"
     FAKE_SYSCTL_STATE: "{{ playbook_dir }}/.sysctl/state.json"
@@ -60,6 +90,39 @@
                   state["values"]["net.ipv4.tcp_available_congestion_control"] = "reno cubic bbr"
               save()
               sys.exit(0)
+          if "{{ item }}" == "ip":
+              print(state.get("routes", {}).get(args[1], ""))
+              save()
+              sys.exit(0)
+          if "{{ item }}" == "tc":
+              # tc -j qdisc show dev DEV | tc qdisc replace dev DEV root KIND
+              # | tc qdisc del dev DEV root, as the kernel answers them.
+              dev = args[args.index("dev") + 1]
+              q = state.get("qdiscs", {}).get(dev)
+              if q is None:
+                  save(); sys.exit(1)
+              if "show" in args:
+                  print(json.dumps(q)); save(); sys.exit(0)
+              default = state["values"]["net.core.default_qdisc"]
+              root = [e for e in q if e.get("root")][0]
+              queues = len(q) - 1
+              def mq(handle):
+                  return [{"kind": "mq", "handle": handle, "root": True}] + [
+                      {"kind": default, "handle": "0:", "parent": "%s%d" % (handle, i + 1)} for i in range(queues)]
+              if "del" in args:
+                  if root["handle"] == "0:":
+                      save(); sys.exit(2)
+                  state["qdiscs"][dev] = mq("0:") if root["kind"] == "mq" else [{"kind": default, "handle": "0:", "root": True}]
+              elif "replace" in args:
+                  kind = args[-1]
+                  if kind == root["kind"] and root["handle"] != "0:":
+                      pass  # the kernel changes the qdisc in place: nothing new
+                  elif kind == "mq":
+                      state["qdiscs"][dev] = mq("8001:")
+                  else:
+                      state["qdiscs"][dev] = [{"kind": kind, "handle": "8001:", "root": True}]
+              save()
+              sys.exit(0)
           if args[:1] == ["-n"]:
               for k in args[1:]:
                   if k not in state["values"]:
@@ -80,9 +143,15 @@
               sys.exit(0)
           save()
           sys.exit(2)
-      loop: [sysctl, modprobe]
+      loop: [sysctl, modprobe, ip, tc]
 
     - block:
+        - name: BBR is on unless turned off
+          assert:
+            that:
+              - (lookup('file', playbook_dir ~ '/../defaults/main.yml') | from_yaml).node_tcp_bbr == true
+            quiet: true
+
         - name: (a) the default, on a kernel with its usual limits
           copy:
             dest: "{{ _state_file }}"
@@ -150,53 +219,182 @@
               - (lookup('file', _state_file) | from_json)['values']['net.core.rmem_max'] == '33554432'
             success_msg: "raise only."
 
+        - name: (e) a kernel with its usual settings and three interfaces
+          copy:
+            dest: "{{ _state_file }}"
+            content: "{{ _kernel_default | combine(_kernel_links) | combine({'values': {'net.core.default_qdisc': 'fq_codel'}}, recursive=true) | to_nice_json }}"
         - name: (e) BBR on
           include_role:
             name: ansible-role-freesocks
             tasks_from: setup/sysctl.yml
           vars:
             node_tcp_bbr: true
-        - name: (e) fq + bbr, the module loaded at boot
+        - name: (e) read the kernel
+          set_fact:
+            _k: "{{ lookup('file', _state_file) | from_json }}"
+        - name: (e) fq + bbr now and at boot, the earlier values written down, fq on the live interfaces
           assert:
             that:
               - "'net.core.default_qdisc = fq' in lookup('file', node_sysctl_file)"
               - "'net.ipv4.tcp_congestion_control = bbr' in lookup('file', node_sysctl_file)"
               - "'tcp_bbr' in lookup('file', node_sysctl_modules_file)"
-              - (lookup('file', _state_file) | from_json)['values']['net.ipv4.tcp_congestion_control'] == 'bbr'
-            success_msg: "BBR when asked for."
+              - _k['values']['net.ipv4.tcp_congestion_control'] == 'bbr'
+              - _k['values']['net.core.default_qdisc'] == 'fq'
+              - "'net.ipv4.tcp_congestion_control = cubic' in lookup('file', node_sysctl_previous_file)"
+              - "'net.core.default_qdisc = fq_codel' in lookup('file', node_sysctl_previous_file)"
+              - "'# qdisc: eth0' in lookup('file', node_sysctl_previous_file)"
+              - "'# qdisc: eth1' in lookup('file', node_sysctl_previous_file)"
+              - "'tun0' not in lookup('file', node_sysctl_previous_file)"
+              - _k['qdiscs']['eth0'] | map(attribute='kind') | list == ['mq', 'fq', 'fq']
+              - _k['qdiscs']['eth1'] | map(attribute='kind') | list == ['fq']
+              - _k['qdiscs']['tun0'] | map(attribute='kind') | list == ['htb']
+              - "['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'mq'] in _k['calls']"
+              - "['tc', 'qdisc', 'replace', 'dev', 'eth1', 'root', 'fq'] in _k['calls']"
+              - _k['calls'].index(['sysctl', '-p', node_sysctl_file]) < _k['calls'].index(['tc', 'qdisc', 'replace', 'dev', 'eth0', 'root', 'mq'])
+              - _k['qdiscs']['eth2'] == _kernel_links.qdiscs.eth2
+              - "'eth2' not in lookup('file', node_sysctl_previous_file)"
+              - _sysctl_qdisc_plan.kept == ['eth2 (fq_codel, set by hand)', 'eth9 (not read)', 'tun0 (htb)']
+            success_msg: "BBR and fq at once; shaping, a qdisc set by hand and an unread interface left alone and named."
 
-        - name: (f) a kernel without BBR
+        - name: (e2) forget the calls so far
+          copy:
+            dest: "{{ _state_file }}"
+            content: "{{ (lookup('file', _state_file) | from_json) | combine({'calls': []}) | to_nice_json }}"
+        - name: (e2) the same again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+          vars:
+            node_tcp_bbr: true
+        - name: (e2) read the kernel
+          set_fact:
+            _k: "{{ lookup('file', _state_file) | from_json }}"
+        - name: (e2) nothing written, applied or changed; the record still says cubic
+          assert:
+            that:
+              - _sysctl_written is not changed
+              - _sysctl_applied is skipped
+              - _k['calls'] | select('contains', 'replace') | list | length == 0
+              - _k['calls'] | select('contains', 'del') | list | length == 0
+              - _k['calls'] | select('contains', '-p') | list | length == 0
+              - "'net.ipv4.tcp_congestion_control = cubic' in lookup('file', node_sysctl_previous_file)"
+              - "'# qdisc: eth0' in lookup('file', node_sysctl_previous_file)"
+            success_msg: "idempotent with BBR on."
+
+        - name: (g) BBR off again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (g) read the kernel
+          set_fact:
+            _k: "{{ lookup('file', _state_file) | from_json }}"
+        - name: (g) the earlier values and qdiscs are back, the buffers stay
+          assert:
+            that:
+              - _k['values']['net.ipv4.tcp_congestion_control'] == 'cubic'
+              - _k['values']['net.core.default_qdisc'] == 'fq_codel'
+              - _k['qdiscs']['eth0'] | map(attribute='kind') | list == ['mq', 'fq_codel', 'fq_codel']
+              - _k['qdiscs']['eth1'] | map(attribute='kind') | list == ['fq_codel']
+              - _k['qdiscs']['tun0'] | map(attribute='kind') | list == ['htb']
+              - "'tcp_congestion_control' not in lookup('file', node_sysctl_file)"
+              - "'default_qdisc' not in lookup('file', node_sysctl_file)"
+              - "'net.core.rmem_max = 16777216' in lookup('file', node_sysctl_file)"
+              - not (node_sysctl_previous_file is exists)
+              - not (node_sysctl_modules_file is exists)
+            success_msg: "off: what the kernel ran before is back."
+
+        - name: (g2) forget the calls so far
+          copy:
+            dest: "{{ _state_file }}"
+            content: "{{ (lookup('file', _state_file) | from_json) | combine({'calls': []}) | to_nice_json }}"
+        - name: (g2) off, again
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (g2) nothing put back twice
+          assert:
+            that:
+              - _sysctl_restored is skipped
+              - (lookup('file', _state_file) | from_json)['calls'] | select('contains', 'tc') | list | length == 0
+              - (lookup('file', _state_file) | from_json)['calls'] | select('contains', '-p') | list | length == 0
+            success_msg: "idempotent with BBR off."
+
+        - name: (j) a machine an earlier release gave BBR (drop-in, no record)
+          copy:
+            dest: "{{ _state_file }}"
+            content: >-
+              {{ _kernel_default | combine(_kernel_links)
+                 | combine({'values': {'net.core.default_qdisc': 'fq', 'net.ipv4.tcp_congestion_control': 'bbr',
+                                       'net.ipv4.tcp_available_congestion_control': 'reno cubic bbr'}}, recursive=true)
+                 | to_nice_json }}
+        - name: (j) its drop-in
+          copy:
+            dest: "{{ node_sysctl_file }}"
+            content: "net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n"
+        - name: (j) BBR on with this release, twice
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+          vars:
+            node_tcp_bbr: true
+          loop: [1, 2]
+        - name: (j) the role's own BBR is not written down as what came before
+          assert:
+            that:
+              - "'net.' not in lookup('file', node_sysctl_previous_file)"
+              - "'# qdisc: eth0' in lookup('file', node_sysctl_previous_file)"
+            success_msg: "no earlier values invented."
+        - name: (j) BBR off
+          include_role:
+            name: ansible-role-freesocks
+            tasks_from: setup/sysctl.yml
+        - name: (j) nothing put back, the record forgotten, the drop-in without BBR
+          assert:
+            that:
+              - _sysctl_restored is skipped
+              - (lookup('file', _state_file) | from_json)['values']['net.ipv4.tcp_congestion_control'] == 'bbr'
+              - not (node_sysctl_previous_file is exists)
+              - "'tcp_congestion_control' not in lookup('file', node_sysctl_file)"
+            success_msg: "off without a record: left to the next boot, and said so."
+
+        - name: (h) a kernel without BBR
           block:
             - name: Write a kernel without the module
               copy:
                 dest: "{{ _state_file }}"
-                content: "{{ _kernel_default | combine({'bbr_module': false}) | to_nice_json }}"
+                content: "{{ _kernel_default | combine(_kernel_links) | combine({'bbr_module': false}) | to_nice_json }}"
+            - name: Leave a boot file from an earlier kernel
+              copy:
+                dest: "{{ node_sysctl_modules_file }}"
+                content: "tcp_bbr\n"
             - name: Run with BBR on
               include_role:
                 name: ansible-role-freesocks
                 tasks_from: setup/sysctl.yml
               vars:
                 node_tcp_bbr: true
-            - name: (f) Unreached
+            - name: (h) Unreached
               assert:
                 that: [false]
                 fail_msg: "BBR was set on a kernel without it."
           rescue:
-            - name: (f) the run stops and says why
+            - name: (h) the run stops and says why, and touches nothing
               assert:
                 that:
                   - "'offers no BBR' in (ansible_failed_result.msg | default(''))"
                   - not (node_sysctl_modules_file is exists)
-                success_msg: "no BBR: the run stops and the boot file (left by (e)) is gone."
+                  - not (node_sysctl_previous_file is exists)
+                  - (lookup('file', _state_file) | from_json)['qdiscs']['eth1'][0]['kind'] == 'fq_codel'
+                success_msg: "no BBR: the run stops, no boot file, no record, no qdisc changed."
 
-        - name: (g) both off
+        - name: (i) both off
           include_role:
             name: ansible-role-freesocks
             tasks_from: setup/sysctl.yml
           vars:
             node_quic_buffers: false
             node_tcp_bbr: false
-        - name: (g) the drop-in and the module file are gone
+        - name: (i) the drop-in and the module file are gone
           assert:
             that:
               - not (node_sysctl_file is exists)
