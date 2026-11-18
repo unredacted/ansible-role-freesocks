@@ -4,13 +4,13 @@
 
 An Ansible role that bootstraps a [FreeSocks](https://freesocks.org/) proxy node (a Remnawave / Xray-core node) and enrolls it with the [FreeSocks Control Plane](https://freesocks.org/) (FCP).
 
-**Version 2 does one thing: the machine.** It installs Docker and the node container, a front server (Caddy or nginx) and a decoy site when the mode wants one, lets in the ports FCP lists for the node, and tells FCP "here I am". FCP owns everything on the backend (the profile, its transports, the mode groups, the addresses), the origin DNS record of a WebSocket node, the fronting (Cloudflare, Fastly, L4 edges) and the release to members. The role never talks to the backend: the node secret comes from FCP with the machine configuration. This is the bootstrap contract v2 (FCP `docs/servers.md`, "Node lifecycle").
+**Version 2 does one thing: the machine.** It installs Docker and the node container, a front server (nginx, or Caddy) and a decoy site when the mode wants one, lets in the ports FCP lists for the node, and tells FCP "here I am". FCP owns everything on the backend (the profile, its transports, the mode groups, the addresses), the origin DNS record of a WebSocket node, the fronting (Cloudflare, Fastly, L4 edges) and the release to members. The role never talks to the backend: the node secret comes from FCP with the machine configuration. This is the bootstrap contract v2 (FCP `docs/servers.md`, "Node lifecycle").
 
 Version 1 (Outline, hostname rotation, backend-to-backend migration, the role writing the backend) lives on the `v1` tag.
 
 ## Modes
 
-A node serves one **connection mode**: one of the modes the backend was set up for in FCP (Admin -> Servers, "Set up this backend"). The role is told the mode (`node_mode`) and nothing else about the shape: FCP's bootstrap answer says whether Caddy and which routes are wanted.
+A node serves one **connection mode**: one of the modes the backend was set up for in FCP (Admin -> Servers, "Set up this backend"). The role is told the mode (`node_mode`) and nothing else about the shape: FCP's bootstrap answer says whether a front server and which routes are wanted.
 
 | Mode (the defaults) | What the machine runs                                       | What FCP does after                                 |
 | ------------------- | ----------------------------------------------------------- | --------------------------------------------------- |
@@ -177,10 +177,12 @@ Each run compares what the kernel runs with the drop-in and applies it again whe
 
 A mode with an ingress (`freedom-ws`) puts a front server on the node: it ends TLS for the origin name with a certificate it takes itself (HTTP-01 on port 80), proxies each route FCP declared to its loopback inbound, and serves the [decoy site](#decoy-site) on every other path and Host. `remnawave_front_server` picks it:
 
-- **`caddy`** (the default for now): Caddy from its apt repository, `/etc/caddy/Caddyfile`.
-- **`nginx`**: nginx and its ACME module (`nginx-module-acme`) from nginx.org's stable repository, pinned over Debian's and added to unattended-upgrades, so its security releases install by themselves. The role's configuration is its own file (`remnawave_nginx_conf`, `/etc/nginx/freesocks/nginx.conf`) and the unit reads it through a drop-in that also confines the service (no new privileges, a read-only system, only the capabilities it needs); the package's `/etc/nginx/nginx.conf` is never edited, so an upgrade never stops at a configuration question, and an upgrade swaps the binary without dropping open sessions. A reload starts new workers and lets the old ones finish their sessions for up to `remnawave_nginx_worker_shutdown_timeout`.
+- **`nginx`** (the default): nginx and its ACME module (`nginx-module-acme`) from nginx.org's stable repository, pinned over Debian's and added to unattended-upgrades, so its security releases install by themselves. The role's configuration is its own file (`remnawave_nginx_conf`, `/etc/nginx/freesocks/nginx.conf`) and the unit reads it through a drop-in that also confines the service (no new privileges, a read-only system, only the capabilities it needs); the package's `/etc/nginx/nginx.conf` is never edited, so an upgrade never stops at a configuration question, and an upgrade swaps the binary without dropping open sessions. A reload starts new workers and lets the old ones finish their sessions for up to `remnawave_nginx_worker_shutdown_timeout`.
+- **`caddy`**: Caddy from its apt repository, `/etc/caddy/Caddyfile`. The default until 2026-11-17.
 
-Switching a node from one to the other stops the old one (its open sessions drop), starts the new one and takes a new certificate for the origin name (Let's Encrypt allows five for the same name a week). The one a node does not run is stopped and its configuration removed; nginx is also masked there, because its package starts a stopped nginx on every upgrade. Caddy is removed entirely (`remnawave_caddy_purge`, on by default): the package purged with its user, ACME account and certificates, logs and configuration, and its apt repository and key. Try nginx on one node (`remnawave_front_server: nginx` in its host vars) before the rest.
+Switching a node from one to the other stops the old one (its open sessions drop), starts the new one and takes a new certificate for the origin name (Let's Encrypt allows five for the same name a week). The one a node does not run is stopped and its configuration removed; nginx is also masked there, because its package starts a stopped nginx on every upgrade. Caddy is removed entirely (`remnawave_caddy_purge`, on by default): the package purged with its user, ACME account and certificates, logs and configuration, and its apt repository and key.
+
+**Upgrading from a Caddy default.** A node that runs Caddy because Caddy was the default moves to nginx on its next deploy or update: its sessions drop once, nginx takes a new certificate and Caddy is purged. To keep a node on Caddy, set `remnawave_front_server: caddy` for it.
 
 **Sized for growth (nginx).** Every limit follows the machine, so more RAM or vCPUs raise them on the next run:
 
@@ -269,13 +271,13 @@ If all of that fails, the run stops and says what to set. The login is written, 
 | `remnawave_node_rotate_secret`        | `false`                | Write FCP's new node secret even though the node's own is still good (recreates the container) |
 | `remnawave_node_secret_min_days`      | `30`                   | The node's secret is replaced when its certificate has fewer days left    |
 | `remnawave_docker_hub_*`, `remnawave_node_image_pull_backoff` |  | See [Pulling the node image](#pulling-the-node-image)                 |
-| `remnawave_caddy_email`               |                        | ACME registration (a mode that runs Caddy)                                |
+| `remnawave_caddy_email`               |                        | ACME registration (a mode with a front server, nginx or Caddy)           |
 | `remnawave_caddy_listen_port`         | `443`                  |                                                                           |
 | `remnawave_decoy_root`                | `/var/www/decoy`       |                                                                           |
 | `remnawave_decoy_kit`                 |                        | A private decoy kit's template directory; empty: the stock page. See [Decoy site](#decoy-site) |
 | `remnawave_decoy_stock_page`          |                        | The page served without a kit; empty: the front server's own              |
 | `remnawave_caddy_strip_request_headers` | the client-address headers | Request headers the front server removes before a route reaches Xray, one name per line; see [Members' addresses](#members-addresses) |
-| `remnawave_front_server`              | `caddy`                | `caddy` or `nginx`; see [Front server](#front-server-caddy-or-nginx)       |
+| `remnawave_front_server`              | `nginx`                | `nginx` or `caddy`; see [Front server](#front-server-caddy-or-nginx)       |
 | `remnawave_caddy_purge`               | `true`                 | Remove Caddy entirely where it is not the front server                    |
 | `remnawave_nginx_max_connections`     | 32 per MiB of RAM      | Connections nginx can hold in all                                         |
 | `remnawave_nginx_loopback_sources`    | `64`                   | Loopback addresses nginx reaches Xray from                                |

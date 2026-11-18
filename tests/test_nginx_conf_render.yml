@@ -11,7 +11,9 @@
 #       source addresses; an h2c route is gRPC (and only then is HTTP/2 on);
 #   (c) every route clears each client-address header of the role's default
 #       list and nothing adds one; no access log; the error log at crit;
-#   (d) the decoy is the fallback; a kit's own 404.html only when it has one.
+#   (d) the decoy is the fallback; a kit's own 404.html only when it has one;
+#   (e) nginx is the role's default front server, and the decoy's stock page
+#       follows it (nginx's page unless a node asks for Caddy).
 # Runs `nginx -t` on the render when nginx and its ACME module are installed
 # and sudo needs no password (CI).
 #
@@ -45,6 +47,18 @@
     _http_routes: 2
     _grpc_routes: 1
   tasks:
+    # (e)
+    - name: Assert nginx is the default front server
+      assert:
+        that:
+          - _defaults.remnawave_front_server == 'nginx'
+          - lookup('file', playbook_dir ~ '/../tasks/setup/decoy.yml') is search("default\\('nginx'\\) == 'caddy'")
+        fail_msg: >-
+          The default front server is {{ _defaults.remnawave_front_server }}: nginx
+          is the default since 2026-11-17 (a node that wants Caddy sets it), and the
+          decoy's stock-page fallback must assume the same one.
+        success_msg: "nginx is the default front server, and the decoy assumes it too."
+
     - block:
         - name: Render the nginx configuration
           template:

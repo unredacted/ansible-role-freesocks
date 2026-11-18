@@ -90,9 +90,9 @@ fcp_firewall_nftables_file: "/etc/nftables.d/freesocks-fcp.nft"
 # The connection MODE this node serves: one of the modes the backend was set up
 # for in FCP (Admin -> Servers), e.g. privacy-reality (REALITY, members connect
 # straight to it), freedom-reality (REALITY behind an L4 edge), freedom-xhttp
-# (XHTTP under REALITY behind an L4 edge), freedom-ws (WebSocket behind Caddy,
-# fronted by an L7 edge). What the machine runs follows from the mode: FCP's
-# bootstrap answer says whether Caddy and which routes are wanted.
+# (XHTTP under REALITY behind an L4 edge), freedom-ws (WebSocket behind the front
+# server, fronted by an L7 edge). What the machine runs follows from the mode:
+# FCP's bootstrap answer says whether a front server and which routes are wanted.
 # Taken at the first deploy and persisted on the machine (.node_mode) once FCP
 # has accepted it; a later run may omit it. A node keeps its mode (FCP refuses
 # a change).
@@ -218,11 +218,12 @@ remnawave_docker_hub_ipv4_names:
 
 # --- Front server (front nodes) ---------------------------------------------------
 # Which server terminates TLS in front of a front node's loopback transport and
-# serves the decoy: `caddy` or `nginx` (from nginx.org, with its ACME module).
+# serves the decoy: `nginx` (from nginx.org, with its ACME module) or `caddy`.
 # Switching a node stops the other one (its open sessions drop) and takes a
-# new certificate for the origin hostname. Caddy until nginx has run on a
-# canary node; then flip the default.
-remnawave_front_server: caddy
+# new certificate for the origin hostname. nginx since 2026-11-17, after it
+# carried the prod front nodes for ten days; a node that still runs Caddy moves
+# to nginx on its next deploy or update unless it sets `caddy`.
+remnawave_front_server: nginx
 
 # --- Caddy (front nodes) ---------------------------------------------------------
 # Where Caddy is not the front server (no ingress, or nginx in front): remove it
@@ -242,12 +243,13 @@ remnawave_decoy_kit: ""
 # Empty: nginx's /usr/share/nginx/html/index.html or Caddy's
 # /usr/share/caddy/index.html, by remnawave_front_server.
 remnawave_decoy_stock_page: ""
-# Members' addresses never reach Xray: Caddy removes these request headers
-# (`header_up -<name>`, WebSocket upgrades included) on every route before it
+# Members' addresses never reach Xray: the front server removes these request
+# headers (nginx: `proxy_set_header <name> ""`; Caddy: `header_up -<name>`;
+# WebSocket upgrades included) on every route before it
 # proxies to the loopback inbound. Every header an edge or a client may use to
 # carry the member's address; an edge strips what it can, but some add one
-# their own configuration cannot remove, so Caddy is the last place to drop
-# it. X-Forwarded-For also removes the one Caddy sets itself (the edge
+# their own configuration cannot remove, so the front server is the last place
+# to drop it. X-Forwarded-For also removes the one Caddy sets itself (the edge
 # server's address); the Caddyfile sets no trusted_proxies. One name per line.
 remnawave_caddy_strip_request_headers:
   - X-Forwarded-For
