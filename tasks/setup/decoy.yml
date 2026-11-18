@@ -61,9 +61,9 @@
         _decoy_stock: >-
           {{ remnawave_decoy_stock_page
              if remnawave_decoy_stock_page | length > 0
-             else ('/usr/share/nginx/html/index.html'
-                   if remnawave_front_server | default('caddy') == 'nginx'
-                   else '/usr/share/caddy/index.html') }}
+             else ('/usr/share/caddy/index.html'
+                   if remnawave_front_server | default('nginx') == 'caddy'
+                   else '/usr/share/nginx/html/index.html') }}
 
     - name: Copy it into the web root
       copy:
