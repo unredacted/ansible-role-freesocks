@@ -12,7 +12,8 @@
 #   (d) an FCP that is not set up fails the play closed;
 #   (e) a stale revision fails the play closed;
 #   (f) a register-only token outside its boundary is refused;
-#   (g) a front node gets the ingress routes and the origin hostname;
+#   (g) a front node gets the ingress routes (its mode's own and its encrypted
+#       twin's) and the origin hostname;
 #   (h) a node FCP blocks while verifying the applied machine fails the play
 #       closed after the applied report;
 #   (i) a port change staged after the bootstrap answer: a run that cannot
@@ -286,11 +287,14 @@
           assert:
             that:
               - origin_hostname == 'bright-harbor-lane.origin.example'
-              - _fcp_bootstrap.ingress.routes | length == 1
+              - _fcp_bootstrap.ingress.routes | length == 2
               - _fcp_bootstrap.ingress.routes[0].path == '/ws'
               - _fcp_bootstrap.ingress.routes[0].port == 8443
+              # The encrypted twin's route rides beside the mode's own from the first run.
+              - _fcp_bootstrap.ingress.routes[1].path == '/wse'
+              - _fcp_bootstrap.ingress.routes[1].port == 8444
               - _fcp_bootstrap.firewall | map(attribute='port') | list == [443]
-            success_msg: "front node: origin hostname and routes from FCP; its Caddy's port is listed, the loopback one is not."
+            success_msg: "front node: origin hostname and both routes from FCP; its front server's port is listed, the loopback ones are not."
 
         # (h) blocked while verifying the machine
         - name: Scenario blocked_later

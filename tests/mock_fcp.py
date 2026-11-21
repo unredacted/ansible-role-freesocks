@@ -413,7 +413,10 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "hostname": i["origin"]["hostname"],
                     "externalPort": 443,
-                    "routes": [{"path": "/ws", "port": 8443}],
+                    # The mode's own route, then its encrypted twin's: FCP hands the
+                    # twin's route out whenever the mode has a twin, from a node's
+                    # first run (FCP docs/servers.md "A node serving the encrypted twin").
+                    "routes": [{"path": "/ws", "port": 8443}, {"path": "/wse", "port": 8444}],
                 }
                 if _is_ws(i["mode"]["slug"])
                 else None
