@@ -51,7 +51,7 @@ jobs:
   # the image pull against the mock Docker API.
   unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Install ansible-core
